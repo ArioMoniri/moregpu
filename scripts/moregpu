@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# moregpu — one CLI to run, stop, and monitor a MoreGPU pool (admin server or worker).
+# Wraps the self-contained Deno apps. Install via Homebrew (see Formula/moregpu.rb) or:
+#   curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/moregpu -o /usr/local/bin/moregpu && chmod +x /usr/local/bin/moregpu
+set -euo pipefail
+
+REPO="${MOREGPU_REPO:-ArioMoniri/moregpu}"; BRANCH="${MOREGPU_BRANCH:-main}"
+RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+SERVER_TS="$RAW/apps/coordinator/server.ts"
+WORKER_TS="$RAW/apps/worker/worker.ts"
+
+need_deno() {
+  command -v deno >/dev/null 2>&1 && return 0
+  echo "[moregpu] Deno is required. Install: curl -fsSL https://deno.land/install.sh | sh" >&2; exit 1
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  serve)   # run the admin server
+    need_deno
+    exec deno run --allow-net --allow-env --allow-read --allow-write "$SERVER_TS" "$@" ;;
+
+  join)    # join this machine as a worker: moregpu join --server wss://ADMIN/ws --token TOK [--cpu]
+    need_deno
+    exec deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
+
+  install) # install the worker as a reboot-surviving service (delegates to install.sh)
+    exec sh -c "curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVICE=1 sh" ;;
+
+  stop)    # stop the worker: service if installed, else tell the user
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet moregpu-worker 2>/dev/null; then
+      systemctl --user stop moregpu-worker && echo "[moregpu] worker service stopped."
+    elif [ "$(uname -s)" = "Darwin" ] && launchctl list 2>/dev/null | grep -q dev.moregpu.worker; then
+      launchctl unload "$HOME/Library/LaunchAgents/dev.moregpu.worker.plist" && echo "[moregpu] worker agent stopped."
+    elif command -v tmux >/dev/null 2>&1 && tmux has-session -t moregpu 2>/dev/null; then
+      tmux kill-session -t moregpu && echo "[moregpu] tmux worker session killed."
+    else
+      echo "[moregpu] no installed service found. A foreground worker stops with Ctrl-C."
+    fi ;;
+
+  status)  # is the worker service running?
+    if command -v systemctl >/dev/null 2>&1; then systemctl --user status moregpu-worker --no-pager 2>/dev/null || echo "[moregpu] no systemd user service.";
+    elif [ "$(uname -s)" = "Darwin" ]; then launchctl list 2>/dev/null | grep dev.moregpu.worker || echo "[moregpu] launchd agent not loaded.";
+    else echo "[moregpu] status: check your process manager."; fi ;;
+
+  logs)    # tail the worker service logs
+    if command -v journalctl >/dev/null 2>&1; then journalctl --user -u moregpu-worker -f;
+    else echo "[moregpu] logs: foreground workers print to their terminal; services log to the OS log."; fi ;;
+
+  monitor) # print pool status from the admin API. env: MOREGPU_SERVER (http URL), MOREGPU_ADMIN_TOKEN
+    base="${MOREGPU_SERVER:-http://localhost:8787}"; base="${base%/ws}"; base="${base/wss:/https:}"; base="${base/ws:/http:}"
+    tok="${MOREGPU_ADMIN_TOKEN:-}"
+    echo "[moregpu] $base/device"; curl -fsS "$base/device" -H "authorization: Bearer $tok" || echo "  (need MOREGPU_ADMIN_TOKEN, and the server reachable)"
+    echo; echo "[moregpu] workers:"; curl -fsS "$base/workers" -H "authorization: Bearer $tok" || true ;;
+
+  version) echo "moregpu CLI (repo $REPO@$BRANCH)" ;;
+
+  help|*)
+    cat <<EOF
+moregpu — run, stop, and monitor a MoreGPU pool.
+
+  moregpu serve [--port N] [--allow-...]      run the admin server (prints a setup wizard)
+  moregpu join --server wss://HOST:8787/ws --token TOK [--cpu] [--throttle 0.4] [--name X]
+                                              join this machine to a pool as a worker
+  moregpu install                             install the worker as a reboot-surviving service
+  moregpu stop                                stop the worker (service / tmux) — foreground: Ctrl-C
+  moregpu status                              show the worker service status
+  moregpu logs                                follow the worker service logs
+  moregpu monitor                             print pool device + workers (env: MOREGPU_SERVER, MOREGPU_ADMIN_TOKEN)
+
+Docs: https://github.com/$REPO
+EOF
+    ;;
+esac

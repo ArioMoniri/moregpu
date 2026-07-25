@@ -284,6 +284,25 @@ async function runJob(rec: JobRec) {
   log('info', `${rec.id} done: ${rec.kernel} · ${(rec.ms ?? 0).toFixed(0)}ms · verified=${rec.verified}${data ? ' · data' : ''}`);
 }
 
+// ---------- device descriptor (the pool presented as a real GPU slot) ----------
+const LIMITS = { maxMatmulDim: 2048, maxElements: 8_000_000, maxInputElements: 16_000_000 };
+function deviceDescriptor() {
+  const g = virtualGpu();
+  return {
+    name: 'MoreGPU-Pool',
+    kind: 'virtual-gpu',
+    backends: [...new Set([...workers.values()].map((w) => w.backend))],
+    vendors: [...new Set([...workers.values()].map((w) => w.label.split(':')[1]?.split('/')[0] ?? w.backend))],
+    slots: g.slots, gpuSlots: g.gpuSlots, cpuSlots: g.cpuSlots, busy: g.busy,
+    kernels: KERNELS,
+    limits: LIMITS,
+    queue: { depth: g.queueDepth, running: g.busy },
+    throughput: { totalUnits: g.totalUnits, totalShards: g.totalShards, trend: g.poolTrend },
+    seal: 'AES-256-GCM',
+    capabilities: { dataMode: true, verifiedResults: true, adaptiveThrottle: true, asyncSubmit: true, sealedWire: true, tokenIsolated: true },
+  };
+}
+
 // ---------- virtual GPU view ----------
 function virtualGpu() {
   const fleet = [...workers.values()];
@@ -305,12 +324,13 @@ async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   if (url.pathname === '/ws') { const { socket, response } = Deno.upgradeWebSocket(req); wireWorker(socket); return response; }
   if (url.pathname === '/health') return json({ ok: true, fleet: workers.size, queue: queue.length });
-  if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/gpu', '/workers', 'POST /submit', '/jobs', '/jobs/:id', '/logs', '/metrics'], auth: 'admin endpoints require Authorization: Bearer <admin token>' });
+  if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/device', '/gpu', '/workers', 'POST /submit (?async=1)', '/jobs', '/jobs/:id', '/logs', '/metrics'], auth: 'admin endpoints require Authorization: Bearer <admin token>' });
   // admin-gated
-  if (['/gpu', '/workers', '/jobs', '/logs', '/metrics'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || (req.method === 'POST' && url.pathname === '/submit')) {
+  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || (req.method === 'POST' && url.pathname === '/submit')) {
     if (!authOk(req)) return json({ error: 'unauthorized — send Authorization: Bearer <admin token>' }, 401);
   }
   if (url.pathname === '/gpu') return json(virtualGpu());
+  if (url.pathname === '/device') return json(deviceDescriptor());
   if (url.pathname === '/workers') {
     const total = [...workers.values()].reduce((s, w) => s + w.units, 0) || 1;
     return json([...workers.values()].map((w) => ({
@@ -334,9 +354,12 @@ async function handler(req: Request): Promise<Response> {
       input = { a, b, scalar: body.scalar, M: body.M, N: body.N, K: body.K };
     }
     const size = Math.max(16, Math.min(kernel === 'matmul' ? 2048 : 8_000_000, Number(body.size ?? (kernel === 'matmul' ? 512 : 1_000_000))));
-    if (workers.size === 0) { const r = submit(kernel, size, input); return json({ ...r, note: 'queued — no workers connected yet; will run when one joins' }, 202); }
+    // Async mode (GPU-style submit-and-poll): return the job handle immediately; caller polls GET /jobs/:id.
+    const isAsync = (body as { async?: boolean }).async === true || url.searchParams.get('async') === '1';
+    if (workers.size === 0) { const r = submit(kernel, size, input); return json({ ...r, poll: `/jobs/${r.id}`, note: 'queued — no workers connected yet; will run when one joins' }, 202); }
     const rec = submit(kernel, size, input);
-    // wait briefly for a synchronous response; clients must still check status (may still be queued/running)
+    if (isAsync) return json({ id: rec.id, status: rec.status, kernel: rec.kernel, poll: `/jobs/${rec.id}` }, 202);
+    // sync: wait briefly for a result; clients must still check status (may still be queued/running)
     for (let i = 0; i < 600 && rec.status !== 'done' && rec.status !== 'failed'; i++) await new Promise((r) => setTimeout(r, 50));
     return json(rec, rec.status === 'failed' ? 503 : 200);
   }

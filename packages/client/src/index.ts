@@ -55,6 +55,17 @@ export interface VirtualGpu {
   totalUnits: number; totalShards: number; poolTrend: number[]; perKernel: Record<string, number>; sealed: string;
 }
 
+export interface DeviceDescriptor {
+  name: string; kind: string; backends: string[]; vendors: string[];
+  slots: number; gpuSlots: number; cpuSlots: number; busy: number;
+  kernels: string[];
+  limits: { maxMatmulDim: number; maxElements: number; maxInputElements: number };
+  queue: { depth: number; running: number };
+  throughput: { totalUnits: number; totalShards: number; trend: number[] };
+  seal: string;
+  capabilities: Record<string, boolean>;
+}
+
 export interface WorkerInfo {
   id: string; backend: 'gpu' | 'cpu'; label: string; os: string;
   userUtil: number; poolDuty: number; busy: boolean;
@@ -97,6 +108,28 @@ export class MoreGPUClient {
   /** The pool as one virtual GPU (slots, contribution totals, throughput trend, per-kernel counts). */
   gpu(): Promise<VirtualGpu> {
     return this.get('/gpu');
+  }
+
+  /** Device descriptor — the pool as a GPU slot: backends, kernels, limits, queue, capabilities. */
+  device(): Promise<DeviceDescriptor> {
+    return this.get('/device');
+  }
+
+  /** Submit without waiting: returns a job handle immediately (GPU-style async queue). Poll with waitFor(). */
+  async submitAsync(kernel: Kernel, size: number): Promise<{ id: string; status: string; poll: string }> {
+    const res = await this.f(`${this.base}/submit?async=1`, { method: 'POST', headers: this.authHeaders(), body: JSON.stringify({ kernel, size }) });
+    return (await res.json()) as { id: string; status: string; poll: string };
+  }
+
+  /** Poll a job until it is done or failed (or the timeout elapses). */
+  async waitFor(id: string, opts: { intervalMs?: number; timeoutMs?: number } = {}): Promise<Job> {
+    const interval = opts.intervalMs ?? 200, deadline = Date.now() + (opts.timeoutMs ?? 60_000);
+    for (;;) {
+      const job = await this.job(id);
+      if (job.status === 'done' || job.status === 'failed') return job;
+      if (Date.now() > deadline) throw new Error(`moregpu: waitFor(${id}) timed out in status ${job.status}`);
+      await new Promise((r) => setTimeout(r, interval));
+    }
   }
 
   /** Connected workers with live contribution (share, units, trend, avg latency, util/duty). */

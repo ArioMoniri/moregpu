@@ -54,6 +54,27 @@ describe('MoreGPUClient — request building', () => {
     expect(job.status).toBe('queued');
   });
 
+  it('device() fetches the pool device descriptor', async () => {
+    const f = mockFetch((url) => { expect(url).toBe('http://admin:8787/device'); return { body: { name: 'MoreGPU-Pool', kernels: ['matmul'], capabilities: { dataMode: true } } }; });
+    const d = await new MoreGPUClient(opts(f)).device();
+    expect(d.name).toBe('MoreGPU-Pool');
+    expect(d.capabilities.dataMode).toBe(true);
+  });
+
+  it('submitAsync returns a handle and waitFor polls until done', async () => {
+    let polls = 0;
+    const f = mockFetch((url) => {
+      if (url.includes('/submit')) return { status: 202, body: { id: 'job-1', status: 'queued', poll: '/jobs/job-1' } };
+      polls++; return { body: { id: 'job-1', status: polls < 2 ? 'running' : 'done', kernel: 'matmul' } };
+    });
+    const c = new MoreGPUClient(opts(f));
+    const handle = await c.submitAsync('matmul', 512);
+    expect(handle.id).toBe('job-1');
+    const job = await c.waitFor('job-1', { intervalMs: 1 });
+    expect(job.status).toBe('done');
+    expect(polls).toBeGreaterThanOrEqual(2);
+  });
+
   it('throws on an auth failure', async () => {
     const f = mockFetch(() => ({ status: 401, body: { error: 'unauthorized' } }));
     await expect(new MoreGPUClient(opts(f)).workers()).rejects.toThrow(/401/);
