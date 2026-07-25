@@ -109,7 +109,9 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
   let x=a[i]; let op=p.x;
   if (op < 0.5) { o[i]=max(x,0.0); }
   else if (op < 1.5) { o[i]=x*p.y; }
-  else { let c=0.7978845608028654; o[i]=0.5*x*(1.0+tanh(c*(x+0.044715*x*x*x))); }
+  else { let c=0.7978845608028654; o[i]=0.5*x*(1.0+tanh(clamp(c*(x+0.044715*x*x*x), -30.0, 30.0))); }
+// ^ clamp the tanh argument: it grows as x³, and some GPU tanh impls (Metal) overflow to NaN on huge
+//   inputs; tanh saturates to ±1 by |arg|≈20, so clamping is exact and just prevents the NaN.
 }`,
   // Elementwise binary (op: 0=add 1=mul 2=saxpy). p.x=op, p.y=scalar.
   binary: `@group(0) @binding(0) var<storage, read> a: array<f32>;

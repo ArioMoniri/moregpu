@@ -573,7 +573,10 @@ async function handler(req: Request): Promise<Response> {
       if (!body.id || typeof body.data !== 'string' || !body.rows || !body.cols) return json({ error: 'need {id, data (base64 f32), rows, cols, worker?}' }, 400);
       const arr = b64ToF32(body.data);
       if (arr.length !== body.rows * body.cols) return json({ error: `data length ${arr.length} != rows*cols ${body.rows * body.cols}` }, 400);
-      if (arr.length > 16_000_000) return json({ error: 'weight too large (>16M elements)' }, 413);
+      // Cap per-weight size so a huge upload gets a clean 413 instead of OOM-ing the coordinator (a sealed
+      // WS frame carries the base64 payload). Big projections (e.g. an LM head) should be tiled or host-side.
+      const WCAP = Number(Deno.env.get('MOREGPU_MAX_WEIGHT_ELEMENTS') ?? 16_000_000);
+      if (arr.length > WCAP) return json({ error: `weight too large (${arr.length} > ${WCAP} elements) — tile it or keep it host-side` }, 413);
       const active = activeFleet();
       if (active.length === 0) return json({ error: 'no active worker to hold the weight' }, 503);
       // home = explicit worker, else the active worker holding the fewest weights (spread the model across GPUs)
