@@ -1,6 +1,6 @@
 cask "moregpu" do
   version "0.3.0"
-  sha256 "e099af466bad747d7c85e6fd881ffcc9881877ea50224377383f362152579920"
+  sha256 "da6a5bc4175283bce0b1874052c249181ca8cd2073f19c2d440284da8890c9d4"
 
   url "https://github.com/ArioMoniri/moregpu/releases/download/v#{version}/moregpu"
   name "MoreGPU"
