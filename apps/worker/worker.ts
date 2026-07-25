@@ -158,7 +158,7 @@ let tenantKey: Uint8Array | null = null;
 
 function connect() {
   const ws = new WebSocket(SERVER);
-  let hb: number | undefined;
+  let hb: ReturnType<typeof setInterval> | undefined;
   ws.onopen = () => {
     ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os } }));
     // Heartbeat: report live load + the adaptive duty so the admin panel can show throttle in real time.
