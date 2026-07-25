@@ -249,15 +249,16 @@ Install from the [**latest GitHub Release**](https://github.com/ArioMoniri/moreg
 
 ```sh
 # Python SDK (standard library only) — matmul, attention(), linear(), mlp(), reductions
-pip install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu_client-0.2.0-py3-none-any.whl
+pip install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu_client-0.3.0-py3-none-any.whl
 # TypeScript/JS SDK (Deno / Node / browser)
-npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.2.0.tgz
-# `moregpu` CLI (serve / join / isolate / stop / monitor)
+npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.3.0.tgz
+# `moregpu` CLI — Homebrew cask (installs Deno), or one curl:
+brew install --cask ArioMoniri/moregpu/moregpu
 curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/moregpu -o /usr/local/bin/moregpu && chmod +x /usr/local/bin/moregpu
 ```
 
 > [!NOTE]
-> The SDKs are **not yet on PyPI / npmjs / a Homebrew tap** — publishing to those registries needs the maintainer's tokens. The Release artifacts above are the real, working install today; the maintainer publish steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing). (Once on PyPI/npm this becomes `pip install moregpu-client` / `npm install @moregpu/client`.)
+> The SDKs are **not yet on PyPI / npmjs** — publishing there needs the maintainer's registry tokens (not available in this environment, so it can't be done from here). The Release artifacts above install today with no account; the exact one-command publish steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing). Once on PyPI/npm this becomes `pip install moregpu-client` / `npm install @moregpu/client`.
 
 **JavaScript / TypeScript** ([`@moregpu/client`](packages/client), runs in Deno / Node / browsers):
 
@@ -338,8 +339,8 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Workload | | How / why |
 |---|---|---|
 | Dense fp32 matmul / GEMM | ✅ | **Workgroup-tiled WGSL GEMM on the GPU** (shared-memory tiling), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
-| Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class kernels; each op is its own pass. These are memory-bound, so they run on the worker's **CPU** (not the GPU) even on a GPU machine. |
-| Softmax / LayerNorm | ✅ | Dedicated row-wise kernels (run on the worker's **CPU**), match a CPU reference to ~1e-8. |
+| Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class WGSL kernels — run **on the GPU** on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU rather than adding raw speed. |
+| Softmax / LayerNorm | ✅ | Row-wise WGSL reductions (one workgroup per row) **on the GPU** on a GPU worker; CPU otherwise. Match a CPU reference to ~1e-8. |
 | Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention; no KV cache. |
 | Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. You orchestrate the graph from the SDK; weights are per-request, no residency. |
 | Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.); `pool.sum/mean/dot/norm` SDK helpers. Convenience, not throughput — each runs on one worker/one thread. |
@@ -350,10 +351,13 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
 | CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
 
-**In one line:** it runs the small, correct primitive set it ships — matmul (on your real GPU via WGSL), plus elementwise, softmax and layernorm (on the worker's CPU) — with verified fp32 results, and lets you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
+**In one line:** every kernel it ships — tiled matmul, elementwise/activations, softmax and layernorm — runs **on your real GPU** (WGSL → Metal/Vulkan/D3D12) on a GPU worker, with verified fp32 results, and you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
 
 > [!NOTE]
-> **What actually runs on the GPU:** `matmul` — the compute-bound workhorse — executes on each worker's GPU (WGSL → Metal/Vulkan/D3D12). The elementwise and row-wise kernels are memory-bound and run on the worker's CPU. A CPU-only worker runs everything on CPU. All paths return the same verified fp32 results.
+> **Why not CUDA / fp16 / full LLMs?** MoreGPU's backend is **WebGPU (WGSL)** — the portable path that runs the same kernels on NVIDIA, AMD, Apple, and Intel GPUs. WebGPU is fp32 compute-only: no tensor cores, no fp16/int8, no CUDA/PTX, and no autograd. Full-model inference and training would need a **separate native CUDA/cuBLAS worker type** (NVIDIA-only, fp16 + tensor cores + a real autograd/KV-cache stack) — a large, honest roadmap item, **not built**. What ships today is a correct, verified fp32 primitive set you can compose; it will not masquerade as a CUDA/training platform it isn't.
+
+> [!NOTE]
+> **What runs on the GPU:** on a GPU worker, **all** kernels execute on-device (WGSL → Metal/Vulkan/D3D12) — tiled matmul, elementwise/activations, and softmax/layernorm reductions. A CPU-only worker runs the identical kernels on the CPU. Either way the coordinator cross-checks the pooled result against a CPU reference, so every path returns the same verified fp32 output.
 
 ## Authorized use only
 

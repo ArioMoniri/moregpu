@@ -8,7 +8,7 @@ REPO="${MOREGPU_REPO:-ArioMoniri/moregpu}"; BRANCH="${MOREGPU_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SERVER_TS="$RAW/apps/coordinator/server.ts"
 WORKER_TS="$RAW/apps/worker/worker.ts"
-VERSION="v0.2.0"
+VERSION="v0.3.0"
 
 # ---- colors (disabled when not a TTY, NO_COLOR is set, or the terminal has < 8 colors) ----
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then CLR=1; else CLR=0; fi

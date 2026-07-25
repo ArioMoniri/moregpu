@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-25
+
+### Added
+
+- **All kernels on the GPU** — a GPU worker now runs elementwise (relu/scale/gelu/
+  add/mul/saxpy) and row-wise softmax/layernorm as WGSL kernels on-device, not just
+  matmul. CPU-only workers run the identical kernels; every result is still verified
+  against a CPU reference.
+- **SCOUT-style CLI** — `moregpu` with no arguments opens an interactive menu with a
+  gradient ANSI-Shadow wordmark and a sectioned Pool/Fleet/Service layout; the same
+  wordmark now prints in the server wizard.
+- **Homebrew cask** (`Casks/moregpu.rb`) installing the CLI (depends on Deno).
+
+### Changed
+
+- **Shard reassignment + concurrent jobs (M8)** — a failed/timed-out shard is retried
+  on other active workers instead of failing the job; workers that fail repeatedly are
+  auto-paused; the queue runs up to `MOREGPU_MAX_CONCURRENT_JOBS` (default 4) at once.
+  Default shard timeout 120s → 60s.
+- README screenshots reframed as macOS windows; capability matrix updated (all kernels
+  on the GPU) with an honest note on why CUDA / fp16 / full-LLM would need a separate
+  native worker type (not built).
+
 ## [0.2.0] - 2026-07-25
 
 ### Added

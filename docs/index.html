@@ -72,8 +72,8 @@ th{color:var(--mut);font-weight:600}
 <div class="card">
 An admin runs a coordinator. Worker machines join with a one-liner over an <b>outbound</b> WebSocket and
 contribute GPU or CPU compute. Jobs are sharded across the fleet, each work unit is <b>AES-256-GCM sealed</b>
-on the wire, computed on each worker (<code>matmul</code> on the GPU via WebGPU → Metal/Vulkan/D3D12; the
-memory-bound elementwise and row-wise kernels on the CPU), then pooled, <b>verified</b> against a CPU
+on the wire, computed on each worker (on a GPU worker every kernel — tiled matmul, elementwise, softmax/layernorm —
+runs on the GPU via WebGPU → Metal/Vulkan/D3D12; CPU otherwise), then pooled, <b>verified</b> against a CPU
 reference, and returned with an <b>Ed25519 signature</b> from the worker that produced it. The
 whole fleet is presented as <b>one virtual GPU</b> with a Slurm-like job queue. It is an honest, verified
 <b>fp32</b> linear-algebra service — not a CUDA replacement or a black-box model runner.
@@ -138,8 +138,8 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 <table>
 <tr><th>Workload</th><th></th><th>How / why</th></tr>
 <tr><td>Dense fp32 matmul / GEMM</td><td class="y">✅</td><td>Workgroup-tiled WGSL GEMM <b>on the GPU</b> (shared-memory tiling), verified. fp32 only, <b>no tensor cores</b> → correct but slower than cuBLAS.</td></tr>
-<tr><td>Elementwise + activations</td><td class="y">✅</td><td>add / mul / scale / saxpy / relu / <b>gelu</b> — memory-bound, so they run on the worker <b>CPU</b> even on a GPU machine.</td></tr>
-<tr><td>Softmax / LayerNorm</td><td class="y">✅</td><td>Dedicated row-wise kernels (on the worker <b>CPU</b>), match a CPU reference to ~1e-8.</td></tr>
+<tr><td>Elementwise + activations</td><td class="y">✅</td><td>add / mul / scale / saxpy / relu / <b>gelu</b> — WGSL kernels that run <b>on the GPU</b> on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU.</td></tr>
+<tr><td>Softmax / LayerNorm</td><td class="y">✅</td><td>Row-wise WGSL reductions <b>on the GPU</b> on a GPU worker (CPU otherwise), match a CPU reference to ~1e-8.</td></tr>
 <tr><td>Scaled dot-product attention (1 head)</td><td class="p">🧩</td><td><code>matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)</code> — verified. Not flash-attention; no KV cache.</td></tr>
 <tr><td>Transformer block / small MLP inference</td><td class="p">🧩</td><td>Compose LN → matmuls → attention → FFN from the SDK. Weights per-request, no residency.</td></tr>
 <tr><td>Large / out-of-core matmul</td><td class="pa">🟡</td><td>Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink.</td></tr>

@@ -67,3 +67,5 @@ clients/python/build/
 
 # build artifacts (attached to GitHub Releases, not committed)
 *.tgz
+
+*.tar.gz
