@@ -1,0 +1,59 @@
+# MoreGPU
+
+> A native GPU compute pool. An admin runs a coordinator/admin server; worker machines (any OS, GPU or CPU) join with a one-liner over an outbound WebSocket and contribute compute. Submitted jobs are sharded across workers, AES-256-GCM sealed on the wire, computed on each worker's GPU (WebGPU → Metal/Vulkan/D3D12) or CPU, then pooled and verified. Runtime: Deno (one cross-platform binary) for the server and worker; a tested TypeScript monorepo holds the core libraries.
+
+Author: Ariorad Moniri. License: Apache-2.0. Repository: https://github.com/ArioMoniri/moregpu
+
+## Key properties
+
+- One-liner install per machine; installs Deno if missing; runs the worker from a raw URL. Cross-OS (Linux/macOS/Windows).
+- Per-pool setup wizard on the server's first run mints an admin token, a worker join token, and an encryption key. Pools are isolated; no one shares another pool's credentials.
+- Adaptive per-user duty cycle: each worker samples its own machine load (loadavg) and lowers its pool duty as the machine's own user gets busier, keeping total system utilization under a cap (default 85%). More user activity → less pool usage → the user is not disturbed and power draw stays low.
+- CPU-only machines contribute to the same pool by running the kernels on CPU.
+- Reboot-surviving, self-healing services: MOREGPU_SERVICE=1 installs systemd (Linux) / launchd (macOS) / scheduled task (Windows); the installer supervises and restarts the worker.
+- Security: join-token gate on workers; admin-token gate on job submission; optional native TLS (wss). Each work unit is AES-256-GCM sealed in transit; the coordinator relays only ciphertext. Single-trust-domain by default (workers hold the tenant key to compute).
+- The fleet is presented as one virtual GPU with a Slurm-like job queue.
+- Tensor kernels available: matmul, vector_add, vector_mul, saxpy, relu, scale. Extensible by adding a WGSL kernel plus a CPU reference.
+- Admin web dashboard (works where only a CLI is available): virtual-GPU view, fleet with live per-worker load and adaptive duty, job queue, error/debug log, and a Prometheus /metrics endpoint to wire into Grafana.
+
+## Run (exact steps)
+
+1. Start the admin server (prints a wizard with tokens + the worker command):
+   `deno run --allow-net --allow-env --allow-read --allow-write https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts`
+   Dashboard on http://HOST:8787. Env: PORT, MOREGPU_BIND (default 0.0.0.0), MOREGPU_HOST, MOREGPU_TLS_CERT + MOREGPU_TLS_KEY (wss), MOREGPU_DUTY.
+
+2. Join a machine as a worker (Linux/macOS):
+   `curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.sh | MOREGPU_SERVER=wss://ADMIN:8787/ws MOREGPU_TOKEN=<join-token> sh`
+   Windows: set MOREGPU_SERVER and MOREGPU_TOKEN, then `irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps1 | iex`.
+   Worker env: MOREGPU_SERVICE=1 (service), MOREGPU_THROTTLE=0.4 (duty ceiling), MOREGPU_MAX_UTIL=0.85 (utilization cap), MOREGPU_FORCE_CPU=1, MOREGPU_NAME, MOREGPU_TMUX=1.
+
+3. Submit a job (admin token required):
+   `curl -X POST http://ADMIN:8787/submit -H "authorization: Bearer <admin-token>" -H "content-type: application/json" -d '{"kernel":"matmul","size":1024}'`
+   Or open the dashboard and submit there.
+
+## HTTP API
+
+- GET / — dashboard
+- GET /help — endpoints + kernels (public)
+- GET /health — liveness + fleet size (public)
+- GET /gpu — the pool as one virtual GPU (admin)
+- GET /workers — workers with live load + adaptive duty (admin)
+- POST /submit — {"kernel","size"} run a job (admin)
+- GET /jobs, GET /jobs/:id — job queue + history (admin)
+- GET /logs — recent errors/debug (admin)
+- GET /metrics — Prometheus metrics for Grafana (admin)
+
+Admin endpoints require header: `Authorization: Bearer <admin token>`.
+
+## Use boundaries (important)
+
+Run workers only on machines you own or are explicitly authorized to use. Running on free third-party platforms (Google Colab free, GitHub Actions and other CI runners, free/trial VPS) is usually prohibited by their Terms of Service; the project ships no tooling to do so. All legal and compliance responsibility is the operator's. See ACCEPTABLE_USE.md.
+
+## Files
+
+- apps/coordinator/server.ts — admin server (HTTP + WebSocket, queue, seal/pool, dashboard, metrics)
+- apps/worker/worker.ts — worker agent (GPU/CPU, adaptive throttle, outbound WS, seal/compute)
+- scripts/install.sh, scripts/install.ps1 — one-liner installers (+ MOREGPU_SERVICE)
+- packages/ — tested TypeScript libraries (gpu, runtime, scheduler, coordinator, transport, protocol, integrity, crypto)
+- docs/ADMIN.md — admin & operations guide
+- ACCEPTABLE_USE.md, CODE_OF_CONDUCT.md, SECURITY.md — governance

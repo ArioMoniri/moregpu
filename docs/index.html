@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoreGPU — native GPU compute pool</title>
+<meta name="description" content="Turn the GPUs (or CPUs) you already own into one pooled, sealed, adaptively-throttled compute pool. One-liner install, any OS.">
+<style>
+:root{--bg:#0b0f17;--card:#121826;--line:#1f2937;--ink:#e6edf3;--mut:#8b98ad;--acc:#6366f1;--grn:#34d399;--yel:#fbbf24}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font:16px/1.6 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--ink)}
+.wrap{max-width:920px;margin:0 auto;padding:0 22px}
+header{padding:60px 0 24px;text-align:center}
+h1{font-size:44px;letter-spacing:-1.5px;margin:0 0 8px}
+.tag{color:var(--mut);font-size:18px;max-width:640px;margin:0 auto}
+.badges{margin:18px 0 4px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.badge{font-size:12px;color:#c7d2fe;background:#1a2133;border:1px solid var(--line);border-radius:999px;padding:4px 12px}
+.anim{margin:26px auto 8px;max-width:900px;border:1px solid var(--line);border-radius:16px;overflow:hidden;background:#0e1117}
+.anim img{display:block;width:100%}
+h2{font-size:22px;letter-spacing:-.4px;margin:44px 0 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:14px 0}
+pre{background:#0e1420;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;font-size:13.5px;margin:10px 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.step b{color:#a5b4fc}
+.k{display:inline-block;font-family:ui-monospace,monospace;font-size:13px;background:#0e1420;border:1px solid var(--line);border-radius:7px;padding:3px 9px;margin:3px 3px 0 0}
+.warn{border-left:3px solid var(--yel);background:#1c1a10}
+.mut{color:var(--mut)}a{color:#a5b4fc;text-decoration:none}a:hover{text-decoration:underline}
+footer{color:var(--mut);font-size:13px;text-align:center;padding:40px 0 60px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:640px){.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>MoreGPU</h1>
+  <p class="tag">Turn the GPUs — or CPUs — you already own into one pooled, sealed, adaptively-throttled compute pool. One-liner install, any OS.</p>
+  <div class="badges">
+    <span class="badge">WebGPU · Metal / Vulkan / D3D12</span>
+    <span class="badge">AES-256-GCM sealed</span>
+    <span class="badge">adaptive per-user throttle</span>
+    <span class="badge">Apache-2.0</span>
+  </div>
+  <div class="anim"><img src="assets/how-it-works.svg" alt="Animated: submit → shard → seal → compute on GPU/CPU → pool → verify"></div>
+  <p class="mut" style="font-size:13px">submit → shard → seal → compute on each worker's GPU/CPU → pool → verify</p>
+</header>
+
+<h2>What it is</h2>
+<div class="card">
+An admin runs a coordinator. Worker machines join with a one-liner over an <b>outbound</b> WebSocket and
+contribute GPU or CPU compute. Jobs are sharded across the fleet, each work unit is AES-256-GCM sealed on
+the wire, computed on each worker's GPU (WebGPU → Metal/Vulkan/D3D12) or CPU, then pooled and verified.
+The whole fleet is presented as <b>one virtual GPU</b> with a Slurm-like job queue.
+</div>
+
+<h2>Run it — three steps</h2>
+<div class="card step">
+<p><b>1. Start the admin server.</b> Its first run prints a wizard with this pool's tokens and the exact worker command.</p>
+<pre><code>deno run --allow-net --allow-env --allow-read --allow-write \
+  https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts</code></pre>
+<p><b>2. Join any machine as a worker</b> with the join token (installs Deno if needed; GPU if present, else CPU).</p>
+<pre><code># Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.sh \
+  | MOREGPU_SERVER=wss://ADMIN:8787/ws MOREGPU_TOKEN=&lt;join-token&gt; sh</code></pre>
+<pre><code># Windows (PowerShell)
+$env:MOREGPU_SERVER="wss://ADMIN:8787/ws"; $env:MOREGPU_TOKEN="&lt;join-token&gt;"
+irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps1 | iex</code></pre>
+<p class="mut">Add <code>MOREGPU_SERVICE=1</code> to install a reboot-surviving, self-healing service.</p>
+<p><b>3. Submit a job</b> (admin token) — or use the dashboard.</p>
+<pre><code>curl -X POST http://ADMIN:8787/submit -H "authorization: Bearer &lt;admin-token&gt;" \
+  -H "content-type: application/json" -d '{"kernel":"matmul","size":1024}'</code></pre>
+</div>
+
+<div class="two">
+  <div>
+    <h2>Adaptive per-user throttle</h2>
+    <div class="card">Each worker samples its own machine's load and lowers its pool duty as the machine's
+    user gets busier, keeping total utilization under a cap (default 85%). Use the PC harder → the pool
+    quietly steps back. CPU-only machines contribute too.</div>
+  </div>
+  <div>
+    <h2>Isolated pools</h2>
+    <div class="card">Every server's setup wizard mints its own admin token, worker join token, and
+    encryption key. Pools are isolated — no one shares another pool's credentials. Optional native TLS
+    (<code>wss://</code>).</div>
+  </div>
+</div>
+
+<h2>Tensor kernels</h2>
+<div class="card">
+  <span class="k">matmul</span><span class="k">vector_add</span><span class="k">vector_mul</span>
+  <span class="k">saxpy</span><span class="k">relu</span><span class="k">scale</span>
+  <p class="mut" style="margin:12px 0 0">Extensible — add a WGSL kernel plus a CPU reference to support a new task type.</p>
+</div>
+
+<h2>Admin panel &amp; observability</h2>
+<div class="card">
+A modern web dashboard (works where only a command line is available): a virtual-GPU view, the fleet with
+live per-worker load and adaptive duty, the job queue, and an errors/debug log. A Prometheus
+<code>/metrics</code> endpoint exposes fleet, queue depth, per-backend shard counts and utilization — point
+Grafana at it for pool dashboards. See the <a href="https://github.com/ArioMoniri/moregpu/blob/main/docs/ADMIN.md">admin guide</a>.
+</div>
+
+<h2>Use boundaries</h2>
+<div class="card warn">
+⚠️ Run workers only on machines you own or are explicitly authorized to use. Running on free third-party
+platforms — Google Colab free, GitHub Actions and other CI runners, free/trial VPS — is usually prohibited
+by their Terms of Service, and this project ships no tooling to do so. All legal and compliance
+responsibility is the operator's. See <a href="https://github.com/ArioMoniri/moregpu/blob/main/ACCEPTABLE_USE.md">ACCEPTABLE_USE.md</a>.
+</div>
+
+<footer>
+  <a href="https://github.com/ArioMoniri/moregpu">GitHub</a> ·
+  <a href="https://github.com/ArioMoniri/moregpu/blob/main/docs/ADMIN.md">Admin guide</a> ·
+  <a href="https://github.com/ArioMoniri/moregpu/blob/main/llms.txt">llms.txt</a> ·
+  Apache-2.0 © 2026 Ariorad Moniri
+</footer>
+</div>
+</body>
+</html>
