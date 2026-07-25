@@ -214,19 +214,43 @@ async function makeGpuBackend(): Promise<Backend | null> {
   }
   const info = adapter.info ?? {};
   const ELEM_OP: Record<string, number> = { relu: 0, scale: 1, gelu: 2, vector_add: 0, vector_mul: 1, saxpy: 2 };
+  // WebGPU caps workgroups per dispatch dimension (usually 65535); dispatch in chunks so large inputs
+  // (data mode allows up to 16M elements) never exceed it — each chunk is an independent dispatch.
+  const MAXW = device.limits.maxComputeWorkgroupsPerDimension || 65535;
+  const ELEM_PER = MAXW * 64;   // max elements per elementwise dispatch (workgroup_size 64)
   return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}`,
     matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]),
-    elementwise: (kernel, a, b, scalar) => {
+    elementwise: async (kernel, a, b, scalar) => {
       const op = ELEM_OP[kernel] ?? 0;
       const unary = kernel === 'relu' || kernel === 'scale' || kernel === 'gelu';
-      const wg: [number, number, number] = [Math.ceil(a.length / 64), 1, 1];
-      return unary
-        ? run(WGSL.unary, [a], new Float32Array([op, scalar, 0, 0]), a.length, wg)
-        : run(WGSL.binary, [a, b as Float32Array], new Float32Array([op, scalar, 0, 0]), a.length, wg);
+      const code = unary ? WGSL.unary : WGSL.binary;
+      const uni = new Float32Array([op, scalar, 0, 0]);
+      if (a.length <= ELEM_PER) {
+        const wg: [number, number, number] = [Math.ceil(a.length / 64), 1, 1];
+        return unary ? run(code, [a], uni, a.length, wg) : run(code, [a, b as Float32Array], uni, a.length, wg);
+      }
+      const out = new Float32Array(a.length);
+      for (let s = 0; s < a.length; s += ELEM_PER) {
+        const aa = a.subarray(s, Math.min(a.length, s + ELEM_PER));
+        const wg: [number, number, number] = [Math.ceil(aa.length / 64), 1, 1];
+        const chunk = unary ? await run(code, [aa], uni, aa.length, wg) : await run(code, [aa, (b as Float32Array).subarray(s, s + aa.length)], uni, aa.length, wg);
+        out.set(chunk, s);
+      }
+      return out;
     },
-    rowwise: (kernel, a, cols) => {
+    rowwise: async (kernel, a, cols) => {
+      const code = kernel === 'softmax' ? WGSL.softmax : WGSL.layernorm;
+      const uni = new Uint32Array([cols, 0, 0, 0]);
       const rows = Math.max(1, Math.floor(a.length / cols));
-      return run(kernel === 'softmax' ? WGSL.softmax : WGSL.layernorm, [a], new Uint32Array([cols, 0, 0, 0]), a.length, [rows, 1, 1]);
+      if (rows <= MAXW) return run(code, [a], uni, a.length, [rows, 1, 1]);
+      const out = new Float32Array(a.length);
+      for (let r = 0; r < rows; r += MAXW) {
+        const rn = Math.min(rows, r + MAXW) - r;
+        const aa = a.subarray(r * cols, (r + rn) * cols);
+        const chunk = await run(code, [aa], uni, aa.length, [rn, 1, 1]);
+        out.set(chunk, r * cols);
+      }
+      return out;
     } };
 }
 

@@ -137,7 +137,7 @@ interface Worker {
   id: string; backend: string; label: string; os: string; ws: WebSocket;
   load1: number; util: number; duty: number; busy: boolean; joinedAt: number;
   // contribution accounting
-  shards: number; units: number; errors: number; consecErrors: number; totalMs: number;
+  shards: number; units: number; errors: number; consecErrors: number; healthyBeats: number; busyCount: number; totalMs: number;
   lastUnits: number; history: number[]; // per-sample units completed → sparkline trend
   pubkey?: CryptoKey; // Ed25519 public key for verifying this worker's result signatures
   pubkeyB64?: string; // raw public key (for the removed-worker denylist)
@@ -159,8 +159,10 @@ interface Pending { resolve: (r: ResultMsg) => void; reject: (e: Error) => void;
 const pending = new Map<string, Pending>();
 const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 60_000);
 const MAX_SHARD_ATTEMPTS = Number(Deno.env.get('MOREGPU_MAX_SHARD_ATTEMPTS') ?? 3); // reassign a failed/timed-out shard to other workers
-const AUTO_PAUSE_ERRORS = Number(Deno.env.get('MOREGPU_AUTO_PAUSE_ERRORS') ?? 4); // consecutive failures before a worker is auto-paused
+const AUTO_PAUSE_ERRORS = Number(Deno.env.get('MOREGPU_AUTO_PAUSE_ERRORS') ?? 4); // consecutive HARD failures before a worker is auto-paused
+const AUTO_RESUME_BEATS = Number(Deno.env.get('MOREGPU_AUTO_RESUME_BEATS') ?? 3); // healthy heartbeats that auto-un-pause an errored worker
 const MAX_CONCURRENT_JOBS = Number(Deno.env.get('MOREGPU_MAX_CONCURRENT_JOBS') ?? 4); // jobs the queue runs at once
+const STALE_JOB_MS = Number(Deno.env.get('MOREGPU_STALE_JOB_MS') ?? 300_000); // fail a job that can't be scheduled within this
 
 function wireWorker(ws: WebSocket) {
   let id = '';
@@ -184,7 +186,7 @@ function wireWorker(ws: WebSocket) {
       let pubkey: CryptoKey | undefined;
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, consecErrors: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
       log('info', `worker joined: ${id} (${safeId(node.label)}, ${safeId(node.os)})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
@@ -195,7 +197,13 @@ function wireWorker(ws: WebSocket) {
         w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty;
         if (typeof m.ceil === 'number') w.ceil = m.ceil;
         if (typeof m.schedule === 'string') w.schedule = m.schedule;
-        if (w.pausedReason !== 'errors') { // a server-side auto-pause is sticky until an admin resumes
+        if (w.pausedReason === 'errors') {
+          // auto-recover: a worker that heartbeats healthy for a few beats is un-paused automatically (no operator needed)
+          if (m.paused === false) {
+            w.healthyBeats++;
+            if (w.healthyBeats >= AUTO_RESUME_BEATS) { w.paused = false; w.pausedReason = null; w.consecErrors = 0; w.healthyBeats = 0; log('info', `auto-resumed ${w.id} after recovery`); pumpQueue(); }
+          } else w.healthyBeats = 0;
+        } else { // the worker's own schedule/admin pause state
           if (typeof m.paused === 'boolean') w.paused = m.paused;
           w.pausedReason = (m.pausedReason as string | null) ?? null;
           if (m.paused === false) pumpQueue();
@@ -240,6 +248,18 @@ setInterval(() => {
   const pd = Math.max(0, totalUnits - lastPoolUnits); lastPoolUnits = totalUnits;
   poolHistory.push(pd); if (poolHistory.length > 30) poolHistory.shift();
 }, 3000);
+
+// Backstop: fail any job that has sat un-schedulable in the queue too long, so a caller never hangs forever.
+setInterval(() => {
+  const now = Date.now();
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const rec = queue[i];
+    if (now - rec.submittedAt > STALE_JOB_MS) {
+      queue.splice(i, 1); rec.status = 'failed'; rec.error = `stale: no worker available within ${Math.round(STALE_JOB_MS / 1000)}s`;
+      M.jobsFailed++; log('warn', `${rec.id} failed: stale in queue (no active worker)`);
+    }
+  }
+}, 15_000);
 
 // ---------- kernels ----------
 const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu']);
@@ -319,18 +339,23 @@ function pumpQueue() {
   }
 }
 
-/** Auto-pause a worker that keeps failing so the fleet stops handing it work (admin can resume). */
+/** Auto-pause a worker that keeps HARD-failing so the fleet stops handing it work (admin/auto resume).
+ *  Never pauses the last active worker — that would strand the queue with nothing to run. */
 function maybeAutoPause(w: Worker) {
-  if (w.consecErrors >= AUTO_PAUSE_ERRORS && !w.paused) { w.paused = true; w.pausedReason = 'errors'; log('warn', `auto-paused ${w.id} after ${w.consecErrors} consecutive failures`); }
+  if (w.consecErrors >= AUTO_PAUSE_ERRORS && !w.paused && activeFleet().length > 1) {
+    w.paused = true; w.pausedReason = 'errors'; w.healthyBeats = 0;
+    log('warn', `auto-paused ${w.id} after ${w.consecErrors} consecutive hard failures`);
+  }
 }
 
 /** Dispatch one shard, retrying on OTHER active workers if it fails/times out (so a dead worker doesn't
- *  fail the whole job). Prefers `preferred`, then any other active worker not yet tried. */
+ *  fail the whole job). Prefers `preferred`, then the HEALTHIEST untried active worker (fewest recent errors). */
 async function dispatchResilient(jobId: string, payload: Record<string, unknown>, preferred: Worker): Promise<{ out: Float32Array; worker: Worker }> {
   const tried = new Set<string>();
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_SHARD_ATTEMPTS; attempt++) {
-    const candidate = (attempt === 0 && !preferred.paused) ? preferred : activeFleet().find((w) => !tried.has(w.id));
+    const pool = activeFleet().filter((w) => !tried.has(w.id)).sort((a, b) => a.consecErrors - b.consecErrors);
+    const candidate = (attempt === 0 && !preferred.paused && !tried.has(preferred.id)) ? preferred : pool[0];
     if (!candidate) break;
     tried.add(candidate.id);
     try {
@@ -338,8 +363,10 @@ async function dispatchResilient(jobId: string, payload: Record<string, unknown>
       candidate.consecErrors = 0;
       return { out, worker: candidate };
     } catch (e) {
-      lastErr = e;
-      candidate.errors++; candidate.consecErrors++; maybeAutoPause(candidate);
+      lastErr = e; candidate.errors++;
+      // Only a HARD compute failure counts toward auto-pause; a timeout/disconnect is transient backpressure,
+      // not a reason to attrit a healthy-but-backlogged worker (a burst of concurrent shards must not pause it).
+      if (String(e).includes('failed:')) { candidate.consecErrors++; maybeAutoPause(candidate); }
       log('warn', `shard reassign: ${candidate.id} failed (${String(e)}); attempt ${attempt + 1}/${MAX_SHARD_ATTEMPTS}`);
     }
   }
@@ -353,10 +380,10 @@ async function dispatchShard(w: Worker, jobId: string, payload: Record<string, u
     const timer = setTimeout(() => { pending.delete(shardId); reject(new Error(`shard timeout (${SHARD_TIMEOUT_MS}ms) on ${w.id}`)); }, SHARD_TIMEOUT_MS);
     pending.set(shardId, { resolve: (r) => { clearTimeout(timer); resolve(r); }, reject: (e) => { clearTimeout(timer); reject(e); }, workerId: w.id });
   });
-  w.busy = true;
+  w.busyCount++; w.busy = true; // a worker may run several concurrent shards under MAX_CONCURRENT_JOBS
   w.ws.send(JSON.stringify({ t: 'assign', shardId, jobId, sealedIn }));
   let r: ResultMsg;
-  try { r = await done; } finally { pending.delete(shardId); w.busy = false; }
+  try { r = await done; } finally { pending.delete(shardId); w.busyCount = Math.max(0, w.busyCount - 1); w.busy = w.busyCount > 0; }
   if (!r.ok || !r.sealedOut) { M.shardsFailed++; throw new Error(`shard on ${w.id} failed: ${r.error}`); }
   M.shardsDone++; (r.backend?.startsWith('gpu') ? M.gpuShards++ : M.cpuShards++);
   const outObj = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealedOut)));

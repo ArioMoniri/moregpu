@@ -71,7 +71,9 @@ menu_screen() {
   cell 0 'Exit' ''; printf '\n\n'
 }
 
-ask() { local p="$1" v; printf '  '; c '38;5;205'; printf '%s' "$p"; rst; read -r v; printf '%s' "$v"; }
+# Prompt to STDERR (so it shows on the terminal) and echo ONLY the entered value on stdout for $( ) capture.
+ask()        { local p="$1" v; { printf '  '; c '38;5;205'; printf '%s' "$p"; rst; } >&2; read -r v; printf '%s' "$v"; }
+ask_secret() { local p="$1" v; { printf '  '; c '38;5;205'; printf '%s' "$p"; rst; } >&2; read -rs v; printf '\n' >&2; printf '%s' "$v"; }  # no echo (tokens)
 
 interactive_menu() {
   while true; do
@@ -82,8 +84,8 @@ interactive_menu() {
     case "$choice" in
       1) exec "$0" serve ;;
       2) exec "$0" serve --worker ;;
-      3) s="$(ask 'server (wss://HOST:8787/ws): ')"; t="$(ask 'join token: ')"; exec "$0" join --server "$s" --token "$t" ;;
-      4) s="$(ask 'server (wss://HOST:8787/ws): ')"; t="$(ask 'join token: ')"; exec "$0" isolate --server "$s" --token "$t" ;;
+      3) s="$(ask 'server (wss://HOST:8787/ws): ')"; t="$(ask_secret 'join token: ')"; exec "$0" join --server "$s" --token "$t" ;;
+      4) s="$(ask 'server (wss://HOST:8787/ws): ')"; t="$(ask_secret 'join token: ')"; exec "$0" isolate --server "$s" --token "$t" ;;
       5) "$0" monitor || true; ;;
       6) "$0" workers || true; ;;
       7) id="$(ask 'worker id: ')"; a="$(ask 'action (pause/resume): ')"; "$0" "$a" "$id" || true ;;
@@ -151,8 +153,10 @@ case "$cmd" in
   workers) curl -fsS "$(mg_base)/workers" -H "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}" ;;
   pause)   mg_ctl "${1:-}" '{"action":"pause"}' ;;
   resume)  mg_ctl "${1:-}" '{"action":"resume"}' ;;
-  set)     mg_ctl "${1:-}" "{\"ceil\":${2:-0.6}}" ;;
-  schedule) mg_ctl "${1:-}" "{\"schedule\":\"${2:-always}\"}" ;;
+  set)     case "${2:-}" in ''|*[!0-9.]*) echo "[moregpu] duty must be a number 0.05-1" >&2; exit 2;; esac
+           mg_ctl "${1:-}" "{\"ceil\":${2}}" ;;
+  schedule) case "${2:-always}" in always|idle-only|[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]) : ;; *) echo "[moregpu] schedule must be always | idle-only | HH:MM-HH:MM" >&2; exit 2;; esac
+           mg_ctl "${1:-}" "{\"schedule\":\"${2:-always}\"}" ;;
   rm|remove) mg_ctl "${1:-}" '{"action":"remove"}' ;;
 
   monitor)
