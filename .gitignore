@@ -58,3 +58,9 @@ docs/adr/
 __pycache__/
 media/
 *.pyc
+
+# Python build artifacts
+clients/python/dist/
+clients/python/*.egg-info/
+clients/python/build/
+.venv*/
