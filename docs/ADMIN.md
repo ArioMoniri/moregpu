@@ -160,4 +160,4 @@ The service runs the same supervised restart loop as a foreground worker: if the
 
 ## 10. Authorized use
 
-Run workers only on machines you own or are explicitly authorized to use. MoreGPU is neutral infrastructure and ships no automation for enrolling free CI runners, notebook services, or trial VPS instances — using it on third-party platforms is very often prohibited by their Terms of Service. All responsibility, legal risk, and compliance rest entirely with the operator. The software is provided AS IS, without warranty, and the authors accept no liability. Apache-2.0 © 2026 Ariorad Moniri.
+Run workers only on machines you own or are explicitly authorized to use. MoreGPU is neutral infrastructure: it ships a generic authorized-runtime worker joiner and no automation for evading any platform's Terms of Service, quotas, or bot-detection — using it on third-party platforms is very often prohibited by their Terms of Service. All responsibility, legal risk, and compliance rest entirely with the operator. The software is provided AS IS, without warranty, and the authors accept no liability. Apache-2.0 © 2026 Ariorad Moniri.

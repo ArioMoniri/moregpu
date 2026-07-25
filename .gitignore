@@ -64,3 +64,6 @@ clients/python/dist/
 clients/python/*.egg-info/
 clients/python/build/
 .venv*/
+
+# build artifacts (attached to GitHub Releases, not committed)
+*.tgz

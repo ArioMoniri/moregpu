@@ -6,7 +6,7 @@
 
 MoreGPU is a native GPU compute pool: an admin runs a coordinator, worker machines join with a one-liner over an outbound WebSocket, and submitted jobs are sharded, sealed, computed on each worker's GPU (or CPU), and pooled back with verification.
 
-> ⚠️ **Authorized machines only.** Run MoreGPU on hardware you own or are explicitly permitted to use. Running workers on free or shared third‑party platforms — Google Colab, GitHub Actions and other CI runners, free/trial VPS — is **usually prohibited by their Terms of Service**, and this project ships no tooling to do so. **All legal and compliance responsibility is entirely yours.** See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md).
+> ⚠️ **Authorized machines only.** Run MoreGPU on hardware you own or are explicitly permitted to use. Running workers on free or shared third‑party platforms — Google Colab, GitHub Actions and other CI runners, free/trial VPS — is **usually prohibited by their Terms of Service**. MoreGPU ships a generic worker joiner usable on any runtime you're permitted to use, and **no automation for evading** any platform's Terms of Service, quotas, or bot‑detection. **All legal and compliance responsibility is entirely yours.** See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md).
 
 <p align="center">
   <img src="docs/assets/moregpu-manim.gif" alt="MoreGPU — submit → shard → seal → compute on GPU/CPU → pool → verify" width="820">
@@ -162,11 +162,21 @@ irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps
 | `MOREGPU_SERVICE=1` | Install a reboot-surviving service (systemd / launchd / Windows task); restarts after logout or reboot. |
 | `MOREGPU_THROTTLE=0.4` | Duty-cycle **ceiling** (`0.05`–`1`). The effective duty adapts below this from the machine's live load. |
 | `MOREGPU_MAX_UTIL=0.85` | Total-utilization cap. The pool uses only the slack below it, backing off as its user gets busier. |
+| `MOREGPU_SCHEDULE` | **When** to contribute: `always` (default) · `idle-only` (only when the machine is idle) · `HH:MM-HH:MM` active window in local time (may wrap midnight, e.g. `22:00-07:00` = nights only). Outside the window the worker takes no new work; in-flight shards always finish. |
 | `MOREGPU_FORCE_CPU=1` (or `--cpu`) | Contribute with CPU only (skip the GPU). |
 | `MOREGPU_NAME` | Name for this worker in the dashboard. |
 | `MOREGPU_TMUX=1` | Run detached inside a tmux session. |
 
-> **Or use the [`moregpu` CLI](scripts/moregpu)** (installable via Homebrew): `moregpu serve`, `moregpu join --server … --token …`, `moregpu stop`, `moregpu status`, `moregpu monitor`.
+> **You stay in control of your own machine.** Set `MOREGPU_SCHEDULE` to lend it only nights/when idle, cap it with `MOREGPU_THROTTLE`, or just `Ctrl-C` / `moregpu stop` any time. The admin can also pause, cap, reschedule, or remove any worker remotely (below) — but they can never make your machine take more than *your* `MOREGPU_MAX_UTIL` slack.
+
+> [!TIP]
+> 🔒 **Dedicated hardware isolation (Linux).** Pin a worker to bounded, isolated resources (a cgroups‑v2 scope: CPU quota, cpuset, memory cap, idle I/O) so the pool can never disturb you, via [`scripts/isolate-linux.sh`](scripts/isolate-linux.sh) or `moregpu isolate`:
+> ```sh
+> MOREGPU_CPU_QUOTA=40% MOREGPU_CPUS=2-3 MOREGPU_MEM_MAX=2G \
+>   moregpu isolate --server wss://ADMIN:8787/ws --token <join-token>
+> ```
+
+> **Or use the [`moregpu` CLI](scripts/moregpu)**: `moregpu serve [--worker]`, `moregpu join --server … --token … [--schedule 22:00-07:00]`, `moregpu isolate …`, `moregpu stop`, `moregpu status`, and admin fleet control — `moregpu workers`, `moregpu pause <id>`, `moregpu resume <id>`, `moregpu set <id> <duty>`, `moregpu rm <id>`.
 
 ---
 
@@ -234,11 +244,19 @@ MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
 
 Drive the pool from an application with the client SDK, or the CLI.
 
+Install from the [**latest GitHub Release**](https://github.com/ArioMoniri/moregpu/releases/latest) — no registry account needed:
+
 ```sh
-pip install moregpu-client          # Python SDK + `moregpu-client` CLI (stdlib only)
-npm install @moregpu/client         # TypeScript/JS SDK (Deno / Node / browser)
-brew install --HEAD ariomoniri/moregpu/moregpu   # the `moregpu` CLI (serve / join / stop / monitor)
+# Python SDK (standard library only)
+pip install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu_client-0.1.0-py3-none-any.whl
+# TypeScript/JS SDK (Deno / Node / browser)
+npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.1.0.tgz
+# `moregpu` CLI (serve / join / isolate / stop / monitor)
+curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/moregpu -o /usr/local/bin/moregpu && chmod +x /usr/local/bin/moregpu
 ```
+
+> [!NOTE]
+> The SDKs are **not yet on PyPI / npmjs / a Homebrew tap** — publishing to those registries needs the maintainer's tokens. The Release artifacts above are the real, working install today; the maintainer publish steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing). (Once on PyPI/npm this becomes `pip install moregpu-client` / `npm install @moregpu/client`.)
 
 **JavaScript / TypeScript** ([`@moregpu/client`](packages/client), runs in Deno / Node / browsers):
 
@@ -278,6 +296,9 @@ docker compose up -d                              # Grafana → http://localhost
   <img src="docs/assets/grafana.png" alt="MoreGPU Grafana dashboard — fleet size, queue depth, total units pooled, jobs done/failed, avg user util & pool duty, and per-worker share/units" width="900">
   <br><sub>The pre-provisioned Grafana dashboard, live: fleet size, queue depth, units pooled, jobs done/failed, avg user-util & pool-duty, and per-worker share + units (here <code>cpu-x</code> and the built-in <code>admin-slot</code>).</sub>
 </p>
+
+> [!NOTE]
+> **Why Prometheus + Grafana?** For a single-admin self-hosted pool it's still the pragmatic 2026 choice — tiny footprint, ubiquitous, dashboards included. The `/metrics` endpoint is plain OpenMetrics, so if you outgrow it you can point **VictoriaMetrics** (metrics at scale) or an OTel-native all-in-one like **OpenObserve** / **SigNoz** at the same endpoint without changing MoreGPU.
 
 ---
 
@@ -335,7 +356,7 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 
 ## Authorized use only
 
-Run workers only on machines you own or are explicitly authorized to use. MoreGPU is neutral infrastructure and does not provide any automation for turning free CI runners, notebook services, or trial VPS instances into pool workers; using it on third-party platforms is very often prohibited by their Terms of Service. All responsibility, legal risk, and compliance rest entirely with the operator. See the acceptable-use notice above and `LICENSE` for full terms.
+Run workers only on machines you own or are explicitly authorized to use. MoreGPU is neutral infrastructure: it ships a generic authorized-runtime worker joiner (usable on any runtime you're permitted to use, including a notebook you control such as [`examples/colab_worker.ipynb`](examples/colab_worker.ipynb)) and **no automation for evading** any platform's Terms of Service, quotas, or bot-detection. Using it on third-party platforms is very often prohibited by their Terms of Service. All responsibility, legal risk, and compliance rest entirely with the operator. See the acceptable-use notice above and `LICENSE` for full terms.
 
 ## License
 

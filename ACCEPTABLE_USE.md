@@ -49,9 +49,11 @@ explicitly permit the workload you intend to run** (for example, paid or
 self-managed runtimes and instances that you control and that allow background
 compute). If the ToS is silent or ambiguous, treat it as prohibited.
 
-MoreGPU does **not** provide, and its maintainer will not provide, any automation
-or tooling for turning free CI runners, free notebooks, or trial instances into
-pool workers. The absence of a technical barrier is **not** permission.
+MoreGPU ships a **generic worker joiner** that runs on any runtime you are permitted
+to use (including a notebook you control, such as `examples/colab_worker.ipynb`). It
+provides **no automation for evading** any platform's Terms of Service, quotas, or
+bot-detection, and its maintainer will not add any. The absence of a technical
+barrier is **not** permission.
 
 Violating a platform's Terms of Service can result in account suspension or
 termination, forfeiture of resources, and — depending on jurisdiction and

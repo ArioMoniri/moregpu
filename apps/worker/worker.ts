@@ -32,6 +32,29 @@ const CORES = Math.max(1, navigator.hardwareConcurrency || 4);
 let emaUtil = 0; // smoothed system utilization (excluding transient spikes)
 let lastDuty = MIN_DUTY;
 
+// ---------- scheduling + remote control (the USER decides WHEN this machine is lent; the ADMIN can override) ----------
+// MOREGPU_SCHEDULE / --schedule:  "always" (default) · "idle-only" (only when the machine is idle) ·
+//   "HH:MM-HH:MM" active window in local time (may wrap past midnight, e.g. "22:00-07:00" = nights only).
+// While outside the window / not idle / admin-paused, the worker takes NO new work (duty 0) and reports
+// "paused" so the coordinator stops assigning to it. In-flight shards always finish (work is never dropped).
+let SCHEDULE = (args.get('schedule') ?? Deno.env.get('MOREGPU_SCHEDULE') ?? 'always').trim().toLowerCase();
+let adminPaused = false; // toggled by an admin 'control' frame from the coordinator
+const IDLE_UTIL = Math.max(0.05, Math.min(0.9, Number(Deno.env.get('MOREGPU_IDLE_UTIL') ?? 0.25)));
+function inWindow(now: Date): boolean {
+  const m = SCHEDULE.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+  if (!m) return true; // not a time window → always (unless 'idle-only', handled below)
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const s = (+m[1]) * 60 + (+m[2]), e = (+m[3]) * 60 + (+m[4]);
+  return s <= e ? (cur >= s && cur < e) : (cur >= s || cur < e); // wrap past midnight
+}
+function scheduleActive(): boolean {
+  if (SCHEDULE === 'idle-only') return emaUtil > 0 ? emaUtil < IDLE_UTIL : true;
+  if (SCHEDULE === 'always' || SCHEDULE === '') return true;
+  return inWindow(new Date());
+}
+/** May the pool give this machine new work right now? */
+function isActive(): boolean { return !adminPaused && scheduleActive(); }
+
 /** Sample the machine's own load and return the duty we're allowed right now (adaptive per-user). */
 function effectiveDuty(): number {
   const ceil = Number.isNaN(CEIL) ? 0.6 : CEIL;
@@ -191,16 +214,26 @@ function connect() {
   let hb: ReturnType<typeof setInterval> | undefined;
   ws.onopen = () => {
     ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os } }));
-    // Heartbeat: report live load + the adaptive duty so the admin panel can show throttle in real time.
+    // Heartbeat: report live load, adaptive duty, and whether the schedule/admin currently allow work.
     hb = setInterval(() => {
       let load1 = 0; try { load1 = Deno.loadavg()[0]; } catch { /* */ }
-      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1, cores: CORES, util: +(load1 / CORES).toFixed(3), duty: +effectiveDuty().toFixed(3) })); } catch { /* */ }
+      const active = isActive();
+      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1, cores: CORES, util: +(load1 / CORES).toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, paused: !active, schedule: SCHEDULE })); } catch { /* */ }
     }, 4000);
   };
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data as string);
     if (msg.t === 'denied') { console.error(`[worker] rejected by server: ${msg.reason}. Check the join token.`); try { ws.close(); } catch { /* */ } Deno.exit(1); }
-    if (msg.t === 'welcome') { tenantKey = b64d(msg.tenantKeyB64); if (Number.isNaN(CEIL)) CEIL = typeof msg.duty === 'number' ? msg.duty : 0.6; console.log(`[worker] joined pool · duty ceiling=${(CEIL * 100).toFixed(0)}% · adaptive (backs off as your machine gets busier, keeps total load < ${(MAX_UTIL * 100).toFixed(0)}%)`); return; }
+    if (msg.t === 'welcome') { tenantKey = b64d(msg.tenantKeyB64); if (Number.isNaN(CEIL)) CEIL = typeof msg.duty === 'number' ? msg.duty : 0.6; console.log(`[worker] joined pool · duty ceiling=${(CEIL * 100).toFixed(0)}% · schedule=${SCHEDULE} · adaptive (backs off as your machine gets busier, keeps total load < ${(MAX_UTIL * 100).toFixed(0)}%)`); return; }
+    if (msg.t === 'control') { // the admin remotely pauses/resumes, caps duty, or sets a schedule for this machine
+      if (typeof msg.pause === 'boolean') adminPaused = msg.pause;
+      if (typeof msg.ceil === 'number') CEIL = Math.max(MIN_DUTY, Math.min(1, msg.ceil));
+      if (typeof msg.schedule === 'string') SCHEDULE = msg.schedule.trim().toLowerCase();
+      const active = isActive();
+      console.log(`[worker] admin control → ${adminPaused ? 'PAUSED' : 'active'} · duty ceiling=${((Number.isNaN(CEIL) ? 0.6 : CEIL) * 100).toFixed(0)}% · schedule=${SCHEDULE}`);
+      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1: 0, cores: CORES, util: +emaUtil.toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, paused: !active, schedule: SCHEDULE })); } catch { /* */ }
+      return;
+    }
     if (msg.t === 'assign') {
       const t0 = performance.now();
       try {

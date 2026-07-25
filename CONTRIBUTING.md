@@ -140,3 +140,43 @@ deno check apps/worker/worker.ts apps/coordinator/server.ts
 Use the issue forms under **New issue**. Please redact any tokens, keys, or
 hostnames from logs before posting. Security vulnerabilities should be reported
 privately via a GitHub security advisory rather than a public issue.
+
+## Releasing & publishing
+
+The pool itself needs no install — the admin server and worker run straight from
+their raw GitHub URLs. The client **SDKs** and CLI are distributed as GitHub
+Release artifacts today; publishing them to public registries requires the
+maintainer's account tokens and is done as follows.
+
+**Build the artifacts:**
+
+```bash
+( cd clients/python && python3 -m build --wheel )     # → dist/moregpu_client-<ver>-py3-none-any.whl
+( cd packages/client && npm run build && npm pack )   # → moregpu-client-<ver>.tgz
+```
+
+**Cut a GitHub Release** (what users install from — no registry account needed):
+
+```bash
+gh release create v<ver> \
+  clients/python/dist/moregpu_client-<ver>-py3-none-any.whl \
+  packages/client/moregpu-client-<ver>.tgz \
+  --title "MoreGPU v<ver>" --notes "…"
+```
+
+**Publish to registries** (optional; needs the maintainer's own tokens — never commit them):
+
+```bash
+# PyPI  (needs a PyPI API token in ~/.pypirc or TWINE_PASSWORD)
+python3 -m twine upload clients/python/dist/*
+
+# npm  (needs `npm login`; the package is @moregpu/client)
+( cd packages/client && npm publish --access public )
+
+# Homebrew: move Formula/moregpu.rb into a tap repo `ArioMoniri/homebrew-moregpu`
+#   so `brew install ArioMoniri/moregpu/moregpu` resolves, then point its `url`/`sha256`
+#   at the release tarball.
+```
+
+Bump the version in `clients/python/pyproject.toml` and `packages/client/package.json`
+together, update `CHANGELOG.md`, then tag and release.

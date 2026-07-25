@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Contribution scheduling** — a worker sets `MOREGPU_SCHEDULE` (`always` ·
+  `idle-only` · `HH:MM-HH:MM` active window, may wrap midnight) to control *when*
+  its machine is lent. Outside the window it takes no new work; in-flight shards
+  always finish.
+- **Remote fleet control** — `POST /workers/:id/control` lets an admin pause,
+  resume, cap the duty ceiling, reschedule, relabel, or remove any worker; the
+  coordinator pushes a control frame to that worker. Exposed in the dashboard
+  (per-row controls, search, "pause/resume all") and the CLI (`moregpu pause /
+  resume / set / schedule / rm / workers`).
+- **High-worker-count admin UI** — the fleet table now searches, sorts by
+  contribution, and caps the rendered rows (with a "showing N of M" count) so the
+  dashboard stays responsive with many machines. No cap on how many can join.
+- **Linux hardware isolation** — [`scripts/isolate-linux.sh`](scripts/isolate-linux.sh)
+  (and `moregpu isolate`) pin a worker to a bounded cgroups-v2 scope (CPU quota,
+  cpuset, memory cap, idle I/O), degrading gracefully when systemd/cgroups v2 are
+  absent.
+- **CLI & admin-UI ASCII banners** and richer `--help`.
+- **`examples/verify_workloads.py`** — replays real GPU-user workloads (Linear,
+  MLP, LayerNorm, softmax head, single-head attention) against a live pool.
+
+### Changed
+
+- Documented the honest execution split (matmul on the GPU; memory-bound
+  elementwise/row-wise kernels on the worker CPU) and the real cryptography model
+  (AES-256-GCM sealing, Ed25519 result signatures, single-trust-domain limits) in
+  `SECURITY.md`, plus a hardware-grounded confidential-computing/TEE roadmap.
+- Client SDKs distributed as GitHub Release artifacts (wheel + npm tarball);
+  publishing to PyPI/npm/Homebrew documented in `CONTRIBUTING.md`.
+
 ## [0.1.0] - 2026-07-25
 
 Initial release: a native GPU compute pool with a networked coordinator and

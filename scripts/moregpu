@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# moregpu — one CLI to run, stop, and monitor a MoreGPU pool (admin server or worker).
+# moregpu — one CLI to run, join, control, and monitor a MoreGPU pool (admin server or worker).
 # Wraps the self-contained Deno apps. Install via Homebrew (see Formula/moregpu.rb) or:
 #   curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/moregpu -o /usr/local/bin/moregpu && chmod +x /usr/local/bin/moregpu
 set -euo pipefail
@@ -9,19 +9,38 @@ RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SERVER_TS="$RAW/apps/coordinator/server.ts"
 WORKER_TS="$RAW/apps/worker/worker.ts"
 
+banner() {
+  cat <<'ART'
+   __  __            ____ ____  _   _
+  |  \/  | ___  _ __/ ___|  _ \| | | |   native GPU compute pool
+  | |\/| |/ _ \| '__| |  _| |_) | | | |
+  | |  | | (_) | |  | |_| |  __/| |_| |
+  |_|  |_|\___/|_|   \____|_|    \___/
+ART
+}
+
 need_deno() {
   command -v deno >/dev/null 2>&1 && return 0
   echo "[moregpu] Deno is required. Install: curl -fsSL https://deno.land/install.sh | sh" >&2; exit 1
 }
 
+# Resolve the admin HTTP base from MOREGPU_SERVER (accepts ws/wss/http/https, with or without /ws).
+mg_base() { local b="${MOREGPU_SERVER:-http://localhost:8787}"; b="${b%/ws}"; b="${b/wss:/https:}"; b="${b/ws:/http:}"; echo "$b"; }
+mg_ctl()  { # <worker-id> <json-body> — POST an admin control frame
+  [ $# -ge 2 ] || { echo "[moregpu] usage: moregpu <pause|resume|set|rm> <worker-id> [value]" >&2; exit 2; }
+  curl -fsS -X POST "$(mg_base)/workers/$1/control" \
+    -H "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}" -H 'content-type: application/json' -d "$2"
+  echo
+}
+
 cmd="${1:-help}"; shift || true
 
 case "$cmd" in
-  serve)   # run the admin server
+  serve)   # run the admin server (add --worker to also lend THIS machine as a slot)
     need_deno
-    exec deno run --allow-net --allow-env --allow-read --allow-write "$SERVER_TS" "$@" ;;
+    exec deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys "$SERVER_TS" "$@" ;;
 
-  join)    # join this machine as a worker: moregpu join --server wss://ADMIN/ws --token TOK [--cpu]
+  join)    # join this machine as a worker: moregpu join --server wss://ADMIN/ws --token TOK [--cpu] [--schedule 22:00-07:00]
     need_deno
     exec deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
 
@@ -48,26 +67,52 @@ case "$cmd" in
     if command -v journalctl >/dev/null 2>&1; then journalctl --user -u moregpu-worker -f;
     else echo "[moregpu] logs: foreground workers print to their terminal; services log to the OS log."; fi ;;
 
+  isolate) # Linux: join as a worker pinned to bounded, isolated hardware (cgroups v2 / systemd scope)
+    need_deno
+    command -v bash >/dev/null 2>&1 || { echo "[moregpu] isolate needs bash (Linux, systemd + cgroups v2)"; exit 1; }
+    exec bash <(curl -fsSL "$RAW/scripts/isolate-linux.sh") \
+      deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
+
+  # ---- admin fleet control (needs MOREGPU_SERVER + MOREGPU_ADMIN_TOKEN) ----
+  workers) # list connected workers
+    curl -fsS "$(mg_base)/workers" -H "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}" ;;
+  pause)   mg_ctl "${1:-}" '{"action":"pause"}' ;;      # moregpu pause <worker-id>
+  resume)  mg_ctl "${1:-}" '{"action":"resume"}' ;;     # moregpu resume <worker-id>
+  set)     mg_ctl "${1:-}" "{\"ceil\":${2:-0.6}}" ;;    # moregpu set <worker-id> <duty 0.05–1>
+  schedule) mg_ctl "${1:-}" "{\"schedule\":\"${2:-always}\"}" ;; # moregpu schedule <id> <always|idle-only|HH:MM-HH:MM>
+  rm|remove) mg_ctl "${1:-}" '{"action":"remove"}' ;;   # moregpu rm <worker-id>
+
   monitor) # print pool status from the admin API. env: MOREGPU_SERVER (http URL), MOREGPU_ADMIN_TOKEN
-    base="${MOREGPU_SERVER:-http://localhost:8787}"; base="${base%/ws}"; base="${base/wss:/https:}"; base="${base/ws:/http:}"
-    tok="${MOREGPU_ADMIN_TOKEN:-}"
+    base="$(mg_base)"; tok="${MOREGPU_ADMIN_TOKEN:-}"
     echo "[moregpu] $base/device"; curl -fsS "$base/device" -H "authorization: Bearer $tok" || echo "  (need MOREGPU_ADMIN_TOKEN, and the server reachable)"
     echo; echo "[moregpu] workers:"; curl -fsS "$base/workers" -H "authorization: Bearer $tok" || true ;;
 
   version) echo "moregpu CLI (repo $REPO@$BRANCH)" ;;
 
-  help|*)
+  help|--help|-h|*)
+    banner
     cat <<EOF
-moregpu — run, stop, and monitor a MoreGPU pool.
 
-  moregpu serve [--port N] [--allow-...]      run the admin server (prints a setup wizard)
-  moregpu join --server wss://HOST:8787/ws --token TOK [--cpu] [--throttle 0.4] [--name X]
-                                              join this machine to a pool as a worker
-  moregpu install                             install the worker as a reboot-surviving service
-  moregpu stop                                stop the worker (service / tmux) — foreground: Ctrl-C
-  moregpu status                              show the worker service status
-  moregpu logs                                follow the worker service logs
-  moregpu monitor                             print pool device + workers (env: MOREGPU_SERVER, MOREGPU_ADMIN_TOKEN)
+  ${cmd:+}moregpu — run, join, control, and monitor a MoreGPU pool.
+
+  RUN A POOL
+    moregpu serve [--worker] [--port N]        run the admin server (prints a setup wizard)
+                                               --worker also lends THIS machine as a slot
+
+  LEND A MACHINE
+    moregpu join --server wss://HOST:8787/ws --token TOK [--cpu] [--throttle 0.4]
+                 [--schedule 22:00-07:00 | idle-only]   join as a worker (set WHEN you contribute)
+    moregpu install                            install the worker as a reboot-surviving service
+    moregpu isolate --server … --token …       Linux: run pinned to bounded, isolated hardware
+    moregpu stop | status | logs               control the local worker service
+
+  ADMIN FLEET CONTROL   (env: MOREGPU_SERVER, MOREGPU_ADMIN_TOKEN)
+    moregpu workers                            list connected workers
+    moregpu pause <id> | resume <id>           pause/resume one worker
+    moregpu set <id> <duty>                    cap a worker's duty ceiling (0.05–1)
+    moregpu schedule <id> <spec>               set a worker's schedule remotely
+    moregpu rm <id>                            disconnect (kick) a worker
+    moregpu monitor                            print pool device + workers
 
 Docs: https://github.com/$REPO
 EOF
