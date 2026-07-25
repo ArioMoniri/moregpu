@@ -27,14 +27,45 @@ There are **two roles** — pick yours:
 
 ---
 
+## 🔑 What is a token?
+
+MoreGPU never shares credentials between pools. The **first time** you start the admin server, the setup wizard mints this pool's secrets and writes them to `.moregpu-server.json`. They persist, so every later restart reuses the same pool. Two of them are yours to hand out; one never leaves the server.
+
+| Token | Minted by | Where you set it | What the holder can do |
+|---|---|---|---|
+| 👑 **Admin token** | wizard, first run (24 random bytes) | `Authorization: Bearer <admin-token>` on every admin call · the dashboard's token box · `adminToken` in the SDKs | Full control: submit jobs, read every job's input **and output**, read `/workers`, `/jobs`, `/logs`, `/metrics` |
+| 🖥️ **Worker join token** | wizard, first run (18 random bytes) | `MOREGPU_TOKEN=…` in the worker one-liner | Enroll a machine as a compute worker |
+| 🔒 **Tenant key** (AES-256-GCM) | wizard, first run (32 random bytes) | never displayed; stays in `.moregpu-server.json` | Seal / unseal shard payloads on the wire |
+
+> [!IMPORTANT]
+> 👑 **Admin token = pool control.** Anyone holding it can submit work and read the plaintext inputs/outputs of every job. Send it only over TLS/`https`, always in the `Authorization` header (never in a URL), and keep it in a secret manager — not a committed file.
+
+> [!WARNING]
+> 🔒 **Join token = the encryption key.** A valid join token is how a machine *earns* the shared AES-256-GCM tenant key (the server ships it in the `welcome` frame). MoreGPU is **single-trust-domain: workers hold the tenant key.** A leaked join token lets an attacker enroll a rogue worker, receive that key, and decrypt every sealed shard. Treat it like a password; send it only over `wss://`/TLS.
+
+> [!TIP]
+> **Rotate a leaked token:** stop the server (`Ctrl-C`), delete `.moregpu-server.json`, restart — the wizard mints fresh tokens **and a fresh tenant key**. Workers then re-join with the new join token.
+
+---
+
 ### 👑 Admin track
 
-**1 · Start the admin server.** First run prints a setup wizard with this pool's tokens and the exact worker command to hand out.
+> [!TIP]
+> 🖥️ **Run this on the machine that will host the pool.** Its first run prints your tokens + the worker command to hand out.
+
+**1 · Start the admin server.**
 
 ```sh
 deno run --allow-net --allow-env --allow-read --allow-write \
   https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts
 ```
+
+> [!TIP]
+> ☝️ **Solo, one machine?** Add `--worker` (and `--allow-run --allow-sys`) — your own GPU joins as `admin-slot`, so you can submit jobs immediately with no separate worker, just like a local GPU:
+> ```sh
+> deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys \
+>   https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts --worker
+> ```
 
 <details><summary><b>▶ What to expect · verify it's up · monitor · stop</b></summary>
 
@@ -75,11 +106,17 @@ Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale, softmax, layernorm
 
 The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live contribution + trend sparklines, the queue, and the error/debug log. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).
 
+<p align="center">
+  <img src="docs/assets/admin-panel.png" alt="MoreGPU admin dashboard — virtual GPU, live per-worker contribution and trend sparklines, per-kernel jobs, and the error/debug log" width="900">
+  <br><sub>The live admin dashboard: virtual-GPU slot, per-worker contribution + trends, per-kernel jobs, error/debug log. The <code>admin-slot</code> row is this machine's built-in worker.</sub>
+</p>
+
 ---
 
 ### 🖥️ Worker track
 
-**Join a machine to a pool** with the admin's join token. Installs Deno if needed; uses the GPU (WebGPU → Metal / Vulkan / D3D12) or falls back to CPU. Nothing shows on screen — it only dials **out**.
+> [!TIP]
+> 🖥️ **Run this on each machine you want to lend** (with the admin's join token). Installs Deno if needed; uses the GPU (WebGPU → Metal / Vulkan / D3D12) or falls back to CPU. Nothing shows on screen — it only dials **out**.
 
 ```sh
 # Linux / macOS
@@ -124,6 +161,53 @@ irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps
 > **Or use the [`moregpu` CLI](scripts/moregpu)** (installable via Homebrew): `moregpu serve`, `moregpu join --server … --token …`, `moregpu stop`, `moregpu status`, `moregpu monitor`.
 
 ---
+
+## ✅ How to test it works
+
+Copy-paste checks for each part. Set your values once:
+
+```sh
+ADMIN="http://localhost:8787"        # your admin server
+TOK="<admin-token>"                  # from the wizard
+```
+
+<details><summary><b>▶ Server is up · a worker joined · submit runs · data mode · metrics · signatures</b></summary>
+
+```sh
+# 1) server is up (public endpoint, no token)
+curl -s "$ADMIN/health"                                   # → {"ok":true,"fleet":N,"queue":0}
+
+# 2) the pool shows up as a GPU slot (device descriptor)
+curl -s "$ADMIN/device" -H "authorization: Bearer $TOK"   # name, backends, kernels, limits, capabilities
+
+# 3) a worker joined — it appears here with a live contribution share
+curl -s "$ADMIN/workers" -H "authorization: Bearer $TOK"  # [{"id":"…","backend":"gpu","share":…}]
+
+# 4) submit a benchmark job — expect "verified":true and "signed":true
+curl -s -X POST "$ADMIN/submit" -H "authorization: Bearer $TOK" \
+  -H 'content-type: application/json' -d '{"kernel":"matmul","size":512}'
+
+# 5) DATA MODE — send tensors, get the product back (verify [58,64,139,154]) via the SDK:
+python3 -c 'from examples.moregpu_client import MoreGPU; import os; \
+  print(MoreGPU(os.environ["ADMIN"], os.environ["TOK"]).matmul([1,2,3,4,5,6],[7,8,9,10,11,12],M=2,N=2,K=3))'
+
+# 6) Prometheus metrics (feed Grafana)
+curl -s "$ADMIN/metrics" -H "authorization: Bearer $TOK" | grep moregpu_fleet
+```
+
+**What "pass" looks like:** `/health` returns `ok:true`; `/workers` lists your machine(s); the submit returns
+`"verified":true,"signed":true` (Ed25519-signed result); data-mode matmul prints `[58.0, 64.0, 139.0, 154.0]`.
+</details>
+
+<details><summary><b>▶ Run the full self-test locally (server + workers + every kernel)</b></summary>
+
+```sh
+git clone https://github.com/ArioMoniri/moregpu && cd moregpu
+npm install && npm test          # 113 unit tests (protocol, gpu, scheduler, crypto, client, …)
+bash examples/e2e.sh             # end-to-end: server + a GPU + a throttled CPU worker + a sealed job
+bash scripts/smoke.sh            # smoke-tests every endpoint + every kernel against a live pool
+```
+</details>
 
 ## Use it from your code
 
@@ -193,6 +277,27 @@ Deployment topology — admin coordinator and outbound-only workers:
 </p>
 
 ---
+
+## 🎮 Can it run what I run?
+
+MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA replacement. Here's what a GPU user gets (✅ native · 🧩 compose from primitives · 🟡 partial · ❌ not supported):
+
+| Workload | | How / why |
+|---|---|---|
+| Dense fp32 matmul / GEMM | ✅ | Native tiled WGSL GEMM, verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
+| Elementwise + activations (add/mul/scale/saxpy/relu) | ✅ | First-class kernels; each op is its own dispatch (not fused). |
+| Softmax / LayerNorm | ✅ | Dedicated row-wise kernels, match a CPU reference to ~1e-8. |
+| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** ([`attention_demo.py`](examples/attention_demo.py)). Not flash-attention; no KV cache. |
+| Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. You orchestrate the graph from the SDK; weights are per-request, no residency. |
+| Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.). Works; fp32. |
+| Large / out-of-core matmul | 🟡 | Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink. |
+| Monte-Carlo / RNG-heavy sims | 🟡 | You supply random inputs (host-side RNG); the pool does the arithmetic. |
+| Full LLM inference (checkpoints, tokenizer, KV cache) | ❌ | No model loader/tokenizer/sampling/KV-cache, no fp16/int8. Impractical to hand-compose at scale. |
+| Training (autograd / backprop / optimizer) | ❌ | No autograd or gradient/optimizer kernels. Not a training platform. |
+| Conv2d / CNNs | 🧩 | im2col on the host, then native matmul — borderline practical, off-GPU unfold. |
+| CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
+
+**In one line:** it runs the small, correct primitive set it ships — matmul, elementwise, softmax, layernorm — on your real GPU with verified results, and lets you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
 
 ## Authorized use only
 
