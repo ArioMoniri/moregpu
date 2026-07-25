@@ -24,7 +24,8 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class WGSL kernels — run **on the GPU** on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU rather than adding raw speed. |
 | Softmax / LayerNorm | ✅ | Row-wise WGSL reductions (one workgroup per row) **on the GPU** on a GPU worker; CPU otherwise. Match a CPU reference to ~1e-8. |
 | Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention; no KV cache. |
-| Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. **Runnable**: [`examples/tiny_llm.py`](examples/tiny_llm.py) does a full toy-transformer forward pass on the pool's GPU. Weights are per-request, no residency. |
+| Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN — runnable in [`tiny_llm.py`](examples/tiny_llm.py). |
+| Split a model across workers/GPUs (pipeline) | 🧩 | **Weight residency**: `pool.upload_weight()` pins a layer's weights on a worker (sent once); `pool.matmul_resident()` runs where they live. Demo: [`pipeline_parallel.py`](examples/pipeline_parallel.py). fp32; no fp16/KV-cache. |
 | Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.); `pool.sum/mean/dot/norm` SDK helpers. Convenience, not throughput — each runs on one worker/one thread. |
 | Large / out-of-core matmul | 🟡 | Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink. |
 | Monte-Carlo / RNG-heavy sims | 🟡 | You supply random inputs (host-side RNG); the pool does the arithmetic. |
@@ -58,24 +59,16 @@ There are **two roles** — pick yours:
 
 ## 🔑 What is a token?
 
-MoreGPU never shares credentials between pools. The **first time** you start the admin server, the setup wizard mints this pool's secrets and writes them to `.moregpu-server.json`. They persist, so every later restart reuses the same pool. Two of them are yours to hand out; one never leaves the server.
+Every pool mints its **own** secrets on first run (into `.moregpu-server.json`, persisted). Two are yours to hand out; one never leaves the server.
 
-| Token | Minted by | Where you set it | What the holder can do |
+| Token | Bytes | Where you set it | The holder can… |
 |---|---|---|---|
-| 👑 **Admin token** | wizard, first run (24 random bytes) | `Authorization: Bearer <admin-token>` on every admin call · the dashboard's token box · `adminToken` in the SDKs | Full control: submit jobs, read every job's input **and output**, read `/workers`, `/jobs`, `/logs`, `/metrics` |
-| 🖥️ **Worker join token** | wizard, first run (18 random bytes) | `MOREGPU_TOKEN=…` in the worker one-liner | Enroll a machine as a compute worker |
-| 🔒 **Tenant key** (AES-256-GCM) | wizard, first run (32 random bytes) | never displayed; stays in `.moregpu-server.json` | Seal / unseal shard payloads on the wire |
-
-> [!IMPORTANT]
-> 👑 **Admin token = pool control.** Anyone holding it can submit work and read the plaintext inputs/outputs of every job. Send it only over TLS/`https`, always in the `Authorization` header (never in a URL), and keep it in a secret manager — not a committed file.
+| 👑 **Admin token** | 24 | `Authorization: Bearer …` — admin calls · dashboard · SDK | submit jobs, read every job's input **and output**, `/workers` `/jobs` `/metrics` |
+| 🖥️ **Join token** | 18 | `MOREGPU_TOKEN=…` in the worker one-liner | enroll a machine as a worker |
+| 🔒 **Tenant key** | 32 | never shown; stays in the config | seal/unseal shards on the wire (AES-256-GCM) |
 
 > [!WARNING]
-> 🔒 **Join token = the encryption key.** A valid join token is how a machine *earns* the shared AES-256-GCM tenant key (the server ships it in the `welcome` frame). MoreGPU is **single-trust-domain: workers hold the tenant key.** A leaked join token lets an attacker enroll a rogue worker, receive that key, and decrypt every sealed shard. Treat it like a password; send it only over `wss://`/TLS.
-
-> [!TIP]
-> **Rotate a leaked token:** stop the server (`Ctrl-C`), delete `.moregpu-server.json`, restart — the wizard mints fresh tokens **and a fresh tenant key**. Workers then re-join with the new join token.
-
-📎 **The full cryptography model** — AES-256-GCM sealing, Ed25519 result signatures, the honest single-trust-domain limits, and the hardening/TEE roadmap — is documented in [SECURITY.md](SECURITY.md#cryptography-in-moregpu-today).
+> **Both handed-out tokens are secrets — send them only over TLS (`https`/`wss`).** The admin token is full pool control (it reads plaintext I/O). The join token *earns* the shared tenant key: MoreGPU is **single-trust-domain — workers hold the key**, so a leaked join token lets a rogue worker decrypt every shard. Rotate by deleting `.moregpu-server.json` and restarting. Full crypto model → [SECURITY.md](SECURITY.md#cryptography-in-moregpu-today).
 
 ---
 
@@ -274,20 +267,14 @@ MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
 
 Drive the pool from an application with the client SDK, or the CLI.
 
-Install from the [**latest GitHub Release**](https://github.com/ArioMoniri/moregpu/releases/latest) — no registry account needed:
-
 ```sh
-# Python SDK (standard library only) — matmul, attention(), linear(), mlp(), reductions
-pip install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu_client-0.3.0-py3-none-any.whl
-# TypeScript/JS SDK (Deno / Node / browser)
-npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.3.0.tgz
-# `moregpu` CLI — Homebrew cask (installs Deno), or one curl:
-brew install --cask ArioMoniri/moregpu/moregpu
-curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/moregpu -o /usr/local/bin/moregpu && chmod +x /usr/local/bin/moregpu
+pip install moregpu-client                        # Python SDK — on PyPI
+brew install --cask ArioMoniri/moregpu/moregpu    # `moregpu` CLI (installs Deno)
+npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.3.0.tgz   # TS/JS SDK
 ```
 
 > [!NOTE]
-> The SDKs are **not yet on PyPI / npmjs** — publishing there needs the maintainer's registry tokens (not available in this environment, so it can't be done from here). The Release artifacts above install today with no account; the exact one-command publish steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing). Once on PyPI/npm this becomes `pip install moregpu-client` / `npm install @moregpu/client`.
+> `moregpu-client` is [live on PyPI](https://pypi.org/project/moregpu-client/). The JS SDK isn't on npmjs yet (install from the release tarball above, or `npm login` and publish per [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing)).
 
 **JavaScript / TypeScript** ([`@moregpu/client`](packages/client), runs in Deno / Node / browsers):
 
@@ -337,7 +324,7 @@ docker compose up -d                              # Grafana → http://localhost
 
 <sub>The animation at the top is rendered with <a href="scripts/manim/system.py">Manim</a>; a live Lottie version is on the <a href="https://ariomoniri.github.io/moregpu/">project site</a>.</sub>
 
-**Adaptive per-user throttle.** Each worker samples its own machine's load and lowers its pool duty as that machine's user gets busier, keeping total system utilization under a cap (`MOREGPU_MAX_UTIL`, default 85%). Use the PC harder and the pool quietly steps back, so the user is not disturbed and power draw stays low. CPU-only machines contribute to the same pool. Workers connect outbound only; enrolling a machine never requires opening an inbound port. Set `MOREGPU_SERVICE=1` for reboot survival and the supervised, self-healing restart loop. Provide `MOREGPU_TLS_CERT` and `MOREGPU_TLS_KEY` to serve over `wss://`. Each pool's tokens and encryption key are generated by the wizard on first run, so pools are isolated.
+**Adaptive per-user throttle.** Each worker watches its own machine's load and lowers its pool duty as the user gets busier, keeping total utilization under a cap (`MOREGPU_MAX_UTIL`, default 85%) — use the PC harder and the pool quietly steps back. Workers dial **outbound only** (no inbound port); `MOREGPU_SERVICE=1` adds reboot-surviving, self-healing supervision; `MOREGPU_TLS_CERT`/`_KEY` serve over `wss://`.
 
 Job flow — submit, shard, seal, compute, pool, verify:
 

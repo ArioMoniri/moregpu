@@ -149,6 +149,10 @@ interface Worker {
 }
 const workers = new Map<string, Worker>();
 const removedPubkeys = new Set<string>(); // workers an admin removed — refuse their re-registration (ban by key)
+// Weight RESIDENCY: a named weight is cached on ONE worker; a resident matmul (bRef) runs there without
+// re-sending the weight. Place different layers' weights on different workers to split a model (pipeline).
+const weightHome = new Map<string, { worker: string; rows: number; cols: number }>(); // weightId → home worker + dims
+const weightStore = new Map<string, Float32Array>(); // coordinator's own copy, used to verify resident results
 const REGISTER_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_REGISTER_TIMEOUT_MS') ?? 8000);
 const MAX_JOBS = Number(Deno.env.get('MOREGPU_MAX_JOBS') ?? 500); // cap retained job records (+ their output blobs)
 const safeId = (s: string) => (String(s ?? '').replace(/[^A-Za-z0-9._:@-]/g, '').slice(0, 64) || 'worker');
@@ -209,6 +213,9 @@ function wireWorker(ws: WebSocket) {
           if (m.paused === false) pumpQueue();
         }
       }
+    } else if (m.t === 'cached') {
+      if (!registered) return;
+      const cb = pendingCache.get(String(m.id)); if (cb) { pendingCache.delete(String(m.id)); cb({ ok: !!m.ok, error: m.error as string | undefined }); }
     } else if (m.t === 'result') {
       if (!registered) return;
       const p = pending.get(String(m.shardId));
@@ -230,6 +237,8 @@ function wireWorker(ws: WebSocket) {
     workers.delete(id);
     // reject any shard still in flight on this worker so the job fails fast instead of hanging the queue
     for (const [sid, p] of pending) if (p.workerId === id) { pending.delete(sid); p.reject(new Error(`worker ${id} disconnected mid-shard`)); }
+    // drop weights that lived on this worker — they must be re-uploaded (the coordinator forgets its home)
+    for (const [wid, home] of weightHome) if (home.worker === id) { weightHome.delete(wid); weightStore.delete(wid); }
     log('info', `worker left: ${id} · fleet=${workers.size}`);
   };
   ws.onerror = () => log('warn', `socket error${id ? ' from ' + id : ''}`);
@@ -306,7 +315,9 @@ function cpuMatmul(a: Float32Array, b: Float32Array, Mm: number, N: number, K: n
 type JobStatus = 'queued' | 'running' | 'done' | 'failed';
 interface JobRec { id: string; status: JobStatus; kernel: string; size: number; sealed: boolean; submittedAt: number; ms?: number; gflops?: number; verified?: boolean; signed?: boolean; shards?: { worker: string; backend: string; work: number; ms: number }[]; error?: string; dataMode?: boolean; output?: string; outLen?: number; }
 /** Real input a caller submitted (data mode); the pool computes on THIS data and returns the output. */
-interface JobInput { a?: Float32Array; b?: Float32Array; scalar?: number; M?: number; N?: number; K?: number; }
+interface JobInput { a?: Float32Array; b?: Float32Array; scalar?: number; M?: number; N?: number; K?: number; bRef?: string; }
+const residentCount = (wid: string) => [...weightHome.values()].filter((h) => h.worker === wid).length;
+const pendingCache = new Map<string, (r: { ok: boolean; error?: string }) => void>(); // /weights waits for the worker's ack
 const jobs = new Map<string, JobRec>();
 const jobInputs = new Map<string, JobInput>();
 const jobSigned = new Map<string, { signed: number; total: number }>(); // Ed25519 verification tally per job
@@ -399,6 +410,27 @@ async function runJob(rec: JobRec) {
   const input = jobInputs.get(rec.id); jobInputs.delete(rec.id);
   const data = !!input?.a; // data mode: compute on the caller's real tensors and return the output
   const t0 = performance.now();
+  // Resident matmul: A · (a weight that lives on its home worker). Runs whole on that worker — the weight
+  // is never re-sent. This is the building block for splitting a model across workers (pipeline parallel).
+  if (rec.kernel === 'matmul' && input?.bRef) {
+    const home = weightHome.get(input.bRef);
+    if (!home) throw new Error(`weight ${input.bRef} is not resident — upload it via POST /weights`);
+    const w = workers.get(home.worker);
+    if (!w || w.paused) throw new Error(`home worker for ${input.bRef} unavailable`);
+    const A = input.a!, K = home.rows, N = home.cols;
+    const M = input.M ?? Math.round(A.length / K);
+    if (A.length !== M * K) throw new Error(`resident matmul shape mismatch (A=${A.length}, expected ${M}x${K})`);
+    const out = await dispatchShard(w, rec.id, { kernel: 'matmul', a: f32ToB64(A), bRef: input.bRef, rows: M, N, K });
+    const wall = performance.now() - t0;
+    const B = weightStore.get(input.bRef);
+    if (B && M * N <= 640 * 640) { const ref = cpuMatmul(A, B, M, N, K); let md = 0; for (let i = 0; i < out.length; i++) md = Math.max(md, Math.abs(out[i] - ref[i])); rec.verified = md < Math.max(1e-2, K * 1e-4); }
+    rec.gflops = (2 * M * N * K) / (wall / 1000) / 1e9; rec.ms = wall;
+    rec.shards = [{ worker: w.id, backend: w.label, work: out.length, ms: 0 }];
+    rec.output = f32ToB64(out); rec.outLen = out.length;
+    const js = jobSigned.get(rec.id); rec.signed = !!js && js.total > 0 && js.signed === js.total; jobSigned.delete(rec.id);
+    log('info', `${rec.id} done: resident matmul ${input.bRef}@${w.id} · ${wall.toFixed(0)}ms · verified=${rec.verified}`);
+    return;
+  }
   if (rec.kernel === 'matmul') {
     // dims: data mode uses input.M/N/K (default square from array); else a random square of rec.size
     const M = data ? (input!.M ?? Math.round(Math.sqrt(input!.a!.length))) : rec.size;
@@ -501,7 +533,7 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === '/health') return json({ ok: true, fleet: workers.size, queue: queue.length });
   if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/device', '/gpu', '/workers', 'POST /workers/:id/control', 'POST /submit (?async=1)', '/jobs', '/jobs/:id', '/logs', '/metrics'], workerSchedule: 'MOREGPU_SCHEDULE=always|idle-only|HH:MM-HH:MM', auth: 'admin endpoints require Authorization: Bearer <admin token>' });
   // admin-gated
-  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || (req.method === 'POST' && url.pathname === '/submit')) {
+  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || (req.method === 'POST' && url.pathname === '/submit')) {
     if (!authOk(req)) return json({ error: 'unauthorized — send Authorization: Bearer <admin token>' }, 401);
   }
   if (url.pathname === '/gpu') return json(virtualGpu());
@@ -534,10 +566,35 @@ async function handler(req: Request): Promise<Response> {
     if (w.paused === false) pumpQueue(); // resuming may unblock the queue
     return json({ ok: true, id, paused: w.paused, ceil: w.duty, schedule: w.schedule ?? 'always', nick: w.nick });
   }
+  // Weight residency: upload a named weight (pinned resident on one worker), or list what's cached.
+  if (url.pathname === '/weights') {
+    if (req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; data?: string; rows?: number; cols?: number; worker?: string };
+      if (!body.id || typeof body.data !== 'string' || !body.rows || !body.cols) return json({ error: 'need {id, data (base64 f32), rows, cols, worker?}' }, 400);
+      const arr = b64ToF32(body.data);
+      if (arr.length !== body.rows * body.cols) return json({ error: `data length ${arr.length} != rows*cols ${body.rows * body.cols}` }, 400);
+      if (arr.length > 16_000_000) return json({ error: 'weight too large (>16M elements)' }, 413);
+      const active = activeFleet();
+      if (active.length === 0) return json({ error: 'no active worker to hold the weight' }, 503);
+      // home = explicit worker, else the active worker holding the fewest weights (spread the model across GPUs)
+      const home = body.worker ? active.find((w) => w.id === body.worker) : active.slice().sort((a, b) => residentCount(a.id) - residentCount(b.id))[0];
+      if (!home) return json({ error: `worker ${body.worker} not active` }, 404);
+      const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify({ data: body.data, rows: body.rows, cols: body.cols })));
+      const ack = new Promise<{ ok: boolean; error?: string }>((res) => { const t = setTimeout(() => { pendingCache.delete(body.id!); res({ ok: false, error: 'cache ack timeout' }); }, 30_000); pendingCache.set(body.id!, (r) => { clearTimeout(t); res(r); }); });
+      home.ws.send(JSON.stringify({ t: 'cache', id: body.id, sealed }));
+      const r = await ack;
+      if (!r.ok) return json({ error: `cache failed on ${home.id}: ${r.error}` }, 502);
+      weightHome.set(body.id, { worker: home.id, rows: body.rows, cols: body.cols });
+      weightStore.set(body.id, arr);
+      log('info', `weight ${body.id} (${body.rows}x${body.cols}) → resident on ${home.id}`);
+      return json({ ok: true, id: body.id, worker: home.id, rows: body.rows, cols: body.cols });
+    }
+    return json([...weightHome.entries()].map(([id, h]) => ({ id, worker: h.worker, rows: h.rows, cols: h.cols })));
+  }
   if (url.pathname === '/logs') return json(LOG.slice(-200).reverse());
   if (url.pathname === '/metrics') return new Response(prometheus(), { headers: { 'content-type': 'text/plain; version=0.0.4' } });
   if (req.method === 'POST' && url.pathname === '/submit') {
-    const body = await req.json().catch(() => ({})) as { kernel?: string; size?: number; a?: string; b?: string; scalar?: number; M?: number; N?: number; K?: number };
+    const body = await req.json().catch(() => ({})) as { kernel?: string; size?: number; a?: string; b?: string; scalar?: number; M?: number; N?: number; K?: number; bRef?: string };
     const kernel = KERNELS.includes(body.kernel ?? '') ? body.kernel! : 'matmul';
     // Data mode: caller supplies real tensors (base64 Float32) → the pool computes on THEM and returns the output.
     let input: JobInput | undefined;
@@ -546,7 +603,7 @@ async function handler(req: Request): Promise<Response> {
       const b = typeof body.b === 'string' ? b64ToF32(body.b) : undefined;
       const CAP = 16_000_000;
       if (a.length > CAP || (b && b.length > CAP)) return json({ error: 'input too large (>16M elements per buffer)' }, 413);
-      input = { a, b, scalar: body.scalar, M: body.M, N: body.N, K: body.K };
+      input = { a, b, scalar: body.scalar, M: body.M, N: body.N, K: body.K, bRef: body.bRef };
     }
     const size = Math.max(16, Math.min(kernel === 'matmul' ? 2048 : 8_000_000, Number(body.size ?? (kernel === 'matmul' ? 512 : 1_000_000))));
     // Async mode (GPU-style submit-and-poll): return the job handle immediately; caller polls GET /jobs/:id.

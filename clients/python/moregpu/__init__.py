@@ -17,7 +17,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
-__version__ = "0.2.0"
+try:  # keep __version__ in sync with the installed distribution, not a hand-edited string
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("moregpu-client")
+except Exception:
+    __version__ = "0.3.0"
 KERNELS = ("matmul", "vector_add", "vector_mul", "saxpy", "relu", "scale", "gelu", "softmax", "layernorm")
 
 
@@ -131,3 +135,23 @@ class MoreGPU:
 
     def norm(self, a: Sequence[float]) -> float:
         return math.sqrt(self.dot(a, a))
+
+    # ---- weight residency (split a model across workers / GPUs) ----
+    def upload_weight(self, wid: str, data: Sequence[float], rows: int, cols: int, worker: str | None = None) -> dict:
+        """Cache a named weight (rows×cols) RESIDENT on a worker; it is sent ONCE. Pin different layers'
+        weights to different workers to split a model across GPUs (pipeline). Returns {id, worker, rows, cols}."""
+        body: dict[str, Any] = {"id": wid, "data": _f32_b64(data), "rows": rows, "cols": cols}
+        if worker:
+            body["worker"] = worker
+        return self._req("/weights", "POST", body)
+
+    def weights(self) -> list[dict]:
+        """List resident weights and which worker holds each."""
+        return self._req("/weights")
+
+    def matmul_resident(self, A: Sequence[float], weight_id: str, M: int) -> list[float]:
+        """A(M×K) · <resident weight weight_id>(K×N), run on the worker holding the weight (never re-sent)."""
+        job = self._req("/submit", "POST", {"kernel": "matmul", "a": _f32_b64(A), "bRef": weight_id, "M": M})
+        if job.get("status") != "done":
+            raise RuntimeError(f"resident matmul not done: {job.get('status')} {job.get('error')}")
+        return _b64_f32(job["output"]) if job.get("output") else []

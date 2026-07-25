@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-25
+
+### Added
+
+- **Weight residency + pipeline parallelism** — `POST /weights` caches a named weight
+  RESIDENT on one worker (sent once); a resident matmul (`bRef`) runs where the weight
+  lives without re-sending it. SDK: `upload_weight()`, `weights()`, `matmul_resident()`.
+  This lets you **split a model across workers/GPUs** — demo: `examples/pipeline_parallel.py`
+  (a 2-layer MLP split across two workers, verified). `examples/tiny_llm.py` shows a full
+  toy-transformer forward pass and quantifies the wall for real LLMs.
+- `moregpu-client` **published to PyPI**: `pip install moregpu-client`.
+
+### Fixed
+
+- Review-council fixes to the 0.3.0 M8 work: coordinator timeouts no longer auto-pause a
+  healthy worker; auto-paused workers auto-recover and the last worker is never auto-paused;
+  a stale-queue reaper prevents hangs; GPU dispatches are chunked to respect
+  `maxComputeWorkgroupsPerDimension`; CLI prompts go to stderr (were invisible) and the token
+  prompt is no-echo.
+
 ## [0.3.0] - 2026-07-25
 
 ### Added

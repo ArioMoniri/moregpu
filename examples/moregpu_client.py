@@ -119,6 +119,25 @@ class MoreGPU:
     def mean(self, a) -> float: return self.sum(a) / len(a)
     def norm(self, a) -> float: return math.sqrt(self.dot(a, a))
 
+    # ---- weight residency (split a model across workers) ----
+    def upload_weight(self, wid: str, data: Sequence[float], rows: int, cols: int, worker: str | None = None) -> dict:
+        """Cache a named weight (rows×cols) RESIDENT on a worker; it is sent ONCE. Pin different layers'
+        weights to different workers to split a model across GPUs. Returns {id, worker, rows, cols}."""
+        body: dict[str, Any] = {"id": wid, "data": _f32_b64(data), "rows": rows, "cols": cols}
+        if worker:
+            body["worker"] = worker
+        return self._req("/weights", "POST", body)
+
+    def weights(self) -> list[dict]:
+        return self._req("/weights")
+
+    def matmul_resident(self, A: Sequence[float], weight_id: str, M: int) -> list[float]:
+        """A(M×K) · <resident weight weight_id>(K×N), run on the worker holding the weight (never re-sent)."""
+        job = self._req("/submit", "POST", {"kernel": "matmul", "a": _f32_b64(A), "bRef": weight_id, "M": M})
+        if job.get("status") != "done":
+            raise RuntimeError(f"resident matmul not done: {job.get('status')} {job.get('error')}")
+        return _b64_f32(job["output"]) if job.get("output") else []
+
 
 if __name__ == "__main__":
     import os

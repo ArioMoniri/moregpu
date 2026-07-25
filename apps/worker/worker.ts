@@ -340,10 +340,15 @@ let backend = (FORCE_CPU ? null : await makeGpuBackend().catch(() => null)) ?? m
 console.log(`[worker] ${NAME} · backend=${backend.label} · server=${SERVER}`);
 
 /** Run one shard on the current backend; on a GPU failure/device-loss, permanently fall back to CPU and retry. */
-async function computeShard(req: { kernel: string; a: string; b?: string; scalar?: number; rows?: number; N?: number; K?: number; cols?: number }): Promise<Float32Array> {
+async function computeShard(req: { kernel: string; a: string; b?: string; bRef?: string; scalar?: number; rows?: number; N?: number; K?: number; cols?: number }): Promise<Float32Array> {
   if (backend.kind === 'gpu' && gpuLost) { console.error('[worker] GPU marked lost — switching to CPU backend.'); backend = makeCpuBackend(); }
   const run = async (): Promise<Float32Array> => {
-    if (req.kernel === 'matmul') return await backend.matmul(b64ToF32(req.a), b64ToF32(req.b!), req.rows!, req.N!, req.K!);
+    if (req.kernel === 'matmul') {
+      // resident-weight matmul: B comes from this worker's cache (never re-sent over the network)
+      const B = req.bRef ? residentWeights.get(req.bRef) : b64ToF32(req.b!);
+      if (!B) throw new Error(`weight ${req.bRef} not resident on this worker`);
+      return await backend.matmul(b64ToF32(req.a), B, req.rows!, req.N!, req.K!);
+    }
     if (ROWWISE.has(req.kernel)) return backend.rowwise ? await backend.rowwise(req.kernel, b64ToF32(req.a), req.cols!) : runRowwise(req.kernel, b64ToF32(req.a), req.cols!);
     if (ELEMENTWISE.has(req.kernel)) return backend.elementwise ? await backend.elementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1) : await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
     throw new Error(`unknown kernel ${req.kernel}`);
@@ -356,6 +361,10 @@ async function computeShard(req: { kernel: string; a: string; b?: string; scalar
 }
 if (!TOKEN) console.log('[worker] warning: no join token set (--token / MOREGPU_TOKEN) — the server will reject me');
 let tenantKey: Uint8Array | null = null;
+// Weight RESIDENCY: named tensors cached on this worker so a matmul can reference one by id (bRef)
+// instead of re-uploading it every call. This is what lets a model be split across workers (place each
+// layer's weights on a different worker → activations pipeline through; weights are sent ONCE).
+const residentWeights = new Map<string, Float32Array>();
 
 function connect() {
   const ws = new WebSocket(SERVER);
@@ -384,6 +393,17 @@ function connect() {
       try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1: 0, cores: CORES, util: +emaUtil.toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, ceil: +(Number.isNaN(CEIL) ? 0.6 : CEIL).toFixed(2), paused: !active, pausedReason: reason, schedule: SCHEDULE })); } catch { /* */ }
       return;
     }
+    if (msg.t === 'cache') { // coordinator asks this worker to hold a named weight resident
+      try {
+        if (!tenantKey) throw new Error('no tenant key');
+        const w = JSON.parse(new TextDecoder().decode(await unseal(tenantKey, msg.sealed)));
+        residentWeights.set(msg.id, b64ToF32(w.data));
+        console.log(`[worker] cached weight ${msg.id} (${w.rows}x${w.cols}) · resident=${residentWeights.size}`);
+        ws.send(JSON.stringify({ t: 'cached', id: msg.id, ok: true }));
+      } catch (e) { ws.send(JSON.stringify({ t: 'cached', id: msg.id, ok: false, error: String(e) })); }
+      return;
+    }
+    if (msg.t === 'uncache') { residentWeights.delete(msg.id); return; }
     if (msg.t === 'assign') {
       const t0 = performance.now();
       try {
