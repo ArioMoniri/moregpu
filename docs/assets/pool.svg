@@ -51,7 +51,7 @@
     <rect x="604" y="128" width="384" height="264" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
   </g>
   <text x="628" y="158" font-size="13" font-weight="650" fill="#0f172a">Worker fleet</text>
-  <text x="792" y="158" font-size="11.5" fill="#94a3b8">headless · true-idle · yields on keystroke</text>
+  <text x="964" y="158" font-size="11.5" fill="#94a3b8" text-anchor="end">headless · true-idle · yields on keystroke</text>
 
   <!-- worker cards -->
   <g>

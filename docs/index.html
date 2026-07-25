@@ -86,7 +86,7 @@ irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps
   </div>
 </div>
 
-<h2>Tensor kernels</h2>
+<h2>Compute kernels</h2>
 <div class="card">
   <span class="k">matmul</span><span class="k">vector_add</span><span class="k">vector_mul</span>
   <span class="k">saxpy</span><span class="k">relu</span><span class="k">scale</span>
@@ -95,10 +95,11 @@ irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps
 
 <h2>Admin panel &amp; observability</h2>
 <div class="card">
-A modern web dashboard (works where only a command line is available): a virtual-GPU view, the fleet with
-live per-worker load and adaptive duty, the job queue, and an errors/debug log. A Prometheus
-<code>/metrics</code> endpoint exposes fleet, queue depth, per-backend shard counts and utilization — point
-Grafana at it for pool dashboards. See the <a href="https://github.com/ArioMoniri/moregpu/blob/main/docs/ADMIN.md">admin guide</a>.
+A modern web dashboard — view it from any browser even when the server host is headless/CLI-only: a
+virtual-GPU view, the fleet with live per-worker load and adaptive duty, the job queue, and an errors/debug
+log. A Prometheus <code>/metrics</code> endpoint exposes fleet, queue depth, per-backend shard counts and
+utilization — scrape it with Prometheus and build Grafana dashboards on top. See the
+<a href="https://github.com/ArioMoniri/moregpu/blob/main/docs/ADMIN.md">admin guide</a>.
 </div>
 
 <h2>Use boundaries</h2>

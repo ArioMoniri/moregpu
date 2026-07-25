@@ -74,7 +74,7 @@ curl -X POST http://ADMIN:8787/submit \
 
 The coordinator shards the job across connected workers, AES-GCM seals each work unit so only ciphertext travels the wire, collects and pools the results, and verifies them. Task types available today: `matmul`, `vector_add`, `vector_mul`, `saxpy`, `relu`, `scale`. The set is extensible — add a WGSL kernel plus a CPU reference to support a new task type.
 
-The fleet is presented as one virtual GPU with a Slurm-like job queue. The admin dashboard (usable where only a command line exists) shows the virtual-GPU view, per-worker live load and adaptive duty, the job queue, and an errors/debug log; a Prometheus `/metrics` endpoint feeds Grafana. See the [admin guide](docs/ADMIN.md).
+The fleet is presented as one virtual GPU with a Slurm-like job queue. The admin dashboard — reachable from any browser even when the server host is headless/CLI-only — shows the virtual-GPU view, per-worker live load and adaptive duty, the job queue, and an errors/debug log. A Prometheus `/metrics` endpoint exposes the pool's numbers; scrape it with Prometheus and build Grafana dashboards on top. See the [admin guide](docs/ADMIN.md).
 
 ---
 

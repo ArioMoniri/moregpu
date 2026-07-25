@@ -13,8 +13,8 @@ Author: Ariorad Moniri. License: Apache-2.0. Repository: https://github.com/Ario
 - Reboot-surviving, self-healing services: MOREGPU_SERVICE=1 installs systemd (Linux) / launchd (macOS) / scheduled task (Windows); the installer supervises and restarts the worker.
 - Security: join-token gate on workers; admin-token gate on job submission; optional native TLS (wss). Each work unit is AES-256-GCM sealed in transit; the coordinator relays only ciphertext. Single-trust-domain by default (workers hold the tenant key to compute).
 - The fleet is presented as one virtual GPU with a Slurm-like job queue.
-- Tensor kernels available: matmul, vector_add, vector_mul, saxpy, relu, scale. Extensible by adding a WGSL kernel plus a CPU reference.
-- Admin web dashboard (works where only a CLI is available): virtual-GPU view, fleet with live per-worker load and adaptive duty, job queue, error/debug log, and a Prometheus /metrics endpoint to wire into Grafana.
+- Compute kernels available: matmul, vector_add, vector_mul, saxpy, relu, scale. Extensible by adding a WGSL kernel plus a CPU reference.
+- Admin web dashboard, viewable from any browser even when the server host is headless/CLI-only: virtual-GPU view, fleet with live per-worker load and adaptive duty, job queue, error/debug log, and a Prometheus /metrics endpoint (scrape with Prometheus and visualize in Grafana).
 
 ## Run (exact steps)
 
@@ -41,7 +41,7 @@ Author: Ariorad Moniri. License: Apache-2.0. Repository: https://github.com/Ario
 - POST /submit — {"kernel","size"} run a job (admin)
 - GET /jobs, GET /jobs/:id — job queue + history (admin)
 - GET /logs — recent errors/debug (admin)
-- GET /metrics — Prometheus metrics for Grafana (admin)
+- GET /metrics — Prometheus metrics; scrape with Prometheus, visualize in Grafana (admin)
 
 Admin endpoints require header: `Authorization: Bearer <admin token>`.
 
