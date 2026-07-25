@@ -9,7 +9,7 @@ MoreGPU is a native GPU compute pool: an admin runs a coordinator, worker machin
 > ⚠️ **Authorized machines only.** Run MoreGPU on hardware you own or are explicitly permitted to use. Running workers on free or shared third‑party platforms — Google Colab, GitHub Actions and other CI runners, free/trial VPS — is **usually prohibited by their Terms of Service**, and this project ships no tooling to do so. **All legal and compliance responsibility is entirely yours.** See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md).
 
 <p align="center">
-  <img src="docs/assets/hero.svg" alt="MoreGPU — idle machines pooled into one compute pool" width="840">
+  <img src="docs/assets/moregpu-manim.gif" alt="MoreGPU — submit → shard → seal → compute on GPU/CPU → pool → verify" width="820">
 </p>
 
 ---
@@ -46,6 +46,8 @@ MoreGPU never shares credentials between pools. The **first time** you start the
 > [!TIP]
 > **Rotate a leaked token:** stop the server (`Ctrl-C`), delete `.moregpu-server.json`, restart — the wizard mints fresh tokens **and a fresh tenant key**. Workers then re-join with the new join token.
 
+📎 **The full cryptography model** — AES-256-GCM sealing, Ed25519 result signatures, the honest single-trust-domain limits, and the hardening/TEE roadmap — is documented in [SECURITY.md](SECURITY.md#cryptography-in-moregpu-today).
+
 ---
 
 ### 👑 Admin track
@@ -67,7 +69,8 @@ deno run --allow-net --allow-env --allow-read --allow-write \
 >   https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts --worker
 > ```
 
-<details><summary><b>▶ What to expect · verify it's up · monitor · stop</b></summary>
+<details>
+<summary><b>▶ What to expect · verify it's up · monitor · stop</b></summary>
 
 **Expect:** a colored ASCII wizard printing the **Admin token**, the **Worker join token**, the dashboard URL (`http://HOST:8787`), and a ready-to-paste worker one-liner. Copy the two tokens — the admin token controls the pool; the join token lets machines enroll.
 
@@ -82,16 +85,18 @@ curl -s http://localhost:8787/device -H "authorization: Bearer <admin-token>"
 **Stop:** `Ctrl-C` in its terminal. Tokens/key persist in `.moregpu-server.json`, so the next start reuses the same pool.
 
 Optional env: `PORT`, `MOREGPU_HOST`, `MOREGPU_TLS_CERT`+`MOREGPU_TLS_KEY` (→ `wss://` TLS), `MOREGPU_DUTY`.
+
 </details>
 
 **2 · Submit a job.** Benchmark mode (the pool generates data), or send your own tensors (data mode).
 
 ```sh
 curl -X POST http://ADMIN:8787/submit -H "authorization: Bearer <admin-token>" \
-  -H "content-type: application/json" -d '{"kernel":"matmul","size":1024}'
+  -H "content-type: application/json" -d '{"kernel":"matmul","size":512}'
 ```
 
-<details><summary><b>▶ What to expect · send your own data · async · verify</b></summary>
+<details>
+<summary><b>▶ What to expect · send your own data · async · verify</b></summary>
 
 **Expect:** a job record `{"status":"done","gflops":…,"verified":true,"shards":[…]}`. `verified:true` means the pooled GPU result matched the CPU reference.
 
@@ -102,6 +107,7 @@ pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 
 **Async (GPU-style submit + poll):** add `?async=1` to get a job handle immediately, then poll `GET /jobs/<id>`.
 
 Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale, softmax, layernorm` (extensible). Enough to compose a real transformer block — see [`examples/attention_demo.py`](examples/attention_demo.py) and [AI usage](docs/AI_USAGE.md). The whole fleet is presented as one **virtual GPU slot** — `GET /device` returns its backends, kernels, limits, queue and capabilities.
+
 </details>
 
 The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live contribution + trend sparklines, the queue, and the error/debug log. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).
@@ -129,7 +135,8 @@ $env:MOREGPU_SERVER="wss://ADMIN:8787/ws"; $env:MOREGPU_TOKEN="<join-token>"
 irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps1 | iex
 ```
 
-<details><summary><b>▶ What to expect · verify you joined · monitor your impact · stop · run as a service</b></summary>
+<details>
+<summary><b>▶ What to expect · verify you joined · monitor your impact · stop · run as a service</b></summary>
 
 **Expect:** log lines like `[worker] <name> · backend=gpu:… · server=wss://…` then `[worker] joined pool · duty ceiling=60% · adaptive …`. It keeps running and pulling work; you'll see `… done in Nms on gpu/cpu` as shards complete.
 
@@ -145,6 +152,7 @@ irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps
 | tmux (`MOREGPU_TMUX=1`) | `tmux kill-session -t moregpu` |
 
 **Run as a reboot-surviving, self-healing service:** add `MOREGPU_SERVICE=1` to the one-liner.
+
 </details>
 
 **Worker options** (environment variables):
@@ -171,7 +179,8 @@ ADMIN="http://localhost:8787"        # your admin server
 TOK="<admin-token>"                  # from the wizard
 ```
 
-<details><summary><b>▶ Server is up · a worker joined · submit runs · data mode · metrics · signatures</b></summary>
+<details>
+<summary><b>▶ Server is up · a worker joined · submit runs · data mode · metrics · signatures</b></summary>
 
 ```sh
 # 1) server is up (public endpoint, no token)
@@ -197,9 +206,11 @@ curl -s "$ADMIN/metrics" -H "authorization: Bearer $TOK" | grep moregpu_fleet
 
 **What "pass" looks like:** `/health` returns `ok:true`; `/workers` lists your machine(s); the submit returns
 `"verified":true,"signed":true` (Ed25519-signed result); data-mode matmul prints `[58.0, 64.0, 139.0, 154.0]`.
+
 </details>
 
-<details><summary><b>▶ Run the full self-test locally (server + workers + every kernel)</b></summary>
+<details>
+<summary><b>▶ Run the full self-test locally (server + workers + every kernel + real ML workloads)</b></summary>
 
 ```sh
 git clone https://github.com/ArioMoniri/moregpu && cd moregpu
@@ -207,6 +218,16 @@ npm install && npm test          # 113 unit tests (protocol, gpu, scheduler, cry
 bash examples/e2e.sh             # end-to-end: server + a GPU + a throttled CPU worker + a sealed job
 bash scripts/smoke.sh            # smoke-tests every endpoint + every kernel against a live pool
 ```
+
+Then, with a pool running, replay the workloads a **real GPU user** runs — a Linear layer,
+a 2-layer MLP, LayerNorm, a softmax head, and a full single-head attention block — each
+checked against a CPU reference:
+
+```sh
+MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
+  python3 examples/verify_workloads.py     # → 7 passed, 0 failed (all match to ~1e-8)
+```
+
 </details>
 
 ## Use it from your code
@@ -229,30 +250,40 @@ const { output } = await pool.run('relu', { a: [-1, 2, -3, 4] });         // any
 const gpu = await pool.gpu();                                             // pool state + per-worker contribution
 ```
 
-**Python** ([`examples/moregpu_client.py`](examples/moregpu_client.py), dependency-free):
+**Python** (`pip install moregpu-client`, standard library only):
 
 ```python
-from moregpu_client import MoreGPU
+from moregpu import MoreGPU                                        # the installed package's module is `moregpu`
 pool = MoreGPU("http://ADMIN:8787", "<admin-token>")
 pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 139, 154]
 pool.run("relu", [-1, 2, -3, 4])                                  # any kernel on your own data
 ```
 
+> Prefer zero-install? Copy the single-file [`examples/moregpu_client.py`](examples/moregpu_client.py) and use `from moregpu_client import MoreGPU` instead — same API, no `pip`.
+
 For AI/ML workloads — which kernels map to which ops, batching patterns, and how to add a kernel — see [**docs/AI_USAGE.md**](docs/AI_USAGE.md).
 
 ## Monitoring (Grafana)
 
-The admin server exposes a Prometheus `/metrics` endpoint (fleet, queue, throughput, and **per-worker contribution**). A turnkey Prometheus + Grafana bundle with a pre-provisioned dashboard is in [`config/observability`](config/observability) — `docker compose up`, then Grafana on `:3000`.
+The admin server exposes a Prometheus `/metrics` endpoint (fleet, queue, throughput, and **per-worker contribution**). A turnkey Prometheus + Grafana bundle with a pre-provisioned dashboard is in [`config/observability`](config/observability):
+
+```sh
+cd config/observability
+export MOREGPU_ADMIN_TOKEN=<admin-token>
+export MOREGPU_TARGET=host.docker.internal:8787   # your admin host:port
+docker compose up -d                              # Grafana → http://localhost:3000
+```
+
+<p align="center">
+  <img src="docs/assets/grafana.png" alt="MoreGPU Grafana dashboard — fleet size, queue depth, total units pooled, jobs done/failed, avg user util & pool duty, and per-worker share/units" width="900">
+  <br><sub>The pre-provisioned Grafana dashboard, live: fleet size, queue depth, units pooled, jobs done/failed, avg user-util & pool-duty, and per-worker share + units (here <code>cpu-x</code> and the built-in <code>admin-slot</code>).</sub>
+</p>
 
 ---
 
 ## How it works
 
-<p align="center">
-  <img src="docs/assets/moregpu-manim.gif" alt="Animation: submit → shard → seal → compute on GPU/CPU → pool → verify" width="720">
-</p>
-
-<p align="center"><sub>Rendered with <a href="scripts/manim/system.py">Manim</a> · full docs and a lightweight animated version on the <a href="https://ariomoniri.github.io/moregpu/">project site</a>.</sub></p>
+<sub>The animation at the top is rendered with <a href="scripts/manim/system.py">Manim</a>; a live Lottie version is on the <a href="https://ariomoniri.github.io/moregpu/">project site</a>.</sub>
 
 **Adaptive per-user throttle.** Each worker samples its own machine's load and lowers its pool duty as that machine's user gets busier, keeping total system utilization under a cap (`MOREGPU_MAX_UTIL`, default 85%). Use the PC harder and the pool quietly steps back, so the user is not disturbed and power draw stays low. CPU-only machines contribute to the same pool. Workers connect outbound only; enrolling a machine never requires opening an inbound port. Set `MOREGPU_SERVICE=1` for reboot survival and the supervised, self-healing restart loop. Provide `MOREGPU_TLS_CERT` and `MOREGPU_TLS_KEY` to serve over `wss://`. Each pool's tokens and encryption key are generated by the wizard on first run, so pools are isolated.
 
@@ -284,9 +315,9 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 
 | Workload | | How / why |
 |---|---|---|
-| Dense fp32 matmul / GEMM | ✅ | Native tiled WGSL GEMM, verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
-| Elementwise + activations (add/mul/scale/saxpy/relu) | ✅ | First-class kernels; each op is its own dispatch (not fused). |
-| Softmax / LayerNorm | ✅ | Dedicated row-wise kernels, match a CPU reference to ~1e-8. |
+| Dense fp32 matmul / GEMM | ✅ | Native **WGSL GEMM on the GPU** (naive, non-tiled), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
+| Elementwise + activations (add/mul/scale/saxpy/relu) | ✅ | First-class kernels; each op is its own pass. These are memory-bound, so they run on the worker's **CPU** (not the GPU) even on a GPU machine. |
+| Softmax / LayerNorm | ✅ | Dedicated row-wise kernels (run on the worker's **CPU**), match a CPU reference to ~1e-8. |
 | Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** ([`attention_demo.py`](examples/attention_demo.py)). Not flash-attention; no KV cache. |
 | Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. You orchestrate the graph from the SDK; weights are per-request, no residency. |
 | Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.). Works; fp32. |
@@ -297,7 +328,10 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Conv2d / CNNs | 🧩 | im2col on the host, then native matmul — borderline practical, off-GPU unfold. |
 | CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
 
-**In one line:** it runs the small, correct primitive set it ships — matmul, elementwise, softmax, layernorm — on your real GPU with verified results, and lets you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
+**In one line:** it runs the small, correct primitive set it ships — matmul (on your real GPU via WGSL), plus elementwise, softmax and layernorm (on the worker's CPU) — with verified fp32 results, and lets you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
+
+> [!NOTE]
+> **What actually runs on the GPU:** `matmul` — the compute-bound workhorse — executes on each worker's GPU (WGSL → Metal/Vulkan/D3D12). The elementwise and row-wise kernels are memory-bound and run on the worker's CPU. A CPU-only worker runs everything on CPU. All paths return the same verified fp32 results.
 
 ## Authorized use only
 

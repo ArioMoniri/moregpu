@@ -1,5 +1,5 @@
-# Prometheus scrape config for a MoreGPU pool.
-# The /metrics endpoint requires the pool's admin token (sent as a Bearer credential).
+# Prometheus scrape config for a MoreGPU pool. __MG_TOKEN__/__MG_TARGET__ are substituted at container
+# start from MOREGPU_ADMIN_TOKEN / MOREGPU_TARGET (Prometheus itself does not expand env vars in config).
 global:
   scrape_interval: 5s
 scrape_configs:
@@ -8,6 +8,6 @@ scrape_configs:
     scheme: http
     authorization:
       type: Bearer
-      credentials: ${MOREGPU_ADMIN_TOKEN}
+      credentials: __MG_TOKEN__
     static_configs:
-      - targets: ["${MOREGPU_TARGET}"]
+      - targets: ["__MG_TARGET__"]

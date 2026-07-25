@@ -43,7 +43,7 @@ curl -X POST http://ADMIN:8787/submit \
   -d '{"size":1024}'
 ```
 
-Task types today: row-sharded `matmul` and `vector_add`. To add a task type, add a WGSL kernel plus a matching CPU reference implementation — the CPU reference is what results are verified against.
+Kernels today: `matmul`, `vector_add`, `vector_mul`, `saxpy`, `relu`, `scale`, `softmax`, `layernorm` (all fp32, sharded and pooled). `matmul` — the compute-bound one — runs on each worker's GPU via WGSL; the elementwise and row-wise kernels are memory-bound and run on the worker's CPU. To add a kernel, provide a compute path plus a matching CPU reference implementation — the CPU reference is what results are verified against. See [AI_USAGE.md](AI_USAGE.md) for the full kernel map.
 
 ---
 
@@ -114,10 +114,10 @@ Enrol a worker with `MOREGPU_SERVICE=1` to install a reboot-surviving, self-heal
 ### Linux — systemd (user service)
 
 ```sh
-systemctl --user status moregpu
-systemctl --user restart moregpu
-systemctl --user stop moregpu
-journalctl --user -u moregpu -f      # live logs
+systemctl --user status moregpu-worker
+systemctl --user restart moregpu-worker
+systemctl --user stop moregpu-worker
+journalctl --user -u moregpu-worker -f      # live logs
 ```
 
 If the worker should keep running after logout, enable lingering: `loginctl enable-linger $USER`.
@@ -126,17 +126,17 @@ If the worker should keep running after logout, enable lingering: `loginctl enab
 
 ```sh
 launchctl list | grep moregpu
-launchctl kickstart -k gui/$(id -u)/moregpu   # restart
-launchctl bootout   gui/$(id -u)/moregpu      # stop/unload
+launchctl kickstart -k gui/$(id -u)/dev.moregpu.worker   # restart
+launchctl bootout   gui/$(id -u)/dev.moregpu.worker      # stop/unload
 ```
 
 ### Windows — scheduled task
 
 ```powershell
-Get-ScheduledTask   -TaskName MoreGPU
-Start-ScheduledTask -TaskName MoreGPU
-Stop-ScheduledTask  -TaskName MoreGPU
-Unregister-ScheduledTask -TaskName MoreGPU    # remove
+Get-ScheduledTask   -TaskName MoreGPUWorker
+Start-ScheduledTask -TaskName MoreGPUWorker
+Stop-ScheduledTask  -TaskName MoreGPUWorker
+Unregister-ScheduledTask -TaskName MoreGPUWorker    # remove
 ```
 
 The service runs the same supervised restart loop as a foreground worker: if the process exits or the Deno install is incomplete, it retries and restarts automatically.

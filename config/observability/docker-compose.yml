@@ -12,12 +12,17 @@ services:
   prometheus:
     image: prom/prometheus:latest
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus.yml:/etc/prometheus/prometheus.tmpl:ro
     environment:
-      - MOREGPU_ADMIN_TOKEN=${MOREGPU_ADMIN_TOKEN:-}
-      - MOREGPU_TARGET=${MOREGPU_TARGET:-host.docker.internal:8787}
+      - MG_TOKEN=${MOREGPU_ADMIN_TOKEN:-}
+      - MG_TARGET=${MOREGPU_TARGET:-host.docker.internal:8787}
+    # Prometheus does not expand env vars in its config, so substitute the placeholders at start.
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
+      - >
+        sed "s|__MG_TOKEN__|$${MG_TOKEN}|g; s|__MG_TARGET__|$${MG_TARGET}|g"
+        /etc/prometheus/prometheus.tmpl > /tmp/prometheus.yml &&
+        exec /bin/prometheus --config.file=/tmp/prometheus.yml
     ports:
       - "9090:9090"
     extra_hosts:

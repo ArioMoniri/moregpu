@@ -92,3 +92,39 @@ pool secure:
 * Rotate tokens if you suspect they have been exposed.
 * Only allow workers from machines you and your participants are authorized to
   enroll.
+
+---
+
+## Cryptography in MoreGPU today
+
+MoreGPU is a **single trust domain**. Every mechanism below protects work units *in transit between the coordinator and cooperating workers* and establishes *which worker produced a result*. None of it hides job data *from* a worker: a worker that clears the join gate is a full participant that holds the decryption key. Read this section with that boundary in mind.
+
+**AES-256-GCM payload sealing (confidentiality + integrity on the wire).** Each pool mints one 256-bit tenant key (`crypto.getRandomValues(32)`), stored in `.moregpu-server.json`. Every shard the coordinator dispatches and every result a worker returns is AES-GCM sealed with a fresh random 12-byte IV; the GCM tag authenticates the ciphertext. This gives confidentiality and tamper-detection for the shard payloads themselves even over a plaintext `ws://` socket.
+- *Honest limits:* the key is a **symmetric secret shared with every enrolled worker**. It is **not** derived via any KDF/HKDF — it is the raw random key, delivered verbatim inside the plaintext `welcome` frame at join time. Any holder of the **join token** therefore receives the full tenant key and can decrypt all sealed traffic. The seal protects data between honest endpoints; it is not confidential computing.
+
+**Ed25519 per-worker result signatures (authenticity + tamper-evidence).** Each worker generates a keypair at startup and registers its raw public key. It signs `shardId|iv|ct` for every result; the coordinator verifies with the registered key and **rejects** the shard on a bad signature.
+- *Honest limits:* the signature covers the **sealed ciphertext and shard id, not the correctness of the math** — it proves *who* signed and that the bytes were not altered in flight, nothing about whether the computation was right. Signing is **conditional**: a worker that registers without a public key is still accepted and runs *unsigned*; the per-job `signed` flag is true only when every shard in that job was signed and verified.
+
+**Result binding + unguessable shard ids (anti-forgery).** Shard ids are `s-<seq>-<random6>`, and the pending table binds each id to the exact worker it was dispatched to — a result whose `workerId` does not match is dropped. In-flight shards carry a 120 s timeout and are rejected on worker disconnect, so a job fails fast instead of hanging. A result can only settle the shard it was issued for, on the worker it was sent to.
+
+**CPU-reference cross-check ("verified" flag).** The coordinator independently recomputes the job on its own CPU and compares against the pooled result within a tolerance. Elementwise and row-wise kernels are always checked; **matmul is only checked when `M·N ≤ 640×640`**.
+- *Honest limits:* this is a numeric recompute-and-compare, **not a cryptographic proof and not a redundancy quorum**. Large matmuls run unverified, and because the coordinator does the whole reference calc itself it only scales as a spot check.
+
+**Pool isolation + token gating.** Per-pool **admin token** (bearer, constant-time compare) gates every admin and `/submit` endpoint; a separate per-pool **join token** gates worker enrollment; each pool has its own key. `/health` and `/help` are public; `/ws` is join-token-gated.
+- *Honest limit:* the admin-token holder submits plaintext tensors and reads plaintext outputs (data mode), so **the coordinator sees all job I/O in the clear** — confidentiality is on-the-wire, not end-to-end.
+
+**Transport security.** Setting `MOREGPU_TLS_CERT` + `MOREGPU_TLS_KEY` upgrades to `https`/`wss`. Without them the server runs plaintext `ws` and prints an explicit wizard warning that the join handshake — *including the tenant key* — travels in cleartext.
+
+**Bottom line:** MoreGPU today defends against a network eavesdropper and against a worker forging or tampering with *another* worker's result. It does **not** defend against a malicious worker reading the job data it was handed, nor prove that a worker computed honestly. There is **no TEE**: decrypted job data lives in ordinary worker memory, readable by the worker process, its OS, and its operator.
+
+## Hardening roadmap (not yet implemented)
+
+Everything below is **NOT YET BUILT** — it is the realistic next tier, listed roughly by security impact.
+
+- **Confidential computing / TEE attestation — NOT YET BUILT.** The *only* path to true secrecy-of-job-data *from the worker*. Run workers inside a hardware enclave (AMD **SEV-SNP**, Intel **TDX**, or **NVIDIA H100 Confidential Computing**) so the tenant key is released only *into* the enclave and plaintext exists solely in hardware-encrypted memory the worker OS/operator cannot read. Remote **attestation** would let the coordinator verify the enclave's measurement *before* handing over the key. This is what breaks the single-trust-domain limitation; nothing short of it does.
+- **Per-job ephemeral key rotation — NOT YET BUILT.** Today one long-lived pool key seals everything. Derive a fresh per-job (or per-shard) key — e.g. **HKDF** over the pool key plus a job nonce — so that exposure of one job's key does not compromise others, and keys can be discarded after a job completes.
+- **N-of-M redundant recomputation with result quorum — NOT YET BUILT.** Because Ed25519 proves only *who signed*, not *that the math is correct*, and the CPU cross-check is skipped for large matmul, dispatch a random fraction of shards to a second (or Nth) worker and require quorum agreement — detecting a lying or faulty worker that returns a validly signed but wrong result.
+- **Join-token rotation / short-lived enrollment tokens — NOT YET BUILT.** A static, long-lived join token grants the tenant key indefinitely. Move to short-TTL, single-use, or signed enrollment tokens so a leaked token expires quickly and enrollment can be revoked.
+- **Replay / freshness nonces — NOT YET BUILT.** Replay resistance today is only implicit (single-use unguessable shard ids + the pending-table lifecycle). Add an explicit server-issued nonce/timestamp per assignment, echoed and signed by the worker, to harden against replay across reconnects.
+- **Worker attestation tokens — NOT YET BUILT.** Cryptographic evidence of a worker's identity/integrity at enroll time (ideally bound to a hardware root of trust or TEE quote), rather than mere possession of a shared join secret.
+- **TLS certificate pinning — NOT YET BUILT.** `wss://` currently trusts the platform CA set. Pin the coordinator's certificate or public key in the worker to defeat man-in-the-middle even against a rogue or mis-issued CA.

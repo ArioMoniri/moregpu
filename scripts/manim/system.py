@@ -14,10 +14,10 @@ BG = "#0e1117"
 
 
 def node(label, sub, color, w=2.4, h=1.0):
-    box = RoundedRectangle(corner_radius=0.14, width=w, height=h,
-                           stroke_color=color, stroke_width=2.5, fill_color="#161b26", fill_opacity=1)
-    t = Text(label, font="Sans", weight="BOLD", color=WHITE).scale(0.34)
-    s = Text(sub, font="Sans", color=GREY_B).scale(0.24)
+    box = RoundedRectangle(corner_radius=0.16, width=w, height=h,
+                           stroke_color=color, stroke_width=3.5, fill_color="#232d44", fill_opacity=1)
+    t = Text(label, font="Sans", weight="BOLD", color=WHITE).scale(0.36)
+    s = Text(sub, font="Sans", color="#aebbce").scale(0.25)
     t.move_to(box.get_center() + UP * 0.14)
     s.move_to(box.get_center() + DOWN * 0.18)
     return VGroup(box, t, s)
@@ -25,9 +25,9 @@ def node(label, sub, color, w=2.4, h=1.0):
 
 class MoreGPUFlow(Scene):
     def construct(self):
-        self.camera.background_color = BG
+        self.camera.background_color = "#0d1220"
 
-        title = Text("MoreGPU", font="Sans", weight="BOLD", color=WHITE).scale(0.7).to_edge(UP)
+        title = Text("MoreGPU", font="Sans", weight="BOLD", color=WHITE).scale(0.72).to_edge(UP)
         sub = Text("submit → shard → seal → compute on GPU/CPU → pool → verify",
                    font="Sans", color=GREY_B).scale(0.32).next_to(title, DOWN, buff=0.15)
         self.play(FadeIn(title, shift=DOWN * 0.2), FadeIn(sub))

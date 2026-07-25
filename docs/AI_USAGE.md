@@ -16,8 +16,9 @@ You can submit in two modes:
 > **Honesty first.** MoreGPU provides a fixed set of **linear-algebra / elementwise building-block
 > kernels** and pools them across machines. It does **not** run a whole trained model, does **not** do
 > autograd/backprop, and does **not** use tensor cores or any specialised GEMM path — `matmul` is a plain
-> tiled WGSL shader on general-purpose GPU compute. Applications get value by **composing** these
-> primitives. See [Scope](#in-scope-vs-out-of-scope).
+> (naive, non-tiled) WGSL shader on general-purpose GPU compute. `matmul` runs on the worker's GPU; the
+> memory-bound elementwise and row-wise kernels run on the worker's CPU. Applications get value by
+> **composing** these primitives. See [Scope](#in-scope-vs-out-of-scope).
 
 ---
 
