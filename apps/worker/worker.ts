@@ -2,9 +2,11 @@
 /**
  * MoreGPU worker agent — a single self-contained file. Runs on any OS with Deno.
  *
- *  • Runs `matmul` on the real GPU (WebGPU → Metal/Vulkan/D3D12) when present; the memory-bound
- *    elementwise and row-wise kernels run on the CPU (moving them to the GPU rarely helps without
- *    weight residency). On a machine with no GPU, matmul runs on the CPU too. CPU machines add compute.
+ *  • On a GPU worker, ALL kernels run on the real GPU (WebGPU → Metal/Vulkan/D3D12): tiled matmul,
+ *    elementwise/activations (relu/scale/gelu/add/mul/saxpy), and row-wise softmax/layernorm reductions.
+ *    On a machine with no GPU, the identical kernels run on the CPU. CPU machines add compute too.
+ *    (Elementwise/row-wise ops are memory-bound, so on the GPU they mainly relieve the worker's CPU
+ *    rather than run dramatically faster — but every kernel now executes on-device.)
  *  • Recovers from GPU device loss by falling back to the CPU backend mid-flight.
  *  • Stays polite: an adaptive DUTY-CYCLE throttle interleaves compute with sleeps, so the interactive
  *    user keeps their machine responsive and average power draw (electricity) stays down.
@@ -75,7 +77,6 @@ function effectiveDuty(): number {
 // into shared memory, so each A/B element is read from global memory once per tile instead of once per
 // output — the standard tiling optimization. Boundary tiles are zero-padded via select(); no early
 // return (all invocations must reach every workgroupBarrier). Still fp32, no tensor cores.
-const TILE = 16;
 const WGSL = {
   matmul: `@group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
@@ -99,12 +100,81 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
   }
   if (row<M && col<N){ C[row*N+col]=acc; }
 }`,
+  // Elementwise unary (op: 0=relu 1=scale 2=gelu), one thread per element. p.x=op, p.y=scalar.
+  unary: `@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+@group(0) @binding(2) var<uniform> p: vec4<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i=g.x; if (i>=arrayLength(&a)) { return; }
+  let x=a[i]; let op=p.x;
+  if (op < 0.5) { o[i]=max(x,0.0); }
+  else if (op < 1.5) { o[i]=x*p.y; }
+  else { let c=0.7978845608028654; o[i]=0.5*x*(1.0+tanh(c*(x+0.044715*x*x*x))); }
+}`,
+  // Elementwise binary (op: 0=add 1=mul 2=saxpy). p.x=op, p.y=scalar.
+  binary: `@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> o: array<f32>;
+@group(0) @binding(3) var<uniform> p: vec4<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i=g.x; if (i>=arrayLength(&a)) { return; }
+  let op=p.x;
+  if (op < 0.5) { o[i]=a[i]+b[i]; }
+  else if (op < 1.5) { o[i]=a[i]*b[i]; }
+  else { o[i]=p.y*a[i]+b[i]; }
+}`,
+  // Softmax over each row (one workgroup per row): max-reduce → exp → sum-reduce → normalize. d.x=cols.
+  softmax: `@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+@group(0) @binding(2) var<uniform> d: vec4<u32>;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+  let cols=d.x; let base=wg.x*cols; let tid=l.x;
+  var m=-3.4e38;
+  for (var j=tid; j<cols; j=j+256u) { m=max(m, a[base+j]); }
+  red[tid]=m; workgroupBarrier();
+  for (var s=128u; s>0u; s=s>>1u) { if (tid<s) { red[tid]=max(red[tid], red[tid+s]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var sum=0.0;
+  for (var j=tid; j<cols; j=j+256u) { sum=sum+exp(a[base+j]-mx); }
+  red[tid]=sum; workgroupBarrier();
+  for (var s=128u; s>0u; s=s>>1u) { if (tid<s) { red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  let sm=red[0]; workgroupBarrier();
+  for (var j=tid; j<cols; j=j+256u) { o[base+j]=exp(a[base+j]-mx)/sm; }
+}`,
+  // LayerNorm over each row (one workgroup per row): mean → variance → normalize. d.x=cols.
+  layernorm: `@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+@group(0) @binding(2) var<uniform> d: vec4<u32>;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+  let cols=d.x; let base=wg.x*cols; let tid=l.x; let n=f32(cols);
+  var s=0.0;
+  for (var j=tid; j<cols; j=j+256u) { s=s+a[base+j]; }
+  red[tid]=s; workgroupBarrier();
+  for (var k=128u; k>0u; k=k>>1u) { if (tid<k) { red[tid]=red[tid]+red[tid+k]; } workgroupBarrier(); }
+  let mean=red[0]/n; workgroupBarrier();
+  var v=0.0;
+  for (var j=tid; j<cols; j=j+256u) { let dd=a[base+j]-mean; v=v+dd*dd; }
+  red[tid]=v; workgroupBarrier();
+  for (var k=128u; k>0u; k=k>>1u) { if (tid<k) { red[tid]=red[tid]+red[tid+k]; } workgroupBarrier(); }
+  let inv=1.0/sqrt(red[0]/n + 1e-5); workgroupBarrier();
+  for (var j=tid; j<cols; j=j+256u) { o[base+j]=(a[base+j]-mean)*inv; }
+}`,
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 // ---------- backends ----------
-interface Backend { kind: 'gpu' | 'cpu'; label: string; matmul(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Promise<Float32Array>; }
+interface Backend {
+  kind: 'gpu' | 'cpu'; label: string;
+  matmul(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Promise<Float32Array>;
+  // Optional GPU paths for the other kernels; when absent the worker uses the CPU reference implementations.
+  elementwise?(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Promise<Float32Array>;
+  rowwise?(kernel: string, a: Float32Array, cols: number): Promise<Float32Array>;
+}
 
 let gpuLost = false; // set if the GPU device is lost (Metal reset, driver crash) → we fall back to CPU
 async function makeGpuBackend(): Promise<Backend | null> {
@@ -122,7 +192,7 @@ async function makeGpuBackend(): Promise<Backend | null> {
   });
   gpuLost = false;
   device.lost.then((info) => { gpuLost = true; console.error(`[worker] GPU device lost (${(info as GPUDeviceLostInfo)?.reason ?? 'unknown'}); falling back to CPU.`); }).catch(() => {});
-  async function run(code: string, storage: Float32Array[], uniform: Uint32Array | null, outLen: number, dispatch: [number, number, number]) {
+  async function run(code: string, storage: Float32Array[], uniform: Uint32Array | Float32Array | null, outLen: number, dispatch: [number, number, number]) {
     const inBufs = storage.map((arr) => { const b = device.createBuffer({ size: Math.max(4, arr.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
     const outBytes = Math.max(4, outLen * 4);
     const outBuf = device.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
@@ -143,8 +213,21 @@ async function makeGpuBackend(): Promise<Backend | null> {
     return out;
   }
   const info = adapter.info ?? {};
+  const ELEM_OP: Record<string, number> = { relu: 0, scale: 1, gelu: 2, vector_add: 0, vector_mul: 1, saxpy: 2 };
   return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}`,
-    matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]) };
+    matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]),
+    elementwise: (kernel, a, b, scalar) => {
+      const op = ELEM_OP[kernel] ?? 0;
+      const unary = kernel === 'relu' || kernel === 'scale' || kernel === 'gelu';
+      const wg: [number, number, number] = [Math.ceil(a.length / 64), 1, 1];
+      return unary
+        ? run(WGSL.unary, [a], new Float32Array([op, scalar, 0, 0]), a.length, wg)
+        : run(WGSL.binary, [a, b as Float32Array], new Float32Array([op, scalar, 0, 0]), a.length, wg);
+    },
+    rowwise: (kernel, a, cols) => {
+      const rows = Math.max(1, Math.floor(a.length / cols));
+      return run(kernel === 'softmax' ? WGSL.softmax : WGSL.layernorm, [a], new Uint32Array([cols, 0, 0, 0]), a.length, [rows, 1, 1]);
+    } };
 }
 
 /** CPU backend: computes in small row-chunks and sleeps between them to honor the duty cycle,
@@ -237,8 +320,8 @@ async function computeShard(req: { kernel: string; a: string; b?: string; scalar
   if (backend.kind === 'gpu' && gpuLost) { console.error('[worker] GPU marked lost — switching to CPU backend.'); backend = makeCpuBackend(); }
   const run = async (): Promise<Float32Array> => {
     if (req.kernel === 'matmul') return await backend.matmul(b64ToF32(req.a), b64ToF32(req.b!), req.rows!, req.N!, req.K!);
-    if (ROWWISE.has(req.kernel)) return runRowwise(req.kernel, b64ToF32(req.a), req.cols!);
-    if (ELEMENTWISE.has(req.kernel)) return await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
+    if (ROWWISE.has(req.kernel)) return backend.rowwise ? await backend.rowwise(req.kernel, b64ToF32(req.a), req.cols!) : runRowwise(req.kernel, b64ToF32(req.a), req.cols!);
+    if (ELEMENTWISE.has(req.kernel)) return backend.elementwise ? await backend.elementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1) : await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
     throw new Error(`unknown kernel ${req.kernel}`);
   };
   try { return await run(); }
