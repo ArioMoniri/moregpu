@@ -41,7 +41,7 @@ echo "[moregpu] fetching worker…"
 curl -fsSL "$WORKER_URL" -o "$MG_DIR/worker.ts.new" 2>/dev/null && mv "$MG_DIR/worker.ts.new" "$MG_DIR/worker.ts" || true
 [ -f "$MG_DIR/worker.ts" ] || { echo "[moregpu] ERROR: could not fetch worker and no cached copy exists"; exit 1; }
 
-RUN_ARGS="run --unstable-webgpu --allow-net --allow-env $MG_DIR/worker.ts --server $SERVER"
+RUN_ARGS="run --unstable-webgpu --allow-net --allow-env --allow-sys $MG_DIR/worker.ts --server $SERVER"
 [ -n "$TOKEN" ] && RUN_ARGS="$RUN_ARGS --token $TOKEN"
 [ -n "${MOREGPU_NAME:-}" ] && RUN_ARGS="$RUN_ARGS --name $MOREGPU_NAME"
 [ -n "${MOREGPU_THROTTLE:-}" ] && RUN_ARGS="$RUN_ARGS --throttle $MOREGPU_THROTTLE"

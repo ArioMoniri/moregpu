@@ -50,6 +50,18 @@ export interface Decision {
 
 const BATTERY_CAP = 0.25;
 
+/**
+ * Adaptive per-machine duty cycle. Given the machine's current utilization (0..1), returns the fraction
+ * of time the pool may compute so that TOTAL system utilization stays under `maxUtil`. As the machine's
+ * own user drives utilization up, the returned duty falls toward `minDuty`; when idle it rises to `ceil`.
+ * Pure and deterministic — this is the formula the worker agent samples `loadavg` into.
+ */
+export function adaptiveDutyFromUtil(util: number, opts: { ceil: number; maxUtil: number; minDuty: number }): number {
+  const u = Math.max(0, Math.min(1, util));
+  const slack = Math.max(0, (opts.maxUtil - u) / opts.maxUtil);
+  return Math.max(opts.minDuty, Math.min(opts.ceil, opts.minDuty + (opts.ceil - opts.minDuty) * slack));
+}
+
 function clamp(x: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, x));
 }

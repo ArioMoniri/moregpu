@@ -30,7 +30,7 @@ $deno = (Get-Command deno).Source
 Write-Host "[moregpu] fetching worker…"
 Invoke-WebRequest -UseBasicParsing $workerUrl -OutFile (Join-Path $mgDir "worker.ts")
 
-$runArgs = @("run","--unstable-webgpu","--allow-net","--allow-env",(Join-Path $mgDir "worker.ts"),"--server",$server)
+$runArgs = @("run","--unstable-webgpu","--allow-net","--allow-env","--allow-sys",(Join-Path $mgDir "worker.ts"),"--server",$server)
 if ($token) { $runArgs += @("--token",$token) }
 if ($env:MOREGPU_NAME) { $runArgs += @("--name",$env:MOREGPU_NAME) }
 if ($env:MOREGPU_THROTTLE) { $runArgs += @("--throttle",$env:MOREGPU_THROTTLE) }

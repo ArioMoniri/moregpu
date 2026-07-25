@@ -17,9 +17,9 @@ JOIN=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$CFG')).joinToke
 ADMIN=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$CFG')).adminToken)")
 
 echo "== joining a GPU worker and a throttled CPU worker (outbound WebSocket, join token) =="
-deno run --unstable-webgpu --allow-net --allow-env apps/worker/worker.ts --server "ws://localhost:$PORT/ws" --token "$JOIN" --name gpu-node >/tmp/moregpu-gpu.log 2>&1 &
+deno run --unstable-webgpu --allow-net --allow-env --allow-sys apps/worker/worker.ts --server "ws://localhost:$PORT/ws" --token "$JOIN" --name gpu-node >/tmp/moregpu-gpu.log 2>&1 &
 PIDS+=($!)
-deno run --allow-net --allow-env apps/worker/worker.ts --server "ws://localhost:$PORT/ws" --token "$JOIN" --name cpu-node --cpu --throttle 0.5 >/tmp/moregpu-cpu.log 2>&1 &
+deno run --allow-net --allow-env --allow-sys apps/worker/worker.ts --server "ws://localhost:$PORT/ws" --token "$JOIN" --name cpu-node --cpu --throttle 0.5 >/tmp/moregpu-cpu.log 2>&1 &
 PIDS+=($!); sleep 5
 
 echo "== fleet =="; curl -s "localhost:$PORT/workers" -H "authorization: Bearer $ADMIN"; echo
