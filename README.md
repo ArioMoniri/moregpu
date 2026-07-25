@@ -14,6 +14,35 @@ MoreGPU is a native GPU compute pool: an admin runs a coordinator, worker machin
 
 ---
 
+## 🎮 Can it run what I run?
+
+MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA replacement. Here's what a GPU user gets (✅ native · 🧩 compose from primitives · 🟡 partial · ❌ not supported):
+
+| Workload | | How / why |
+|---|---|---|
+| Dense fp32 matmul / GEMM | ✅ | **Workgroup-tiled WGSL GEMM on the GPU** (shared-memory tiling), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
+| Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class WGSL kernels — run **on the GPU** on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU rather than adding raw speed. |
+| Softmax / LayerNorm | ✅ | Row-wise WGSL reductions (one workgroup per row) **on the GPU** on a GPU worker; CPU otherwise. Match a CPU reference to ~1e-8. |
+| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention; no KV cache. |
+| Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. You orchestrate the graph from the SDK; weights are per-request, no residency. |
+| Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.); `pool.sum/mean/dot/norm` SDK helpers. Convenience, not throughput — each runs on one worker/one thread. |
+| Large / out-of-core matmul | 🟡 | Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink. |
+| Monte-Carlo / RNG-heavy sims | 🟡 | You supply random inputs (host-side RNG); the pool does the arithmetic. |
+| Full LLM inference (checkpoints, tokenizer, KV cache) | ❌ | No model loader/tokenizer/sampling/KV-cache, no fp16/int8. Impractical to hand-compose at scale. |
+| Training (autograd / backprop / optimizer) | ❌ | No autograd or gradient/optimizer kernels. Not a training platform. |
+| Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
+| CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
+
+**In one line:** every kernel it ships — tiled matmul, elementwise/activations, softmax and layernorm — runs **on your real GPU** (WGSL → Metal/Vulkan/D3D12) on a GPU worker, with verified fp32 results, and you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
+
+> [!NOTE]
+> **Why not CUDA / fp16 / full LLMs?** MoreGPU's backend is **WebGPU (WGSL)** — the portable path that runs the same kernels on NVIDIA, AMD, Apple, and Intel GPUs. WebGPU is fp32 compute-only: no tensor cores, no fp16/int8, no CUDA/PTX, and no autograd. Full-model inference and training would need a **separate native CUDA/cuBLAS worker type** (NVIDIA-only, fp16 + tensor cores + a real autograd/KV-cache stack) — a large, honest roadmap item, **not built**. What ships today is a correct, verified fp32 primitive set you can compose; it will not masquerade as a CUDA/training platform it isn't.
+
+> [!NOTE]
+> **What runs on the GPU:** on a GPU worker, **all** kernels execute on-device (WGSL → Metal/Vulkan/D3D12) — tiled matmul, elementwise/activations, and softmax/layernorm reductions. A CPU-only worker runs the identical kernels on the CPU. Either way the coordinator cross-checks the pooled result against a CPU reference, so every path returns the same verified fp32 output.
+
+---
+
 ## Run it
 
 There are **two roles** — pick yours:
@@ -329,35 +358,6 @@ Deployment topology — admin coordinator and outbound-only workers:
 <p align="center">
   <img src="docs/assets/deploy.svg" alt="Deployment topology — Linux/macOS/Windows workers dial outbound (wss + join token) to one isolated admin server" width="900">
 </p>
-
----
-
-## 🎮 Can it run what I run?
-
-MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA replacement. Here's what a GPU user gets (✅ native · 🧩 compose from primitives · 🟡 partial · ❌ not supported):
-
-| Workload | | How / why |
-|---|---|---|
-| Dense fp32 matmul / GEMM | ✅ | **Workgroup-tiled WGSL GEMM on the GPU** (shared-memory tiling), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
-| Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class WGSL kernels — run **on the GPU** on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU rather than adding raw speed. |
-| Softmax / LayerNorm | ✅ | Row-wise WGSL reductions (one workgroup per row) **on the GPU** on a GPU worker; CPU otherwise. Match a CPU reference to ~1e-8. |
-| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention; no KV cache. |
-| Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. You orchestrate the graph from the SDK; weights are per-request, no residency. |
-| Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.); `pool.sum/mean/dot/norm` SDK helpers. Convenience, not throughput — each runs on one worker/one thread. |
-| Large / out-of-core matmul | 🟡 | Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink. |
-| Monte-Carlo / RNG-heavy sims | 🟡 | You supply random inputs (host-side RNG); the pool does the arithmetic. |
-| Full LLM inference (checkpoints, tokenizer, KV cache) | ❌ | No model loader/tokenizer/sampling/KV-cache, no fp16/int8. Impractical to hand-compose at scale. |
-| Training (autograd / backprop / optimizer) | ❌ | No autograd or gradient/optimizer kernels. Not a training platform. |
-| Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
-| CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
-
-**In one line:** every kernel it ships — tiled matmul, elementwise/activations, softmax and layernorm — runs **on your real GPU** (WGSL → Metal/Vulkan/D3D12) on a GPU worker, with verified fp32 results, and you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
-
-> [!NOTE]
-> **Why not CUDA / fp16 / full LLMs?** MoreGPU's backend is **WebGPU (WGSL)** — the portable path that runs the same kernels on NVIDIA, AMD, Apple, and Intel GPUs. WebGPU is fp32 compute-only: no tensor cores, no fp16/int8, no CUDA/PTX, and no autograd. Full-model inference and training would need a **separate native CUDA/cuBLAS worker type** (NVIDIA-only, fp16 + tensor cores + a real autograd/KV-cache stack) — a large, honest roadmap item, **not built**. What ships today is a correct, verified fp32 primitive set you can compose; it will not masquerade as a CUDA/training platform it isn't.
-
-> [!NOTE]
-> **What runs on the GPU:** on a GPU worker, **all** kernels execute on-device (WGSL → Metal/Vulkan/D3D12) — tiled matmul, elementwise/activations, and softmax/layernorm reductions. A CPU-only worker runs the identical kernels on the CPU. Either way the coordinator cross-checks the pooled result against a CPU reference, so every path returns the same verified fp32 output.
 
 ## Authorized use only
 
