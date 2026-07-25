@@ -82,7 +82,12 @@ function wizardBanner() {
   console.log(`    ${C.grn}curl -fsSL ${RAW}/scripts/install.sh \\`);
   console.log(`      | MOREGPU_SERVER=${wsUrl} MOREGPU_TOKEN=${cfg.joinToken} sh${C.reset}`);
   console.log(`  ${C.dim}Windows:  $env:MOREGPU_SERVER="${wsUrl}"; $env:MOREGPU_TOKEN="${cfg.joinToken}"; irm ${RAW}/scripts/install.ps1 | iex${C.reset}`);
-  console.log(`  ${C.dim}reboot-surviving service: add MOREGPU_SERVICE=1 · type /help in this console's HTTP: ${httpScheme}://${ADVERTISE_HOST}:${PORT}/help${C.reset}\n`);
+  console.log(`  ${C.dim}reboot-surviving service: add MOREGPU_SERVICE=1 · type /help in this console's HTTP: ${httpScheme}://${ADVERTISE_HOST}:${PORT}/help${C.reset}`);
+  if (!(CERT_PATH && KEY_PATH) && BIND !== '127.0.0.1' && BIND !== 'localhost') {
+    console.log(`\n  ${C.red}${C.b}⚠ no TLS and bound to ${BIND}${C.reset}${C.red} — the join handshake (including the tenant key) travels in plaintext.${C.reset}`);
+    console.log(`  ${C.dim}For untrusted networks: set MOREGPU_TLS_CERT + MOREGPU_TLS_KEY (wss://), or MOREGPU_BIND=127.0.0.1 behind a VPN/tunnel.${C.reset}`);
+  }
+  console.log('');
 }
 function printHelp() {
   console.log(art());
@@ -129,7 +134,10 @@ interface Worker {
   lastUnits: number; history: number[]; // per-sample units completed → sparkline trend
 }
 const workers = new Map<string, Worker>();
-const pending = new Map<string, (r: { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number }) => void>();
+type ResultMsg = { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number };
+interface Pending { resolve: (r: ResultMsg) => void; reject: (e: Error) => void; workerId: string; }
+const pending = new Map<string, Pending>();
+const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 120_000);
 
 function wireWorker(ws: WebSocket) {
   let id = '';
@@ -147,10 +155,18 @@ function wireWorker(ws: WebSocket) {
     } else if (m.t === 'heartbeat') {
       const w = workers.get(String(m.id)); if (w) { w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty; }
     } else if (m.t === 'result') {
-      pending.get(String(m.shardId))?.({ ok: m.ok as boolean, sealedOut: m.sealedOut as { iv: string; ct: string } | undefined, error: m.error as string | undefined, backend: m.backend as string | undefined, ms: m.ms as number | undefined });
+      const p = pending.get(String(m.shardId));
+      // only the worker the shard was dispatched to may complete it (ignore forged/foreign results)
+      if (p && p.workerId === id) p.resolve({ ok: m.ok as boolean, sealedOut: m.sealedOut as { iv: string; ct: string } | undefined, error: m.error as string | undefined, backend: m.backend as string | undefined, ms: m.ms as number | undefined });
     }
   };
-  ws.onclose = () => { if (id) { workers.delete(id); log('info', `worker left: ${id} · fleet=${workers.size}`); } };
+  ws.onclose = () => {
+    if (!id) return;
+    workers.delete(id);
+    // reject any shard still in flight on this worker so the job fails fast instead of hanging the queue
+    for (const [sid, p] of pending) if (p.workerId === id) { pending.delete(sid); p.reject(new Error(`worker ${id} disconnected mid-shard`)); }
+    log('info', `worker left: ${id} · fleet=${workers.size}`);
+  };
   ws.onerror = () => log('warn', `socket error${id ? ' from ' + id : ''}`);
 }
 
@@ -170,6 +186,24 @@ setInterval(() => {
 
 // ---------- kernels ----------
 const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale']);
+const ROWWISE = new Set(['softmax', 'layernorm']); // per-row reductions; sharded by whole rows
+function cpuRowwise(kernel: string, a: Float32Array, cols: number): Float32Array {
+  const rows = Math.floor(a.length / cols), o = new Float32Array(a.length);
+  for (let r = 0; r < rows; r++) {
+    const off = r * cols;
+    if (kernel === 'softmax') {
+      let mx = -Infinity; for (let j = 0; j < cols; j++) mx = Math.max(mx, a[off + j]);
+      let s = 0; for (let j = 0; j < cols; j++) { const e = Math.exp(a[off + j] - mx); o[off + j] = e; s += e; }
+      for (let j = 0; j < cols; j++) o[off + j] /= s;
+    } else {
+      let m = 0; for (let j = 0; j < cols; j++) m += a[off + j]; m /= cols;
+      let v = 0; for (let j = 0; j < cols; j++) { const d = a[off + j] - m; v += d * d; } v /= cols;
+      const inv = 1 / Math.sqrt(v + 1e-5);
+      for (let j = 0; j < cols; j++) o[off + j] = (a[off + j] - m) * inv;
+    }
+  }
+  return o;
+}
 function cpuKernel(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Float32Array {
   const n = a.length, o = new Float32Array(n);
   for (let i = 0; i < n; i++) {
@@ -223,12 +257,16 @@ async function pumpQueue() {
 }
 
 async function dispatchShard(w: Worker, jobId: string, payload: Record<string, unknown>): Promise<Float32Array> {
-  const shardId = `s-${++shardSeq}`;
+  const shardId = `s-${++shardSeq}-${tokenB64url(6)}`; // unguessable so results can't be forged by id
   const sealedIn = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify(payload)));
-  const done = new Promise<{ ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number }>((res) => pending.set(shardId, res));
+  const done = new Promise<ResultMsg>((resolve, reject) => {
+    const timer = setTimeout(() => { pending.delete(shardId); reject(new Error(`shard timeout (${SHARD_TIMEOUT_MS}ms) on ${w.id}`)); }, SHARD_TIMEOUT_MS);
+    pending.set(shardId, { resolve: (r) => { clearTimeout(timer); resolve(r); }, reject: (e) => { clearTimeout(timer); reject(e); }, workerId: w.id });
+  });
   w.busy = true;
   w.ws.send(JSON.stringify({ t: 'assign', shardId, jobId, sealedIn }));
-  const r = await done; pending.delete(shardId); w.busy = false;
+  let r: ResultMsg;
+  try { r = await done; } finally { pending.delete(shardId); w.busy = false; }
   if (!r.ok || !r.sealedOut) { M.shardsFailed++; w.errors++; throw new Error(`shard on ${w.id} failed: ${r.error}`); }
   M.shardsDone++; (r.backend?.startsWith('gpu') ? M.gpuShards++ : M.cpuShards++);
   const outObj = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealedOut)));
@@ -280,6 +318,23 @@ async function runJob(rec: JobRec) {
     const ref = cpuKernel(rec.kernel, a, b, scalar); let md = 0; for (let i = 0; i < n; i++) md = Math.max(md, Math.abs(O[i] - ref[i]));
     rec.verified = md < 1e-3; rec.ms = performance.now() - t0; rec.shards = sh;
     if (data) { rec.output = f32ToB64(O); rec.outLen = O.length; }
+  } else if (ROWWISE.has(rec.kernel)) {
+    // per-row op (softmax/layernorm): N = columns per row; shard whole rows across the fleet.
+    const cols = Math.max(1, data ? (input!.N ?? 128) : 128);
+    const a = data ? input!.a! : new Float32Array(rec.size * cols).map(() => Math.random() * 4 - 2);
+    const rows = Math.floor(a.length / cols);
+    if (rows < 1) throw new Error(`${rec.kernel}: need at least one full row of ${cols} columns`);
+    const rowsPer = Math.ceil(rows / fleet.length);
+    const parts = await Promise.all(fleet.map(async (w, i) => {
+      const r0 = i * rowsPer, rn = Math.min(rows, r0 + rowsPer) - r0; if (rn <= 0) return null;
+      const out = await dispatchShard(w, rec.id, { kernel: rec.kernel, a: f32ToB64(a.slice(r0 * cols, (r0 + rn) * cols)), cols });
+      return { r0, out, w };
+    }));
+    const O = new Float32Array(rows * cols); const sh: JobRec['shards'] = [];
+    for (const p of parts) if (p) { O.set(p.out, p.r0 * cols); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length, ms: 0 }); }
+    const ref = cpuRowwise(rec.kernel, a, cols); let md = 0; for (let i = 0; i < O.length; i++) md = Math.max(md, Math.abs(O[i] - ref[i]));
+    rec.verified = md < 1e-4; rec.ms = performance.now() - t0; rec.shards = sh;
+    if (data) { rec.output = f32ToB64(O); rec.outLen = O.length; }
   } else { throw new Error(`unknown kernel ${rec.kernel}`); }
   log('info', `${rec.id} done: ${rec.kernel} · ${(rec.ms ?? 0).toFixed(0)}ms · verified=${rec.verified}${data ? ' · data' : ''}`);
 }
@@ -318,7 +373,7 @@ function virtualGpu() {
 // ---------- HTTP + WS ----------
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o, null, 2), { status, headers: { 'content-type': 'application/json' } });
 const authOk = (req: Request) => constEq((req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '') || (req.headers.get('x-admin-token') ?? ''), cfg.adminToken);
-const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale'];
+const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'softmax', 'layernorm'];
 
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -442,7 +497,7 @@ a{color:#a5b4fc}.sp{margin-top:16px}.k{display:inline-block;background:#1a2133;c
     <div class=sp><a href=/metrics target=_blank>/metrics</a> <span class=mut>· wire to Grafana</span></div></div>
 </div>
 <div class="card sp"><h3>Run a job</h3><div class=row>
-  <select id=kernel><option>matmul</option><option>vector_add</option><option>vector_mul</option><option>saxpy</option><option>relu</option><option>scale</option></select>
+  <select id=kernel><option>matmul</option><option>vector_add</option><option>vector_mul</option><option>saxpy</option><option>relu</option><option>scale</option><option>softmax</option><option>layernorm</option></select>
   <label class=mut>size <input id=size value=512 style=width:110px></label><button onclick=submit()>Submit</button><span id=jobmsg class=mut></span></div></div>
 <div class="card sp"><h3>Fleet — live contribution</h3><table><thead><tr><th>worker</th><th>type</th><th>share</th><th>trend</th><th>shards</th><th>units</th><th>avg ms</th><th>user load</th><th>pool duty</th><th>state</th></tr></thead><tbody id=fleet><tr><td class=mut colspan=10>connect a worker…</td></tr></tbody></table></div>
 <div class="card sp"><h3>Per-kernel jobs</h3><div id=kernels class=mut>—</div></div>
@@ -453,6 +508,7 @@ const K='moregpu_admin_token';document.getElementById('tok').value=localStorage.
 const H=()=>({'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||'')});
 function save(){localStorage.setItem(K,document.getElementById('tok').value.trim());refresh();}
 function pct(x){return Math.round((x||0)*100)+'%';}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function fmt(n){n=n||0;return n>=1e9?(n/1e9).toFixed(1)+'G':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n;}
 // inline SVG sparkline from an array of values
 function spark(arr,w,h,col){arr=arr||[];if(!arr.length)return '<svg width='+w+' height='+h+'></svg>';
@@ -474,12 +530,12 @@ async function refresh(){
   const pk=g.perKernel||{};const ks=Object.keys(pk);
   document.getElementById('kernels').innerHTML=ks.length?ks.map(k=>'<span class=k>'+k+' · '+pk[k]+'</span>').join(' '):'no jobs yet';
   const w=await (await fetch('/workers',{headers:H()})).json();
-  document.getElementById('fleet').innerHTML=w.length?w.map(x=>'<tr><td>'+x.id+(x.errors?' <span class=lvl-error>('+x.errors+' err)</span>':'')+'</td><td><span class="pill '+(x.backend==='gpu'?'gpuP':'cpuP')+'">'+x.backend+'</span></td><td><b>'+pct(x.share)+'</b></td><td>'+spark(x.trend,72,20,x.backend==='gpu'?'#34d399':'#fbbf24')+'</td><td>'+x.shards+'</td><td class=mut>'+fmt(x.units)+'</td><td class=mut>'+x.avgMs+'</td><td>'+pct(x.userUtil)+'</td><td>'+pct(x.poolDuty)+'</td><td class=mut>'+(x.busy?'working':'idle')+'</td></tr>').join(''):'<tr><td class=mut colspan=10>connect a worker…</td></tr>';
+  document.getElementById('fleet').innerHTML=w.length?w.map(x=>'<tr><td>'+esc(x.id)+(x.errors?' <span class=lvl-error>('+(x.errors|0)+' err)</span>':'')+'</td><td><span class="pill '+(x.backend==='gpu'?'gpuP':'cpuP')+'">'+esc(x.backend)+'</span></td><td><b>'+pct(x.share)+'</b></td><td>'+spark(x.trend,72,20,x.backend==='gpu'?'#34d399':'#fbbf24')+'</td><td>'+(x.shards|0)+'</td><td class=mut>'+fmt(x.units)+'</td><td class=mut>'+esc(x.avgMs)+'</td><td>'+pct(x.userUtil)+'</td><td>'+pct(x.poolDuty)+'</td><td class=mut>'+(x.busy?'working':'idle')+'</td></tr>').join(''):'<tr><td class=mut colspan=10>connect a worker…</td></tr>';
   const j=await (await fetch('/jobs',{headers:H()})).json();
   document.getElementById('jd').textContent=j.filter(x=>x.status==='done').length;
   document.getElementById('jf').textContent=j.filter(x=>x.status==='failed').length;
   const L=await (await fetch('/logs',{headers:H()})).json();
-  document.getElementById('logs').innerHTML=L.slice(0,80).map(e=>'<span class=lvl-'+e.level+'>'+new Date(e.ts).toLocaleTimeString()+' ['+e.level+'] '+e.msg+(e.ctx?' · '+e.ctx:'')+'</span>').join('\\n');
+  document.getElementById('logs').innerHTML=L.slice(0,80).map(e=>'<span class=lvl-'+esc(e.level)+'>'+new Date(e.ts).toLocaleTimeString()+' ['+esc(e.level)+'] '+esc(e.msg)+(e.ctx?' · '+esc(e.ctx):'')+'</span>').join('\\n');
  }catch(e){}
 }
 async function submit(){const m=document.getElementById('jobmsg');m.textContent='running…';

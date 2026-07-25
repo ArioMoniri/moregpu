@@ -9,7 +9,7 @@
  *   const gpu = await pool.gpu();                         // pool state (virtual GPU)
  */
 
-export type Kernel = 'matmul' | 'vector_add' | 'vector_mul' | 'saxpy' | 'relu' | 'scale';
+export type Kernel = 'matmul' | 'vector_add' | 'vector_mul' | 'saxpy' | 'relu' | 'scale' | 'softmax' | 'layernorm';
 
 export interface JobSpec { kernel: Kernel; size: number; }
 

@@ -40,6 +40,31 @@ export function cpuMatmul(a: Float32Array, b: Float32Array, dims: MatmulDims): F
   return out;
 }
 
+/** Row-wise softmax over a `rows × cols` matrix (numerically stable). */
+export function cpuSoftmax(a: Float32Array, cols: number): Float32Array {
+  const rows = Math.floor(a.length / cols), o = new Float32Array(a.length);
+  for (let r = 0; r < rows; r++) {
+    const off = r * cols;
+    let mx = -Infinity; for (let j = 0; j < cols; j++) mx = Math.max(mx, a[off + j]!);
+    let s = 0; for (let j = 0; j < cols; j++) { const e = Math.exp(a[off + j]! - mx); o[off + j] = e; s += e; }
+    for (let j = 0; j < cols; j++) o[off + j]! /= s;
+  }
+  return o;
+}
+
+/** Row-wise layer normalization over a `rows × cols` matrix (ε = 1e-5, no affine). */
+export function cpuLayernorm(a: Float32Array, cols: number): Float32Array {
+  const rows = Math.floor(a.length / cols), o = new Float32Array(a.length);
+  for (let r = 0; r < rows; r++) {
+    const off = r * cols;
+    let m = 0; for (let j = 0; j < cols; j++) m += a[off + j]!; m /= cols;
+    let v = 0; for (let j = 0; j < cols; j++) { const d = a[off + j]! - m; v += d * d; } v /= cols;
+    const inv = 1 / Math.sqrt(v + 1e-5);
+    for (let j = 0; j < cols; j++) o[off + j] = (a[off + j]! - m) * inv;
+  }
+  return o;
+}
+
 /** Max absolute difference between two vectors — used to assert GPU/CPU agreement. */
 export function maxAbsDiff(a: Float32Array, b: Float32Array): number {
   if (a.length !== b.length) return Infinity;

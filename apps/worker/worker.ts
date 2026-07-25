@@ -19,7 +19,7 @@ const args = new Map<string, string>();
 for (let i = 0; i < Deno.args.length; i++) { const a = Deno.args[i]; if (a.startsWith('--')) args.set(a.slice(2), Deno.args[i + 1] ?? 'true'); }
 const SERVER = args.get('server') ?? Deno.env.get('MOREGPU_SERVER') ?? 'ws://localhost:8787/ws';
 const TOKEN = args.get('token') ?? Deno.env.get('MOREGPU_TOKEN') ?? '';
-const NAME = args.get('name') ?? Deno.env.get('MOREGPU_NAME') ?? `${(() => { try { return Deno.hostname(); } catch { return 'worker'; } })()}-${Math.floor(performance.now()) % 100000}`;
+const NAME = args.get('name') ?? Deno.env.get('MOREGPU_NAME') ?? `${(() => { try { return Deno.hostname(); } catch { return 'worker'; } })()}-${crypto.randomUUID().slice(0, 6)}`;
 // Duty cycle CEILING: the most of this machine the pool may ever use (fraction of time computing).
 // The EFFECTIVE duty adapts DOWN from this ceiling in real time based on the machine's own load, so
 // the moment the user works their PC harder, the pool's share shrinks and the user is not disturbed.
@@ -149,6 +149,26 @@ async function runElementwise(kernel: string, a: Float32Array, b: Float32Array |
   return o;
 }
 
+// ---------- row-wise tensor kernels (softmax/layernorm; sharded by whole rows) ----------
+const ROWWISE = new Set(['softmax', 'layernorm']);
+function runRowwise(kernel: string, a: Float32Array, cols: number): Float32Array {
+  const rows = Math.floor(a.length / cols), o = new Float32Array(a.length);
+  for (let r = 0; r < rows; r++) {
+    const off = r * cols;
+    if (kernel === 'softmax') {
+      let mx = -Infinity; for (let j = 0; j < cols; j++) mx = Math.max(mx, a[off + j]);
+      let s = 0; for (let j = 0; j < cols; j++) { const e = Math.exp(a[off + j] - mx); o[off + j] = e; s += e; }
+      for (let j = 0; j < cols; j++) o[off + j] /= s;
+    } else { // layernorm
+      let m = 0; for (let j = 0; j < cols; j++) m += a[off + j]; m /= cols;
+      let v = 0; for (let j = 0; j < cols; j++) { const d = a[off + j] - m; v += d * d; } v /= cols;
+      const inv = 1 / Math.sqrt(v + 1e-5);
+      for (let j = 0; j < cols; j++) o[off + j] = (a[off + j] - m) * inv;
+    }
+  }
+  return o;
+}
+
 // ---------- work loop ----------
 const FORCE_CPU = args.has('cpu') || Deno.env.get('MOREGPU_FORCE_CPU') === '1';
 const backend = (FORCE_CPU ? null : await makeGpuBackend().catch(() => null)) ?? makeCpuBackend();
@@ -178,6 +198,7 @@ function connect() {
         const req = JSON.parse(new TextDecoder().decode(await unseal(tenantKey, msg.sealedIn)));
         let out: Float32Array;
         if (req.kernel === 'matmul') out = await backend.matmul(b64ToF32(req.a), b64ToF32(req.b), req.rows, req.N, req.K);
+        else if (ROWWISE.has(req.kernel)) out = runRowwise(req.kernel, b64ToF32(req.a), req.cols);
         else if (ELEMENTWISE.has(req.kernel)) out = await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
         else throw new Error(`unknown kernel ${req.kernel}`);
         const sealedOut = await seal(tenantKey, new TextEncoder().encode(JSON.stringify({ out: f32ToB64(out) })));

@@ -16,7 +16,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
-KERNELS = ("matmul", "vector_add", "vector_mul", "saxpy", "relu", "scale")
+KERNELS = ("matmul", "vector_add", "vector_mul", "saxpy", "relu", "scale", "softmax", "layernorm")
 
 
 def _f32_b64(values: Sequence[float]) -> str:

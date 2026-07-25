@@ -70,7 +70,7 @@ pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 
 ```
 **Async (GPU-style submit + poll):** add `?async=1` to get a job handle immediately, then poll `GET /jobs/<id>`.
 
-Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale` (extensible). The whole fleet is presented as one **virtual GPU slot** — `GET /device` returns its backends, kernels, limits, queue and capabilities.
+Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale, softmax, layernorm` (extensible). Enough to compose a real transformer block — see [`examples/attention_demo.py`](examples/attention_demo.py) and [AI usage](docs/AI_USAGE.md). The whole fleet is presented as one **virtual GPU slot** — `GET /device` returns its backends, kernels, limits, queue and capabilities.
 </details>
 
 The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live contribution + trend sparklines, the queue, and the error/debug log. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).

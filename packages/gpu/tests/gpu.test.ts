@@ -3,6 +3,8 @@ import {
   cpuVectorAdd,
   cpuSaxpy,
   cpuMatmul,
+  cpuSoftmax,
+  cpuLayernorm,
   maxAbsDiff,
   getKernel,
   KERNELS,
@@ -32,6 +34,22 @@ describe('CPU reference kernels (golden oracle + fallback)', () => {
     const a = new Float32Array([1, 2, 3, 4]);
     const id = new Float32Array([1, 0, 0, 1]);
     expect(Array.from(cpuMatmul(a, id, { M: 2, N: 2, K: 2 }))).toEqual([1, 2, 3, 4]);
+  });
+
+  it('softmax is row-wise, sums to 1 per row', () => {
+    const out = cpuSoftmax(new Float32Array([1, 2, 3, 0, 0, 0]), 3);
+    expect(out[0]! + out[1]! + out[2]!).toBeCloseTo(1, 5);
+    expect(out[3]! + out[4]! + out[5]!).toBeCloseTo(1, 5);
+    for (const x of out.slice(3, 6)) expect(x).toBeCloseTo(1 / 3, 5); // equal logits → uniform
+    expect(out[2]!).toBeGreaterThan(out[0]!); // larger logit → larger prob
+  });
+
+  it('layernorm gives each row zero mean and unit variance', () => {
+    const out = cpuLayernorm(new Float32Array([1, 2, 3, 4]), 4);
+    const mean = (out[0]! + out[1]! + out[2]! + out[3]!) / 4;
+    const varr = out.reduce((s, x) => s + x * x, 0) / 4;
+    expect(mean).toBeCloseTo(0, 5);
+    expect(varr).toBeCloseTo(1, 3);
   });
 
   it('maxAbsDiff detects agreement and disagreement', () => {

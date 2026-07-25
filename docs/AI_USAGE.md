@@ -31,6 +31,12 @@ You can submit in two modes:
 | `saxpy`       | `out[i] = α·a[i] + b[i]`     | `a`, `b`, `scalar`               |
 | `relu`        | `out[i] = max(0, a[i])`      | `a`                              |
 | `scale`       | `out[i] = α·a[i]`            | `a`, `scalar`                    |
+| `softmax`     | row-wise softmax             | `a`, `N` (= columns per row)     |
+| `layernorm`   | row-wise LayerNorm (ε 1e-5)  | `a`, `N` (= columns per row)     |
+
+`softmax` and `layernorm` are **per-row** reductions over a `rows × N` matrix (the coordinator shards
+them by whole rows). Together with `matmul` and the elementwise ops they are enough to compose a real
+transformer block.
 
 Tensors are 32-bit floats, sent as base64 of the little-endian `Float32Array` bytes. The clients below
 handle that encoding for you. Add a kernel by following [Adding a kernel](#adding-a-kernel).
@@ -77,6 +83,20 @@ out = pool.run("relu", Yb)["output_decoded"]                            # activa
 
 Because `matmul` is the dominant cost in almost every network (dense layers, attention's `QKᵀ` and
 `·V`, im2col convolutions), pooling matmul is what lets the fleet do ML-shaped work.
+
+**A real attention block, entirely on the pool** — `softmax(Q·Kᵀ / √d) · V`:
+
+```python
+scores  = pool.matmul(Q, Kt, M=T, N=T, K=d)                     # Q·Kᵀ
+scaled  = pool.run("scale", scores, scalar=1/ d**0.5)["output_decoded"]
+weights = pool.run("softmax", scaled, N=T)["output_decoded"]    # row-softmax
+out     = pool.matmul(weights, V, M=T, N=d, K=T)                # weights·V
+```
+
+A runnable version is [`examples/attention_demo.py`](../examples/attention_demo.py) (matches a reference
+to ~1e-8). The realistic target class is a **small FP32 encoder** (sentence embeddings, classification,
+retrieval re-ranking) or an MLP, run as batched prefill — not a multi-billion-parameter autoregressive
+chat model, which needs tensor-core GEMM the WGSL tier does not provide.
 
 ---
 
