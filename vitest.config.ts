@@ -14,6 +14,7 @@ export default defineConfig({
       '@moregpu/transport': pkg('./packages/transport/src/index.ts'),
       '@moregpu/gpu': pkg('./packages/gpu/src/index.ts'),
       '@moregpu/integrity': pkg('./packages/integrity/src/index.ts'),
+      '@moregpu/client': pkg('./packages/client/src/index.ts'),
     },
   },
   test: {

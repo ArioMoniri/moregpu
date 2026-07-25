@@ -1,0 +1,37 @@
+# Bundled observability for a MoreGPU pool: Prometheus scrapes the admin server's /metrics,
+# Grafana visualizes it with a pre-provisioned dashboard. Turnkey:
+#
+#   cd config/observability
+#   export MOREGPU_ADMIN_TOKEN=<your admin token>
+#   export MOREGPU_TARGET=host.docker.internal:8787   # or your admin host:port
+#   docker compose up -d
+#   # Grafana → http://localhost:3000  (admin / admin), dashboard "MoreGPU Pool" is pre-loaded
+#
+# Nothing here is required to run MoreGPU; it is an optional, self-hostable monitoring stack.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    environment:
+      - MOREGPU_ADMIN_TOKEN=${MOREGPU_ADMIN_TOKEN:-}
+      - MOREGPU_TARGET=${MOREGPU_TARGET:-host.docker.internal:8787}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on: [prometheus]
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"

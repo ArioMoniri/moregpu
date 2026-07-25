@@ -191,16 +191,20 @@ function cpuMatmul(a: Float32Array, b: Float32Array, Mm: number, N: number, K: n
 
 // ---------- jobs + Slurm-like queue ----------
 type JobStatus = 'queued' | 'running' | 'done' | 'failed';
-interface JobRec { id: string; status: JobStatus; kernel: string; size: number; sealed: boolean; submittedAt: number; ms?: number; gflops?: number; verified?: boolean; shards?: { worker: string; backend: string; work: number; ms: number }[]; error?: string; }
+interface JobRec { id: string; status: JobStatus; kernel: string; size: number; sealed: boolean; submittedAt: number; ms?: number; gflops?: number; verified?: boolean; shards?: { worker: string; backend: string; work: number; ms: number }[]; error?: string; dataMode?: boolean; output?: string; outLen?: number; }
+/** Real input a caller submitted (data mode); the pool computes on THIS data and returns the output. */
+interface JobInput { a?: Float32Array; b?: Float32Array; scalar?: number; M?: number; N?: number; K?: number; }
 const jobs = new Map<string, JobRec>();
+const jobInputs = new Map<string, JobInput>();
 const queue: JobRec[] = [];
 let jobSeq = 0, shardSeq = 0, draining = false;
 
-function submit(kernel: string, size: number): JobRec {
+function submit(kernel: string, size: number, input?: JobInput): JobRec {
   const id = `job-${++jobSeq}`;
-  const rec: JobRec = { id, status: 'queued', kernel, size, sealed: true, submittedAt: Date.now() };
+  const rec: JobRec = { id, status: 'queued', kernel, size, sealed: true, submittedAt: Date.now(), dataMode: !!input?.a };
   jobs.set(id, rec); queue.push(rec); M.jobsTotal++; KM[kernel] = (KM[kernel] ?? 0) + 1;
-  log('info', `queued ${id}: ${kernel} size=${size}`, `queue depth ${queue.length}`);
+  if (input?.a) jobInputs.set(id, input);
+  log('info', `queued ${id}: ${kernel} ${input?.a ? 'data' : 'size=' + size}`, `queue depth ${queue.length}`);
   pumpQueue();
   return rec;
 }
@@ -235,35 +239,49 @@ async function dispatchShard(w: Worker, jobId: string, payload: Record<string, u
 
 async function runJob(rec: JobRec) {
   const fleet = [...workers.values()];
+  const input = jobInputs.get(rec.id); jobInputs.delete(rec.id);
+  const data = !!input?.a; // data mode: compute on the caller's real tensors and return the output
   const t0 = performance.now();
   if (rec.kernel === 'matmul') {
-    const N = rec.size, A = new Float32Array(N * N).map(() => Math.random()), B = new Float32Array(N * N).map(() => Math.random());
-    const rowsPer = Math.ceil(N / fleet.length);
+    // dims: data mode uses input.M/N/K (default square from array); else a random square of rec.size
+    const M = data ? (input!.M ?? Math.round(Math.sqrt(input!.a!.length))) : rec.size;
+    const K = data ? (input!.K ?? M) : rec.size;
+    const N = data ? (input!.N ?? K) : rec.size;
+    const A = data ? input!.a! : new Float32Array(M * K).map(() => Math.random());
+    const B = data ? input!.b! : new Float32Array(K * N).map(() => Math.random());
+    if (A.length !== M * K || B.length !== K * N) throw new Error(`matmul input shape mismatch (A=${A.length} expected ${M * K}, B=${B.length} expected ${K * N})`);
+    const rowsPer = Math.ceil(M / fleet.length);
     const parts = await Promise.all(fleet.map(async (w, i) => {
-      const r0 = i * rowsPer, rows = Math.min(N, r0 + rowsPer) - r0; if (rows <= 0) return null;
-      const out = await dispatchShard(w, rec.id, { kernel: 'matmul', a: f32ToB64(A.slice(r0 * N, (r0 + rows) * N)), b: f32ToB64(B), rows, N, K: N });
+      const r0 = i * rowsPer, rows = Math.min(M, r0 + rowsPer) - r0; if (rows <= 0) return null;
+      const out = await dispatchShard(w, rec.id, { kernel: 'matmul', a: f32ToB64(A.slice(r0 * K, (r0 + rows) * K)), b: f32ToB64(B), rows, N, K });
       return { r0, out, w };
     }));
-    const Cm = new Float32Array(N * N); const sh: JobRec['shards'] = [];
-    for (const p of parts) if (p) { Cm.set(p.out, p.r0 * N); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length / N, ms: 0 }); }
+    const Cm = new Float32Array(M * N); const sh: JobRec['shards'] = [];
+    for (const p of parts) if (p) { Cm.set(p.out, p.r0 * N); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length, ms: 0 }); }
     const wall = performance.now() - t0;
-    if (N <= 640) { let md = 0; const ref = cpuMatmul(A, B, N, N, N); for (let i = 0; i < Cm.length; i++) md = Math.max(md, Math.abs(Cm[i] - ref[i])); rec.verified = md < 1e-2; }
-    rec.gflops = (2 * N * N * N) / (wall / 1000) / 1e9; rec.ms = wall; rec.shards = sh;
+    if (M * N <= 640 * 640) { let md = 0; const ref = cpuMatmul(A, B, M, N, K); for (let i = 0; i < Cm.length; i++) md = Math.max(md, Math.abs(Cm[i] - ref[i])); rec.verified = md < Math.max(1e-2, K * 1e-4); }
+    rec.gflops = (2 * M * N * K) / (wall / 1000) / 1e9; rec.ms = wall; rec.shards = sh;
+    if (data) { rec.output = f32ToB64(Cm); rec.outLen = Cm.length; }
   } else if (ELEMENTWISE.has(rec.kernel)) {
-    const n = rec.size, a = new Float32Array(n).map(() => Math.random() * 2 - 1), b = new Float32Array(n).map(() => Math.random());
+    const binary = rec.kernel !== 'relu' && rec.kernel !== 'scale';
+    const a = data ? input!.a! : new Float32Array(rec.size).map(() => Math.random() * 2 - 1);
+    const b = data ? (input!.b ?? new Float32Array(a.length)) : new Float32Array(a.length).map(() => Math.random());
+    const scalar = data ? (input!.scalar ?? 1) : 2;
+    const n = a.length;
+    if (binary && b.length !== n) throw new Error(`elementwise input length mismatch (a=${n}, b=${b.length})`);
     const per = Math.ceil(n / fleet.length);
     const parts = await Promise.all(fleet.map(async (w, i) => {
       const s0 = i * per, len = Math.min(n, s0 + per) - s0; if (len <= 0) return null;
-      const needB = rec.kernel !== 'relu' && rec.kernel !== 'scale';
-      const out = await dispatchShard(w, rec.id, { kernel: rec.kernel, a: f32ToB64(a.subarray(s0, s0 + len)), b: needB ? f32ToB64(b.subarray(s0, s0 + len)) : undefined, scalar: 2, len });
+      const out = await dispatchShard(w, rec.id, { kernel: rec.kernel, a: f32ToB64(a.subarray(s0, s0 + len)), b: binary ? f32ToB64(b.subarray(s0, s0 + len)) : undefined, scalar, len });
       return { s0, out, w };
     }));
     const O = new Float32Array(n); const sh: JobRec['shards'] = [];
     for (const p of parts) if (p) { O.set(p.out, p.s0); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length, ms: 0 }); }
-    const ref = cpuKernel(rec.kernel, a, b, 2); let md = 0; for (let i = 0; i < n; i++) md = Math.max(md, Math.abs(O[i] - ref[i]));
+    const ref = cpuKernel(rec.kernel, a, b, scalar); let md = 0; for (let i = 0; i < n; i++) md = Math.max(md, Math.abs(O[i] - ref[i]));
     rec.verified = md < 1e-3; rec.ms = performance.now() - t0; rec.shards = sh;
+    if (data) { rec.output = f32ToB64(O); rec.outLen = O.length; }
   } else { throw new Error(`unknown kernel ${rec.kernel}`); }
-  log('info', `${rec.id} done: ${rec.kernel} · ${(rec.ms ?? 0).toFixed(0)}ms · verified=${rec.verified}`);
+  log('info', `${rec.id} done: ${rec.kernel} · ${(rec.ms ?? 0).toFixed(0)}ms · verified=${rec.verified}${data ? ' · data' : ''}`);
 }
 
 // ---------- virtual GPU view ----------
@@ -304,16 +322,25 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === '/logs') return json(LOG.slice(-200).reverse());
   if (url.pathname === '/metrics') return new Response(prometheus(), { headers: { 'content-type': 'text/plain; version=0.0.4' } });
   if (req.method === 'POST' && url.pathname === '/submit') {
-    const body = await req.json().catch(() => ({})) as { kernel?: string; size?: number };
+    const body = await req.json().catch(() => ({})) as { kernel?: string; size?: number; a?: string; b?: string; scalar?: number; M?: number; N?: number; K?: number };
     const kernel = KERNELS.includes(body.kernel ?? '') ? body.kernel! : 'matmul';
+    // Data mode: caller supplies real tensors (base64 Float32) → the pool computes on THEM and returns the output.
+    let input: JobInput | undefined;
+    if (typeof body.a === 'string') {
+      const a = b64ToF32(body.a);
+      const b = typeof body.b === 'string' ? b64ToF32(body.b) : undefined;
+      const CAP = 16_000_000;
+      if (a.length > CAP || (b && b.length > CAP)) return json({ error: 'input too large (>16M elements per buffer)' }, 413);
+      input = { a, b, scalar: body.scalar, M: body.M, N: body.N, K: body.K };
+    }
     const size = Math.max(16, Math.min(kernel === 'matmul' ? 2048 : 8_000_000, Number(body.size ?? (kernel === 'matmul' ? 512 : 1_000_000))));
-    if (workers.size === 0) { const r = submit(kernel, size); return json({ ...r, note: 'queued — no workers connected yet; will run when one joins' }, 202); }
-    const rec = submit(kernel, size);
-    // wait briefly for it to finish for a synchronous response
+    if (workers.size === 0) { const r = submit(kernel, size, input); return json({ ...r, note: 'queued — no workers connected yet; will run when one joins' }, 202); }
+    const rec = submit(kernel, size, input);
+    // wait briefly for a synchronous response; clients must still check status (may still be queued/running)
     for (let i = 0; i < 600 && rec.status !== 'done' && rec.status !== 'failed'; i++) await new Promise((r) => setTimeout(r, 50));
     return json(rec, rec.status === 'failed' ? 503 : 200);
   }
-  if (url.pathname === '/jobs') return json([...jobs.values()].slice(-50).reverse());
+  if (url.pathname === '/jobs') return json([...jobs.values()].slice(-50).reverse().map(({ output: _o, ...r }) => ({ ...r, hasOutput: !!_o })));
   if (url.pathname.startsWith('/jobs/')) { const r = jobs.get(url.pathname.slice(6)); return r ? json(r) : json({ error: 'not found' }, 404); }
   return new Response(dashboard(), { headers: { 'content-type': 'text/html' } });
 }
@@ -323,9 +350,14 @@ function prometheus(): string {
   const total = g.totalUnits || 1;
   const lines = [
     '# HELP moregpu_fleet Connected workers', '# TYPE moregpu_fleet gauge', `moregpu_fleet ${g.slots}`,
-    `moregpu_gpu_slots ${g.gpuSlots}`, `moregpu_cpu_slots ${g.cpuSlots}`, `moregpu_busy ${g.busy}`,
-    `moregpu_queue_depth ${g.queueDepth}`, `moregpu_avg_user_util ${g.avgUserUtil}`, `moregpu_avg_pool_duty ${g.avgPoolDuty}`,
-    `moregpu_total_units ${g.totalUnits}`, `moregpu_total_shards ${g.totalShards}`,
+    '# TYPE moregpu_gpu_slots gauge', `moregpu_gpu_slots ${g.gpuSlots}`,
+    '# TYPE moregpu_cpu_slots gauge', `moregpu_cpu_slots ${g.cpuSlots}`,
+    '# TYPE moregpu_busy gauge', `moregpu_busy ${g.busy}`,
+    '# TYPE moregpu_queue_depth gauge', `moregpu_queue_depth ${g.queueDepth}`,
+    '# TYPE moregpu_avg_user_util gauge', `moregpu_avg_user_util ${g.avgUserUtil}`,
+    '# TYPE moregpu_avg_pool_duty gauge', `moregpu_avg_pool_duty ${g.avgPoolDuty}`,
+    '# TYPE moregpu_total_units counter', `moregpu_total_units ${g.totalUnits}`,
+    '# TYPE moregpu_total_shards counter', `moregpu_total_shards ${g.totalShards}`,
     '# TYPE moregpu_jobs_total counter', `moregpu_jobs_total ${M.jobsTotal}`, `moregpu_jobs_done ${M.jobsDone}`, `moregpu_jobs_failed ${M.jobsFailed}`,
     `moregpu_shards_done ${M.shardsDone}`, `moregpu_shards_failed ${M.shardsFailed}`, `moregpu_gpu_shards ${M.gpuShards}`, `moregpu_cpu_shards ${M.cpuShards}`,
     '# HELP moregpu_worker_units Units of work completed per worker', '# TYPE moregpu_worker_units counter',

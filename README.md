@@ -78,6 +78,37 @@ The fleet is presented as one virtual GPU with a Slurm-like job queue. The admin
 
 ---
 
+## Use it from your code
+
+Drive the pool from an application with the client SDK.
+
+**JavaScript / TypeScript** ([`@moregpu/client`](packages/client), runs in Deno / Node / browsers):
+
+```ts
+import { MoreGPUClient } from '@moregpu/client';
+const pool = new MoreGPUClient({ baseUrl: 'http://ADMIN:8787', adminToken: '<admin-token>' });
+const C = await pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], 2, 2, 3); // send tensors, get the product
+const { output } = await pool.run('relu', { a: [-1, 2, -3, 4] });         // any kernel on your own data
+const gpu = await pool.gpu();                                             // pool state + per-worker contribution
+```
+
+**Python** ([`examples/moregpu_client.py`](examples/moregpu_client.py), dependency-free):
+
+```python
+from moregpu_client import MoreGPU
+pool = MoreGPU("http://ADMIN:8787", "<admin-token>")
+pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 139, 154]
+pool.run("relu", [-1, 2, -3, 4])                                  # any kernel on your own data
+```
+
+For AI/ML workloads — which kernels map to which ops, batching patterns, and how to add a kernel — see [**docs/AI_USAGE.md**](docs/AI_USAGE.md).
+
+## Monitoring (Grafana)
+
+The admin server exposes a Prometheus `/metrics` endpoint (fleet, queue, throughput, and **per-worker contribution**). A turnkey Prometheus + Grafana bundle with a pre-provisioned dashboard is in [`config/observability`](config/observability) — `docker compose up`, then Grafana on `:3000`.
+
+---
+
 ## How it works
 
 <p align="center">

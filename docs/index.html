@@ -41,8 +41,9 @@ footer{color:var(--mut);font-size:13px;text-align:center;padding:40px 0 60px}
     <span class="badge">adaptive per-user throttle</span>
     <span class="badge">Apache-2.0</span>
   </div>
-  <div class="anim"><img src="assets/how-it-works.svg" alt="Animated: submit → shard → seal → compute on GPU/CPU → pool → verify"></div>
-  <p class="mut" style="font-size:13px">submit → shard → seal → compute on each worker's GPU/CPU → pool → verify</p>
+  <div class="anim"><div id="lottie" style="width:100%;max-width:640px;margin:0 auto"></div>
+    <noscript><img src="assets/how-it-works.svg" alt="submit → shard → seal → compute on GPU/CPU → pool → verify"></noscript></div>
+  <p class="mut" style="font-size:13px">Lottie flow · submit → shard → seal → compute on each worker's GPU/CPU → pool → verify</p>
 </header>
 
 <h2>What it is</h2>
@@ -110,6 +111,12 @@ by their Terms of Service, and this project ships no tooling to do so. All legal
 responsibility is the operator's. See <a href="https://github.com/ArioMoniri/moregpu/blob/main/ACCEPTABLE_USE.md">ACCEPTABLE_USE.md</a>.
 </div>
 
+<h2>Interactive animation (Rive)</h2>
+<div class="card">
+  <canvas id="rive" width="640" height="240" style="max-width:100%"></canvas>
+  <p class="mut" id="rivenote">Author a <code>.riv</code> in the <a href="https://rive.app">Rive editor</a> and drop it at <code>docs/assets/moregpu.riv</code> — it will play here automatically. (The Lottie flow above is live now.)</p>
+</div>
+
 <footer>
   <a href="https://github.com/ArioMoniri/moregpu">GitHub</a> ·
   <a href="https://github.com/ArioMoniri/moregpu/blob/main/docs/ADMIN.md">Admin guide</a> ·
@@ -117,5 +124,24 @@ responsibility is the operator's. See <a href="https://github.com/ArioMoniri/mor
   Apache-2.0 © 2026 Ariorad Moniri
 </footer>
 </div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js"></script>
+<script>
+  try {
+    lottie.loadAnimation({ container: document.getElementById('lottie'), renderer: 'svg', loop: true, autoplay: true, path: 'assets/moregpu.lottie.json' });
+  } catch (e) {
+    document.getElementById('lottie').innerHTML = '<img src="assets/how-it-works.svg" style="width:100%">';
+  }
+</script>
+<script src="https://unpkg.com/@rive-app/canvas@2"></script>
+<script>
+  fetch('assets/moregpu.riv', { method: 'HEAD' }).then(function (r) {
+    if (r.ok && window.rive) {
+      new rive.Rive({ src: 'assets/moregpu.riv', canvas: document.getElementById('rive'), autoplay: true, layout: new rive.Layout({ fit: rive.Fit.Contain }) });
+      document.getElementById('rivenote').textContent = 'Live Rive scene.';
+    } else {
+      document.getElementById('rive').style.display = 'none';
+    }
+  }).catch(function () { document.getElementById('rive').style.display = 'none'; });
+</script>
 </body>
 </html>
