@@ -63,12 +63,17 @@ const httpScheme = CERT_PATH && KEY_PATH ? 'https' : 'http';
 const RAW = 'https://raw.githubusercontent.com/ArioMoniri/moregpu/main';
 
 function art() {
-  return `${C.cyan}${C.b}
-   __  __            ____ ____  _   _
-  |  \\/  | ___  _ __/ ___|  _ \\| | | |   ${C.reset}${C.dim}native GPU compute pool${C.cyan}${C.b}
-  | |\\/| |/ _ \\| '__| |  _| |_) | | | |
-  | |  | | (_) | |  | |_| |  __/| |_| |
-  |_|  |_|\\___/|_|   \\____|_|    \\___/${C.reset}`;
+  // ANSI Shadow "MOREGPU" with an indigo→pink→red 256-color gradient (matches the `moregpu` CLI).
+  const rows = [
+    '███╗   ███╗ ██████╗ ██████╗ ███████╗ ██████╗ ██████╗ ██╗   ██╗',
+    '████╗ ████║██╔═══██╗██╔══██╗██╔════╝██╔════╝ ██╔══██╗██║   ██║',
+    '██╔████╔██║██║   ██║██████╔╝█████╗  ██║  ███╗██████╔╝██║   ██║',
+    '██║╚██╔╝██║██║   ██║██╔══██╗██╔══╝  ██║   ██║██╔═══╝ ██║   ██║',
+    '██║ ╚═╝ ██║╚██████╔╝██║  ██║███████╗╚██████╔╝██║     ╚██████╔╝',
+    '╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝      ╚═════╝ ',
+  ];
+  const cols = [63, 99, 135, 171, 205, 203];
+  return '\n' + rows.map((r, i) => `  \x1b[38;5;${cols[i]}m${r}${C.reset}`).join('\n');
 }
 function wizardBanner() {
   const wsUrl = `${scheme}://${ADVERTISE_HOST}:${PORT}/ws`;
@@ -132,7 +137,7 @@ interface Worker {
   id: string; backend: string; label: string; os: string; ws: WebSocket;
   load1: number; util: number; duty: number; busy: boolean; joinedAt: number;
   // contribution accounting
-  shards: number; units: number; errors: number; totalMs: number;
+  shards: number; units: number; errors: number; consecErrors: number; totalMs: number;
   lastUnits: number; history: number[]; // per-sample units completed → sparkline trend
   pubkey?: CryptoKey; // Ed25519 public key for verifying this worker's result signatures
   pubkeyB64?: string; // raw public key (for the removed-worker denylist)
@@ -152,7 +157,10 @@ function activeFleet(): Worker[] { return [...workers.values()].filter((w) => !w
 type ResultMsg = { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number; signed?: boolean };
 interface Pending { resolve: (r: ResultMsg) => void; reject: (e: Error) => void; workerId: string; }
 const pending = new Map<string, Pending>();
-const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 120_000);
+const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 60_000);
+const MAX_SHARD_ATTEMPTS = Number(Deno.env.get('MOREGPU_MAX_SHARD_ATTEMPTS') ?? 3); // reassign a failed/timed-out shard to other workers
+const AUTO_PAUSE_ERRORS = Number(Deno.env.get('MOREGPU_AUTO_PAUSE_ERRORS') ?? 4); // consecutive failures before a worker is auto-paused
+const MAX_CONCURRENT_JOBS = Number(Deno.env.get('MOREGPU_MAX_CONCURRENT_JOBS') ?? 4); // jobs the queue runs at once
 
 function wireWorker(ws: WebSocket) {
   let id = '';
@@ -176,14 +184,23 @@ function wireWorker(ws: WebSocket) {
       let pubkey: CryptoKey | undefined;
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, consecErrors: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
       log('info', `worker joined: ${id} (${safeId(node.label)}, ${safeId(node.os)})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
     } else if (m.t === 'heartbeat') {
       if (!registered || !id) return; // ignore heartbeats before auth; trust only the socket's own id, not m.id
       const w = workers.get(id);
-      if (w) { w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty; if (typeof m.ceil === 'number') w.ceil = m.ceil; if (typeof m.paused === 'boolean') w.paused = m.paused; w.pausedReason = (m.pausedReason as string | null) ?? null; if (typeof m.schedule === 'string') w.schedule = m.schedule; if (m.paused === false) pumpQueue(); }
+      if (w) {
+        w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty;
+        if (typeof m.ceil === 'number') w.ceil = m.ceil;
+        if (typeof m.schedule === 'string') w.schedule = m.schedule;
+        if (w.pausedReason !== 'errors') { // a server-side auto-pause is sticky until an admin resumes
+          if (typeof m.paused === 'boolean') w.paused = m.paused;
+          w.pausedReason = (m.pausedReason as string | null) ?? null;
+          if (m.paused === false) pumpQueue();
+        }
+      }
     } else if (m.t === 'result') {
       if (!registered) return;
       const p = pending.get(String(m.shardId));
@@ -274,7 +291,7 @@ const jobs = new Map<string, JobRec>();
 const jobInputs = new Map<string, JobInput>();
 const jobSigned = new Map<string, { signed: number; total: number }>(); // Ed25519 verification tally per job
 const queue: JobRec[] = [];
-let jobSeq = 0, shardSeq = 0, draining = false;
+let jobSeq = 0, shardSeq = 0, inflight = 0;
 
 function submit(kernel: string, size: number, input?: JobInput): JobRec {
   const id = `job-${++jobSeq}`;
@@ -288,17 +305,45 @@ function submit(kernel: string, size: number, input?: JobInput): JobRec {
   return rec;
 }
 
-async function pumpQueue() {
-  if (draining) return;
-  draining = true;
-  try {
-    while (queue.length && activeFleet().length > 0) {
-      const rec = queue.shift()!;
-      rec.status = 'running';
-      try { await runJob(rec); rec.status = 'done'; M.jobsDone++; }
-      catch (e) { rec.status = 'failed'; rec.error = String(e); M.jobsFailed++; log('error', `${rec.id} failed: ${rec.error}`); }
+// Run up to MAX_CONCURRENT_JOBS jobs at once; each finished job re-pumps so the queue keeps flowing and
+// one slow/large job never blocks the rest. Fire-and-forget: callers poll rec.status (never await this).
+function pumpQueue() {
+  while (inflight < MAX_CONCURRENT_JOBS && queue.length && activeFleet().length > 0) {
+    const rec = queue.shift()!;
+    rec.status = 'running';
+    inflight++;
+    runJob(rec)
+      .then(() => { rec.status = 'done'; M.jobsDone++; })
+      .catch((e) => { rec.status = 'failed'; rec.error = String(e); M.jobsFailed++; log('error', `${rec.id} failed: ${rec.error}`); })
+      .finally(() => { inflight--; pumpQueue(); });
+  }
+}
+
+/** Auto-pause a worker that keeps failing so the fleet stops handing it work (admin can resume). */
+function maybeAutoPause(w: Worker) {
+  if (w.consecErrors >= AUTO_PAUSE_ERRORS && !w.paused) { w.paused = true; w.pausedReason = 'errors'; log('warn', `auto-paused ${w.id} after ${w.consecErrors} consecutive failures`); }
+}
+
+/** Dispatch one shard, retrying on OTHER active workers if it fails/times out (so a dead worker doesn't
+ *  fail the whole job). Prefers `preferred`, then any other active worker not yet tried. */
+async function dispatchResilient(jobId: string, payload: Record<string, unknown>, preferred: Worker): Promise<{ out: Float32Array; worker: Worker }> {
+  const tried = new Set<string>();
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < MAX_SHARD_ATTEMPTS; attempt++) {
+    const candidate = (attempt === 0 && !preferred.paused) ? preferred : activeFleet().find((w) => !tried.has(w.id));
+    if (!candidate) break;
+    tried.add(candidate.id);
+    try {
+      const out = await dispatchShard(candidate, jobId, payload);
+      candidate.consecErrors = 0;
+      return { out, worker: candidate };
+    } catch (e) {
+      lastErr = e;
+      candidate.errors++; candidate.consecErrors++; maybeAutoPause(candidate);
+      log('warn', `shard reassign: ${candidate.id} failed (${String(e)}); attempt ${attempt + 1}/${MAX_SHARD_ATTEMPTS}`);
     }
-  } finally { draining = false; }
+  }
+  throw lastErr ?? new Error('no active worker could complete the shard');
 }
 
 async function dispatchShard(w: Worker, jobId: string, payload: Record<string, unknown>): Promise<Float32Array> {
@@ -312,7 +357,7 @@ async function dispatchShard(w: Worker, jobId: string, payload: Record<string, u
   w.ws.send(JSON.stringify({ t: 'assign', shardId, jobId, sealedIn }));
   let r: ResultMsg;
   try { r = await done; } finally { pending.delete(shardId); w.busy = false; }
-  if (!r.ok || !r.sealedOut) { M.shardsFailed++; w.errors++; throw new Error(`shard on ${w.id} failed: ${r.error}`); }
+  if (!r.ok || !r.sealedOut) { M.shardsFailed++; throw new Error(`shard on ${w.id} failed: ${r.error}`); }
   M.shardsDone++; (r.backend?.startsWith('gpu') ? M.gpuShards++ : M.cpuShards++);
   const outObj = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealedOut)));
   const out = b64ToF32(outObj.out);
@@ -338,8 +383,8 @@ async function runJob(rec: JobRec) {
     const rowsPer = Math.ceil(M / fleet.length);
     const parts = await Promise.all(fleet.map(async (w, i) => {
       const r0 = i * rowsPer, rows = Math.min(M, r0 + rowsPer) - r0; if (rows <= 0) return null;
-      const out = await dispatchShard(w, rec.id, { kernel: 'matmul', a: f32ToB64(A.slice(r0 * K, (r0 + rows) * K)), b: f32ToB64(B), rows, N, K });
-      return { r0, out, w };
+      const { out, worker } = await dispatchResilient(rec.id, { kernel: 'matmul', a: f32ToB64(A.slice(r0 * K, (r0 + rows) * K)), b: f32ToB64(B), rows, N, K }, w);
+      return { r0, out, w: worker };
     }));
     const Cm = new Float32Array(M * N); const sh: JobRec['shards'] = [];
     for (const p of parts) if (p) { Cm.set(p.out, p.r0 * N); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length, ms: 0 }); }
@@ -357,8 +402,8 @@ async function runJob(rec: JobRec) {
     const per = Math.ceil(n / fleet.length);
     const parts = await Promise.all(fleet.map(async (w, i) => {
       const s0 = i * per, len = Math.min(n, s0 + per) - s0; if (len <= 0) return null;
-      const out = await dispatchShard(w, rec.id, { kernel: rec.kernel, a: f32ToB64(a.subarray(s0, s0 + len)), b: binary ? f32ToB64(b.subarray(s0, s0 + len)) : undefined, scalar, len });
-      return { s0, out, w };
+      const { out, worker } = await dispatchResilient(rec.id, { kernel: rec.kernel, a: f32ToB64(a.subarray(s0, s0 + len)), b: binary ? f32ToB64(b.subarray(s0, s0 + len)) : undefined, scalar, len }, w);
+      return { s0, out, w: worker };
     }));
     const O = new Float32Array(n); const sh: JobRec['shards'] = [];
     for (const p of parts) if (p) { O.set(p.out, p.s0); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length, ms: 0 }); }
@@ -374,8 +419,8 @@ async function runJob(rec: JobRec) {
     const rowsPer = Math.ceil(rows / fleet.length);
     const parts = await Promise.all(fleet.map(async (w, i) => {
       const r0 = i * rowsPer, rn = Math.min(rows, r0 + rowsPer) - r0; if (rn <= 0) return null;
-      const out = await dispatchShard(w, rec.id, { kernel: rec.kernel, a: f32ToB64(a.slice(r0 * cols, (r0 + rn) * cols)), cols });
-      return { r0, out, w };
+      const { out, worker } = await dispatchResilient(rec.id, { kernel: rec.kernel, a: f32ToB64(a.slice(r0 * cols, (r0 + rn) * cols)), cols }, w);
+      return { r0, out, w: worker };
     }));
     const O = new Float32Array(rows * cols); const sh: JobRec['shards'] = [];
     for (const p of parts) if (p) { O.set(p.out, p.r0 * cols); sh.push({ worker: p.w.id, backend: p.w.label, work: p.out.length, ms: 0 }); }
@@ -453,7 +498,7 @@ async function handler(req: Request): Promise<Response> {
     if (body.action === 'remove') { if (w.pubkeyB64) removedPubkeys.add(w.pubkeyB64); try { w.ws.close(); } catch { /* */ } workers.delete(id); log('warn', `admin removed worker ${id}${w.pubkeyB64 ? ' (banned by key)' : ' (unsigned — could rejoin under a new id)'}`); return json({ ok: true, removed: id, banned: !!w.pubkeyB64 }); }
     const ctl: Record<string, unknown> = { t: 'control' };
     if (body.action === 'pause') { w.paused = true; w.pausedReason = 'admin'; ctl.pause = true; }
-    if (body.action === 'resume') { w.paused = false; w.pausedReason = null; ctl.pause = false; }
+    if (body.action === 'resume') { w.paused = false; w.pausedReason = null; w.consecErrors = 0; ctl.pause = false; }
     if (typeof body.ceil === 'number' && isFinite(body.ceil)) { const c = Math.max(0.05, Math.min(1, body.ceil)); w.duty = c; w.ceil = c; ctl.ceil = c; }
     if (typeof body.schedule === 'string') { w.schedule = body.schedule.trim().toLowerCase().slice(0, 40); ctl.schedule = w.schedule; }
     if (typeof body.nick === 'string') w.nick = body.nick.slice(0, 40);
@@ -627,7 +672,7 @@ function renderFleet(){
    '<td>'+spark(x.trend,72,20,x.backend==='gpu'?'#34d399':'#fbbf24')+'</td>'+
    '<td>'+(x.shards|0)+'</td><td class=mut>'+fmt(x.units)+'</td>'+
    '<td>'+pct(x.userUtil)+'</td><td>'+pct(x.poolDuty)+'</td>'+
-   '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':'<span class=lvl-warn>paused</span>'):(x.busy?'working':'idle'))+'</td>'+
+   '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':(x.pausedReason==='errors'?'<span class=lvl-error>auto-paused</span>':'<span class=lvl-warn>paused</span>')):(x.busy?'working':'idle'))+'</td>'+
    '<td class=ctl>'+
      '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'" title="'+(paused?'resume':'pause')+'">'+(paused?'▶':'⏸')+'</button>'+
      '<input class=dutyin value='+((x.ceil!=null?x.ceil:(x.poolDuty||0.6)).toFixed(2))+' title="duty ceiling 0.05–1">'+
