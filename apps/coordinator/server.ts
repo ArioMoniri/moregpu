@@ -135,11 +135,18 @@ interface Worker {
   shards: number; units: number; errors: number; totalMs: number;
   lastUnits: number; history: number[]; // per-sample units completed → sparkline trend
   pubkey?: CryptoKey; // Ed25519 public key for verifying this worker's result signatures
+  pubkeyB64?: string; // raw public key (for the removed-worker denylist)
   paused: boolean; // scheduled-off or admin-paused → coordinator assigns it no new work
+  pausedReason?: string | null; // 'admin' | 'schedule' | null — why it's paused
+  ceil: number; // the worker's reported/administered duty CEILING (distinct from the live effective duty)
   schedule?: string; // the machine's own contribution schedule ("always" / "idle-only" / "HH:MM-HH:MM")
   nick?: string; // optional admin-set display label
 }
 const workers = new Map<string, Worker>();
+const removedPubkeys = new Set<string>(); // workers an admin removed — refuse their re-registration (ban by key)
+const REGISTER_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_REGISTER_TIMEOUT_MS') ?? 8000);
+const MAX_JOBS = Number(Deno.env.get('MOREGPU_MAX_JOBS') ?? 500); // cap retained job records (+ their output blobs)
+const safeId = (s: string) => (String(s ?? '').replace(/[^A-Za-z0-9._:@-]/g, '').slice(0, 64) || 'worker');
 /** Workers eligible for new work right now (not scheduled-off / admin-paused). */
 function activeFleet(): Worker[] { return [...workers.values()].filter((w) => !w.paused); }
 type ResultMsg = { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number; signed?: boolean };
@@ -149,23 +156,36 @@ const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 120_
 
 function wireWorker(ws: WebSocket) {
   let id = '';
+  let registered = false;
+  // Close a socket that connects but never authenticates, so an unauthenticated peer can't hold FDs/RAM open.
+  const authTimer = setTimeout(() => { if (!registered) { try { ws.send(JSON.stringify({ t: 'denied', reason: 'no register within timeout' })); } catch { /* */ } try { ws.close(); } catch { /* */ } } }, REGISTER_TIMEOUT_MS);
   ws.onmessage = async (ev) => {
     let m: Record<string, unknown>;
     try { m = JSON.parse(ev.data as string); } catch { log('warn', 'bad frame from worker'); return; }
     if (m.t === 'register') {
+      if (registered) return; // one register per socket
       if (!constEq(String(m.joinToken ?? ''), cfg.joinToken)) { ws.send(JSON.stringify({ t: 'denied', reason: 'bad join token' })); log('warn', 'worker rejected: bad join token'); ws.close(); return; }
       const node = m.node as { id: string; backend: string; label: string; os: string };
-      id = node.id;
+      const pubkeyB64 = typeof m.pubkey === 'string' ? m.pubkey : undefined;
+      // Ban list: an admin-removed worker (by key) may not re-enroll.
+      if (pubkeyB64 && removedPubkeys.has(pubkeyB64)) { ws.send(JSON.stringify({ t: 'denied', reason: 'removed by admin' })); ws.close(); return; }
+      const wantId = safeId(node.id); // sanitize (also prevents /metrics label injection)
+      // Reject an id that's already live so a token-holder can't hijack another worker's identity/shards.
+      if (workers.has(wantId)) { ws.send(JSON.stringify({ t: 'denied', reason: 'worker id already registered' })); log('warn', `worker rejected: duplicate id ${wantId}`); ws.close(); return; }
+      id = wantId;
       let pubkey: CryptoKey | undefined;
-      try { if (typeof m.pubkey === 'string') pubkey = await crypto.subtle.importKey('raw', b64d(m.pubkey) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
-      workers.set(id, { id, backend: node.backend, label: node.label, os: node.os, ws, load1: 0, util: 0, duty: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, paused: false });
+      try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
+      registered = true; clearTimeout(authTimer);
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
-      log('info', `worker joined: ${id} (${node.label}, ${node.os})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
+      log('info', `worker joined: ${id} (${safeId(node.label)}, ${safeId(node.os)})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
     } else if (m.t === 'heartbeat') {
-      const w = workers.get(String(m.id));
-      if (w) { w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty; if (typeof m.paused === 'boolean') w.paused = m.paused; if (typeof m.schedule === 'string') w.schedule = m.schedule; if (m.paused === false) pumpQueue(); }
+      if (!registered || !id) return; // ignore heartbeats before auth; trust only the socket's own id, not m.id
+      const w = workers.get(id);
+      if (w) { w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty; if (typeof m.ceil === 'number') w.ceil = m.ceil; if (typeof m.paused === 'boolean') w.paused = m.paused; w.pausedReason = (m.pausedReason as string | null) ?? null; if (typeof m.schedule === 'string') w.schedule = m.schedule; if (m.paused === false) pumpQueue(); }
     } else if (m.t === 'result') {
+      if (!registered) return;
       const p = pending.get(String(m.shardId));
       if (!p || p.workerId !== id) return; // forged/foreign result for another worker's shard → ignored
       const w = workers.get(id);
@@ -180,6 +200,7 @@ function wireWorker(ws: WebSocket) {
     }
   };
   ws.onclose = () => {
+    clearTimeout(authTimer);
     if (!id) return;
     workers.delete(id);
     // reject any shard still in flight on this worker so the job fails fast instead of hanging the queue
@@ -257,6 +278,8 @@ function submit(kernel: string, size: number, input?: JobInput): JobRec {
   const id = `job-${++jobSeq}`;
   const rec: JobRec = { id, status: 'queued', kernel, size, sealed: true, submittedAt: Date.now(), dataMode: !!input?.a };
   jobs.set(id, rec); queue.push(rec); M.jobsTotal++; KM[kernel] = (KM[kernel] ?? 0) + 1;
+  // cap retained job records (and their data-mode output blobs) — drop the oldest terminal jobs first
+  if (jobs.size > MAX_JOBS) for (const [jid, j] of jobs) { if (jobs.size <= MAX_JOBS) break; if (j.status === 'done' || j.status === 'failed') jobs.delete(jid); }
   if (input?.a) jobInputs.set(id, input);
   log('info', `queued ${id}: ${kernel} ${input?.a ? 'data' : 'size=' + size}`, `queue depth ${queue.length}`);
   pumpQueue();
@@ -412,8 +435,8 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === '/workers') {
     const total = [...workers.values()].reduce((s, w) => s + w.units, 0) || 1;
     return json([...workers.values()].map((w) => ({
-      id: w.id, nick: w.nick, backend: w.backend, label: w.label, os: w.os, userUtil: w.util, poolDuty: w.duty, busy: w.busy,
-      paused: w.paused, schedule: w.schedule ?? 'always',
+      id: w.id, nick: w.nick, backend: w.backend, label: w.label, os: w.os, userUtil: w.util, poolDuty: w.duty, ceil: w.ceil, busy: w.busy,
+      paused: w.paused, pausedReason: w.pausedReason ?? null, schedule: w.schedule ?? 'always',
       shards: w.shards, units: w.units, share: +(w.units / total).toFixed(3), errors: w.errors,
       avgMs: w.shards ? +(w.totalMs / w.shards).toFixed(1) : 0, uptimeS: Math.round((Date.now() - w.joinedAt) / 1000), trend: w.history,
     })));
@@ -425,11 +448,11 @@ async function handler(req: Request): Promise<Response> {
     const w = workers.get(id);
     if (!w) return json({ error: 'worker not found' }, 404);
     const body = await req.json().catch(() => ({})) as { action?: string; ceil?: number; schedule?: string; nick?: string };
-    if (body.action === 'remove') { try { w.ws.close(); } catch { /* */ } workers.delete(id); log('warn', `admin removed worker ${id}`); return json({ ok: true, removed: id }); }
+    if (body.action === 'remove') { if (w.pubkeyB64) removedPubkeys.add(w.pubkeyB64); try { w.ws.close(); } catch { /* */ } workers.delete(id); log('warn', `admin removed worker ${id}${w.pubkeyB64 ? ' (banned by key)' : ' (unsigned — could rejoin under a new id)'}`); return json({ ok: true, removed: id, banned: !!w.pubkeyB64 }); }
     const ctl: Record<string, unknown> = { t: 'control' };
-    if (body.action === 'pause') { w.paused = true; ctl.pause = true; }
-    if (body.action === 'resume') { w.paused = false; ctl.pause = false; }
-    if (typeof body.ceil === 'number' && isFinite(body.ceil)) { const c = Math.max(0.05, Math.min(1, body.ceil)); w.duty = c; ctl.ceil = c; }
+    if (body.action === 'pause') { w.paused = true; w.pausedReason = 'admin'; ctl.pause = true; }
+    if (body.action === 'resume') { w.paused = false; w.pausedReason = null; ctl.pause = false; }
+    if (typeof body.ceil === 'number' && isFinite(body.ceil)) { const c = Math.max(0.05, Math.min(1, body.ceil)); w.duty = c; w.ceil = c; ctl.ceil = c; }
     if (typeof body.schedule === 'string') { w.schedule = body.schedule.trim().toLowerCase().slice(0, 40); ctl.schedule = w.schedule; }
     if (typeof body.nick === 'string') w.nick = body.nick.slice(0, 40);
     try { if (Object.keys(ctl).length > 1) w.ws.send(JSON.stringify(ctl)); } catch { /* */ }
@@ -585,10 +608,11 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){retur
 function fmt(n){n=n||0;return n>=1e9?(n/1e9).toFixed(1)+'G':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n;}
 // ---- fleet control (pause/resume/duty/remove) + high-worker-count rendering ----
 let FLEET=[];
-function ctl(id,body){return fetch('/workers/'+encodeURIComponent(id)+'/control',{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(){refresh();}).catch(function(){});}
-function pauseAll(p){(FLEET||[]).forEach(function(x){ctl(x.id,{action:p?'pause':'resume'});});}
+function ctl(id,body,silent){return fetch('/workers/'+encodeURIComponent(id)+'/control',{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(){if(!silent)refresh();}).catch(function(){});}
+function pauseAll(p){Promise.all((FLEET||[]).map(function(x){return ctl(x.id,{action:p?'pause':'resume'},true);})).then(refresh);}
 function renderFleet(){
  var el=document.getElementById('fleet');if(!el)return;
+ var ae=document.activeElement;if(ae&&ae.classList&&ae.classList.contains('dutyin'))return; // don't clobber a duty field mid-edit
  var q=(document.getElementById('fsearch').value||'').toLowerCase();
  var list=(FLEET||[]).filter(function(x){return !q||((x.nick||'')+' '+x.id+' '+x.backend+' '+(x.os||'')+' '+(x.label||'')).toLowerCase().indexOf(q)>=0;});
  list.sort(function(a,b){return (b.share||0)-(a.share||0);});
@@ -601,10 +625,10 @@ function renderFleet(){
    '<td>'+spark(x.trend,72,20,x.backend==='gpu'?'#34d399':'#fbbf24')+'</td>'+
    '<td>'+(x.shards|0)+'</td><td class=mut>'+fmt(x.units)+'</td>'+
    '<td>'+pct(x.userUtil)+'</td><td>'+pct(x.poolDuty)+'</td>'+
-   '<td>'+(paused?'<span class=lvl-warn>paused</span>':(x.busy?'working':'idle'))+'</td>'+
+   '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':'<span class=lvl-warn>paused</span>'):(x.busy?'working':'idle'))+'</td>'+
    '<td class=ctl>'+
-     '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'">'+(paused?'▶':'⏸')+'</button>'+
-     '<input class=dutyin value='+((x.poolDuty||0.6).toFixed(2))+' title="duty ceiling 0.05–1">'+
+     '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'" title="'+(paused?'resume':'pause')+'">'+(paused?'▶':'⏸')+'</button>'+
+     '<input class=dutyin value='+((x.ceil!=null?x.ceil:(x.poolDuty||0.6)).toFixed(2))+' title="duty ceiling 0.05–1">'+
      '<button class=mini data-act=setduty data-id="'+esc(x.id)+'">set</button>'+
      '<button class="mini danger" data-act=remove data-id="'+esc(x.id)+'">✕</button>'+
    '</td></tr>';}).join(''):'<tr><td class=mut colspan=10>connect a worker…</td></tr>';

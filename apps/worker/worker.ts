@@ -2,9 +2,10 @@
 /**
  * MoreGPU worker agent — a single self-contained file. Runs on any OS with Deno.
  *
- *  • Uses the real GPU (WebGPU → Metal/Vulkan/D3D12) when present.
- *  • When there is NO GPU, it contributes to the same pool with its CPU — running the identical
- *    kernels in JS/WASM. CPU machines add compute too.
+ *  • Runs `matmul` on the real GPU (WebGPU → Metal/Vulkan/D3D12) when present; the memory-bound
+ *    elementwise and row-wise kernels run on the CPU (moving them to the GPU rarely helps without
+ *    weight residency). On a machine with no GPU, matmul runs on the CPU too. CPU machines add compute.
+ *  • Recovers from GPU device loss by falling back to the CPU backend mid-flight.
  *  • Stays polite: an adaptive DUTY-CYCLE throttle interleaves compute with sleeps, so the interactive
  *    user keeps their machine responsive and average power draw (electricity) stays down.
  *  • Connects OUTBOUND over WebSocket (NAT/firewall friendly) and must present the pool's JOIN TOKEN.
@@ -91,12 +92,22 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, Math.max(0, ms)))
 // ---------- backends ----------
 interface Backend { kind: 'gpu' | 'cpu'; label: string; matmul(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Promise<Float32Array>; vectorAdd(a: Float32Array, b: Float32Array): Promise<Float32Array>; }
 
+let gpuLost = false; // set if the GPU device is lost (Metal reset, driver crash) → we fall back to CPU
 async function makeGpuBackend(): Promise<Backend | null> {
   const gpu = (navigator as { gpu?: GPU }).gpu;
   if (!gpu) return null;
   const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) return null;
-  const device = await adapter.requestDevice();
+  // Ask for the adapter's real buffer limits (default caps storage buffers at 128 MiB on Apple silicon,
+  // which would fail a large data-mode matmul); clamp to what the adapter actually supports.
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
+  });
+  gpuLost = false;
+  device.lost.then((info) => { gpuLost = true; console.error(`[worker] GPU device lost (${(info as GPUDeviceLostInfo)?.reason ?? 'unknown'}); falling back to CPU.`); }).catch(() => {});
   async function run(code: string, storage: Float32Array[], uniform: Uint32Array | null, outLen: number, dispatch: [number, number, number]) {
     const inBufs = storage.map((arr) => { const b = device.createBuffer({ size: Math.max(4, arr.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
     const outBytes = Math.max(4, outLen * 4);
@@ -204,8 +215,24 @@ function runRowwise(kernel: string, a: Float32Array, cols: number): Float32Array
 
 // ---------- work loop ----------
 const FORCE_CPU = args.has('cpu') || Deno.env.get('MOREGPU_FORCE_CPU') === '1';
-const backend = (FORCE_CPU ? null : await makeGpuBackend().catch(() => null)) ?? makeCpuBackend();
+let backend = (FORCE_CPU ? null : await makeGpuBackend().catch(() => null)) ?? makeCpuBackend();
 console.log(`[worker] ${NAME} · backend=${backend.label} · server=${SERVER}`);
+
+/** Run one shard on the current backend; on a GPU failure/device-loss, permanently fall back to CPU and retry. */
+async function computeShard(req: { kernel: string; a: string; b?: string; scalar?: number; rows?: number; N?: number; K?: number; cols?: number }): Promise<Float32Array> {
+  if (backend.kind === 'gpu' && gpuLost) { console.error('[worker] GPU marked lost — switching to CPU backend.'); backend = makeCpuBackend(); }
+  const run = async (): Promise<Float32Array> => {
+    if (req.kernel === 'matmul') return await backend.matmul(b64ToF32(req.a), b64ToF32(req.b!), req.rows!, req.N!, req.K!);
+    if (ROWWISE.has(req.kernel)) return runRowwise(req.kernel, b64ToF32(req.a), req.cols!);
+    if (ELEMENTWISE.has(req.kernel)) return await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
+    throw new Error(`unknown kernel ${req.kernel}`);
+  };
+  try { return await run(); }
+  catch (e) {
+    if (backend.kind === 'gpu') { console.error(`[worker] GPU compute failed (${e}); switching to CPU and retrying.`); backend = makeCpuBackend(); return await run(); }
+    throw e;
+  }
+}
 if (!TOKEN) console.log('[worker] warning: no join token set (--token / MOREGPU_TOKEN) — the server will reject me');
 let tenantKey: Uint8Array | null = null;
 
@@ -214,11 +241,12 @@ function connect() {
   let hb: ReturnType<typeof setInterval> | undefined;
   ws.onopen = () => {
     ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os } }));
-    // Heartbeat: report live load, adaptive duty, and whether the schedule/admin currently allow work.
+    // Heartbeat: report live load, adaptive duty, the ceiling, and why (if) we're paused.
     hb = setInterval(() => {
       let load1 = 0; try { load1 = Deno.loadavg()[0]; } catch { /* */ }
       const active = isActive();
-      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1, cores: CORES, util: +(load1 / CORES).toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, paused: !active, schedule: SCHEDULE })); } catch { /* */ }
+      const reason = adminPaused ? 'admin' : (!scheduleActive() ? 'schedule' : null);
+      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1, cores: CORES, util: +(load1 / CORES).toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, ceil: +(Number.isNaN(CEIL) ? 0.6 : CEIL).toFixed(2), paused: !active, pausedReason: reason, schedule: SCHEDULE })); } catch { /* */ }
     }, 4000);
   };
   ws.onmessage = async (ev) => {
@@ -230,8 +258,9 @@ function connect() {
       if (typeof msg.ceil === 'number') CEIL = Math.max(MIN_DUTY, Math.min(1, msg.ceil));
       if (typeof msg.schedule === 'string') SCHEDULE = msg.schedule.trim().toLowerCase();
       const active = isActive();
+      const reason = adminPaused ? 'admin' : (!scheduleActive() ? 'schedule' : null);
       console.log(`[worker] admin control → ${adminPaused ? 'PAUSED' : 'active'} · duty ceiling=${((Number.isNaN(CEIL) ? 0.6 : CEIL) * 100).toFixed(0)}% · schedule=${SCHEDULE}`);
-      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1: 0, cores: CORES, util: +emaUtil.toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, paused: !active, schedule: SCHEDULE })); } catch { /* */ }
+      try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1: 0, cores: CORES, util: +emaUtil.toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, ceil: +(Number.isNaN(CEIL) ? 0.6 : CEIL).toFixed(2), paused: !active, pausedReason: reason, schedule: SCHEDULE })); } catch { /* */ }
       return;
     }
     if (msg.t === 'assign') {
@@ -239,11 +268,7 @@ function connect() {
       try {
         if (!tenantKey) throw new Error('no tenant key');
         const req = JSON.parse(new TextDecoder().decode(await unseal(tenantKey, msg.sealedIn)));
-        let out: Float32Array;
-        if (req.kernel === 'matmul') out = await backend.matmul(b64ToF32(req.a), b64ToF32(req.b), req.rows, req.N, req.K);
-        else if (ROWWISE.has(req.kernel)) out = runRowwise(req.kernel, b64ToF32(req.a), req.cols);
-        else if (ELEMENTWISE.has(req.kernel)) out = await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
-        else throw new Error(`unknown kernel ${req.kernel}`);
+        const out = await computeShard(req);
         const sealedOut = await seal(tenantKey, new TextEncoder().encode(JSON.stringify({ out: f32ToB64(out) })));
         const ms = performance.now() - t0;
         const sig = await signResult(msg.shardId, sealedOut);
