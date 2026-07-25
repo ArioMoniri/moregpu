@@ -144,7 +144,7 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 <tr><td>Transformer block / small MLP inference</td><td class="p">🧩</td><td>Compose LN → matmuls → attention → FFN from the SDK; split a model across workers with weight residency.</td></tr>
 <tr><td>Small LLM (real GPT-2 124M)</td><td class="pa">🟡</td><td><b>A real GPT-2 runs on the pool</b> (<code>examples/llm_infer.py</code>) and matches Hugging Face token-for-token. Slow — activations round-trip per layer (~seconds/token).</td></tr>
 <tr><td>Large / out-of-core matmul</td><td class="pa">🟡</td><td>Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink.</td></tr>
-<tr><td>Big / fast LLM inference (7B+, low latency)</td><td class="n">❌</td><td>fp32, no fp16/int8/tensor cores, no KV cache, activations cross the network — needs a native fp16/CUDA worker (roadmap).</td></tr>
+<tr><td>Big / fast LLM inference (7B+, low latency)</td><td class="n">❌</td><td>fp32/fp16 weights, no int8/tensor cores, no KV cache, activations cross the network — needs a native fp16/CUDA worker (roadmap).</td></tr>
 <tr><td>Training (autograd / backprop)</td><td class="n">❌</td><td>No autograd or optimizer kernels. Not a training platform.</td></tr>
 <tr><td>CUDA/PTX · Stable Diffusion · NVENC · tensor cores</td><td class="n">❌</td><td>WGSL backend, compute-only, fp32 — these paths don't exist.</td></tr>
 </table>

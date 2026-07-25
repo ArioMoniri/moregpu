@@ -151,8 +151,8 @@ const workers = new Map<string, Worker>();
 const removedPubkeys = new Set<string>(); // workers an admin removed — refuse their re-registration (ban by key)
 // Weight RESIDENCY: a named weight is cached on ONE worker; a resident matmul (bRef) runs there without
 // re-sending the weight. Place different layers' weights on different workers to split a model (pipeline).
-const weightHome = new Map<string, { worker: string; rows: number; cols: number }>(); // weightId → home worker + dims
-const weightStore = new Map<string, Float32Array>(); // coordinator's own copy, used to verify resident results
+const weightHome = new Map<string, { worker: string; rows: number; cols: number; dtype: 'f32' | 'f16' }>(); // weightId → home worker + dims
+const weightStore = new Map<string, Float32Array>(); // coordinator's own copy (DEQUANTIZED for f16), used to verify resident results
 const REGISTER_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_REGISTER_TIMEOUT_MS') ?? 8000);
 const MAX_JOBS = Number(Deno.env.get('MOREGPU_MAX_JOBS') ?? 500); // cap retained job records (+ their output blobs)
 const safeId = (s: string) => (String(s ?? '').replace(/[^A-Za-z0-9._:@-]/g, '').slice(0, 64) || 'worker');
@@ -423,7 +423,8 @@ async function runJob(rec: JobRec) {
     const out = await dispatchShard(w, rec.id, { kernel: 'matmul', a: f32ToB64(A), bRef: input.bRef, rows: M, N, K });
     const wall = performance.now() - t0;
     const B = weightStore.get(input.bRef);
-    if (B && M * N <= 640 * 640) { const ref = cpuMatmul(A, B, M, N, K); let md = 0; for (let i = 0; i < out.length; i++) md = Math.max(md, Math.abs(out[i] - ref[i])); rec.verified = md < Math.max(1e-2, K * 1e-4); }
+    const tol = home.dtype === 'f16' ? Math.max(3e-2, K * 3e-3) : Math.max(1e-2, K * 1e-4); // f16 keeps ~3 sig digits
+    if (B && M * N <= 640 * 640) { const ref = cpuMatmul(A, B, M, N, K); let md = 0; for (let i = 0; i < out.length; i++) md = Math.max(md, Math.abs(out[i] - ref[i])); rec.verified = md < tol; }
     rec.gflops = (2 * M * N * K) / (wall / 1000) / 1e9; rec.ms = wall;
     rec.shards = [{ worker: w.id, backend: w.label, work: out.length, ms: 0 }];
     rec.output = f32ToB64(out); rec.outLen = out.length;
@@ -569,9 +570,12 @@ async function handler(req: Request): Promise<Response> {
   // Weight residency: upload a named weight (pinned resident on one worker), or list what's cached.
   if (url.pathname === '/weights') {
     if (req.method === 'POST') {
-      const body = await req.json().catch(() => ({})) as { id?: string; data?: string; rows?: number; cols?: number; worker?: string };
-      if (!body.id || typeof body.data !== 'string' || !body.rows || !body.cols) return json({ error: 'need {id, data (base64 f32), rows, cols, worker?}' }, 400);
-      const arr = b64ToF32(body.data);
+      const body = await req.json().catch(() => ({})) as { id?: string; data?: string; rows?: number; cols?: number; worker?: string; dtype?: string };
+      if (!body.id || typeof body.data !== 'string' || !body.rows || !body.cols) return json({ error: 'need {id, data (base64), rows, cols, dtype?, worker?}' }, 400);
+      const dtype: 'f32' | 'f16' = body.dtype === 'f16' ? 'f16' : 'f32';
+      const bytes = b64d(body.data);
+      // Coordinator keeps a DEQUANTIZED f32 copy so its cpuMatmul verify matches the worker's f16 result.
+      const arr = dtype === 'f16' ? Float32Array.from(new Float16Array(bytes.buffer)) : new Float32Array(bytes.buffer);
       if (arr.length !== body.rows * body.cols) return json({ error: `data length ${arr.length} != rows*cols ${body.rows * body.cols}` }, 400);
       // Cap per-weight size so a huge upload gets a clean 413 instead of OOM-ing the coordinator (a sealed
       // WS frame carries the base64 payload). Big projections (e.g. an LM head) should be tiled or host-side.
@@ -582,15 +586,15 @@ async function handler(req: Request): Promise<Response> {
       // home = explicit worker, else the active worker holding the fewest weights (spread the model across GPUs)
       const home = body.worker ? active.find((w) => w.id === body.worker) : active.slice().sort((a, b) => residentCount(a.id) - residentCount(b.id))[0];
       if (!home) return json({ error: `worker ${body.worker} not active` }, 404);
-      const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify({ data: body.data, rows: body.rows, cols: body.cols })));
+      const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify({ data: body.data, rows: body.rows, cols: body.cols, dtype })));
       const ack = new Promise<{ ok: boolean; error?: string }>((res) => { const t = setTimeout(() => { pendingCache.delete(body.id!); res({ ok: false, error: 'cache ack timeout' }); }, 30_000); pendingCache.set(body.id!, (r) => { clearTimeout(t); res(r); }); });
       home.ws.send(JSON.stringify({ t: 'cache', id: body.id, sealed }));
       const r = await ack;
       if (!r.ok) return json({ error: `cache failed on ${home.id}: ${r.error}` }, 502);
-      weightHome.set(body.id, { worker: home.id, rows: body.rows, cols: body.cols });
+      weightHome.set(body.id, { worker: home.id, rows: body.rows, cols: body.cols, dtype });
       weightStore.set(body.id, arr);
-      log('info', `weight ${body.id} (${body.rows}x${body.cols}) → resident on ${home.id}`);
-      return json({ ok: true, id: body.id, worker: home.id, rows: body.rows, cols: body.cols });
+      log('info', `weight ${body.id} (${body.rows}x${body.cols} ${dtype}) → resident on ${home.id}`);
+      return json({ ok: true, id: body.id, worker: home.id, rows: body.rows, cols: body.cols, dtype });
     }
     return json([...weightHome.entries()].map(([id, h]) => ({ id, worker: h.worker, rows: h.rows, cols: h.cols })));
   }

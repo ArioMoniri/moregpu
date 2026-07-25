@@ -29,6 +29,12 @@ def _f32_b64(values: Sequence[float]) -> str:
     return base64.b64encode(array.array("f", values).tobytes()).decode()
 
 
+def _f16_b64(values: Sequence[float]) -> str:  # array has no half typecode; struct '<e' packs IEEE f16
+    import struct
+    v = list(values)
+    return base64.b64encode(struct.pack(f"<{len(v)}e", *v)).decode()
+
+
 def _b64_f32(s: str) -> list[float]:
     a = array.array("f"); a.frombytes(base64.b64decode(s)); return list(a)
 
@@ -137,10 +143,12 @@ class MoreGPU:
         return math.sqrt(self.dot(a, a))
 
     # ---- weight residency (split a model across workers / GPUs) ----
-    def upload_weight(self, wid: str, data: Sequence[float], rows: int, cols: int, worker: str | None = None) -> dict:
-        """Cache a named weight (rows×cols) RESIDENT on a worker; it is sent ONCE. Pin different layers'
-        weights to different workers to split a model across GPUs (pipeline). Returns {id, worker, rows, cols}."""
-        body: dict[str, Any] = {"id": wid, "data": _f32_b64(data), "rows": rows, "cols": cols}
+    def upload_weight(self, wid: str, data: Sequence[float], rows: int, cols: int, worker: str | None = None, dtype: str = "f32") -> dict:
+        """Cache a named weight (rows×cols) RESIDENT on a worker; it is sent ONCE. dtype='f16' halves the
+        upload + worker memory + GEMM bandwidth (f32 accumulate on a shader-f16 GPU; CPU workers dequantize).
+        Pin different layers to different workers to split a model across GPUs. Returns {id, worker, rows, cols, dtype}."""
+        body: dict[str, Any] = {"id": wid, "data": (_f16_b64(data) if dtype == "f16" else _f32_b64(data)),
+                                "rows": rows, "cols": cols, "dtype": dtype}
         if worker:
             body["worker"] = worker
         return self._req("/weights", "POST", body)

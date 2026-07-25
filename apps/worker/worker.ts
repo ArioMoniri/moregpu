@@ -100,6 +100,31 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
   }
   if (row<M && col<N){ C[row*N+col]=acc; }
 }`,
+  // fp16 tiled GEMM: f16 A/B storage (half the memory + bandwidth), f32 accumulate, f32 output.
+  // `enable f16;` is a module directive and must be the first line — so this is a separate module.
+  matmulF16: `enable f16;
+@group(0) @binding(0) var<storage, read> A: array<f16>;
+@group(0) @binding(1) var<storage, read> B: array<f16>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+@group(0) @binding(3) var<uniform> d: vec4<u32>;
+var<workgroup> As: array<f16, 256>;
+var<workgroup> Bs: array<f16, 256>;
+@compute @workgroup_size(16,16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+  let M=d.x; let N=d.y; let K=d.z;
+  let row=g.y; let col=g.x; let lr=l.y; let lc=l.x;
+  var acc=0.0;
+  let tiles=(K+15u)/16u;
+  for (var t=0u; t<tiles; t=t+1u) {
+    let aCol=t*16u+lc; let bRow=t*16u+lr;
+    As[lr*16u+lc]=select(f16(0.0), A[row*K+aCol], row<M && aCol<K);
+    Bs[lr*16u+lc]=select(f16(0.0), B[bRow*N+col], bRow<K && col<N);
+    workgroupBarrier();
+    for (var k=0u;k<16u;k=k+1u){ acc=acc+f32(As[lr*16u+k])*f32(Bs[k*16u+lc]); }
+    workgroupBarrier();
+  }
+  if (row<M && col<N){ C[row*N+col]=acc; }
+}`,
   // Elementwise unary (op: 0=relu 1=scale 2=gelu), one thread per element. p.x=op, p.y=scalar.
   unary: `@group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read_write> o: array<f32>;
@@ -171,8 +196,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, Math.max(0, ms)))
 
 // ---------- backends ----------
 interface Backend {
-  kind: 'gpu' | 'cpu'; label: string;
+  kind: 'gpu' | 'cpu'; label: string; hasF16?: boolean;
   matmul(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Promise<Float32Array>;
+  // fp16 matmul: f16 A/B (Uint16 bit patterns), f32 output. Present only on f16-capable GPU workers.
+  matmulF16?(a: Uint16Array, b: Uint16Array, M: number, N: number, K: number): Promise<Float32Array>;
   // Optional GPU paths for the other kernels; when absent the worker uses the CPU reference implementations.
   elementwise?(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Promise<Float32Array>;
   rowwise?(kernel: string, a: Float32Array, cols: number): Promise<Float32Array>;
@@ -184,9 +211,13 @@ async function makeGpuBackend(): Promise<Backend | null> {
   if (!gpu) return null;
   const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) return null;
+  // fp16 (half precision) if the adapter supports it — requestDevice REJECTS an unsupported feature,
+  // so gate on it. f16 weights halve residency memory + matmul bandwidth (with f32 accumulation).
+  const hasF16 = adapter.features.has('shader-f16');
   // Ask for the adapter's real buffer limits (default caps storage buffers at 128 MiB on Apple silicon,
   // which would fail a large data-mode matmul); clamp to what the adapter actually supports.
   const device = await adapter.requestDevice({
+    requiredFeatures: hasF16 ? ['shader-f16'] : [],
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
@@ -194,8 +225,9 @@ async function makeGpuBackend(): Promise<Backend | null> {
   });
   gpuLost = false;
   device.lost.then((info) => { gpuLost = true; console.error(`[worker] GPU device lost (${(info as GPUDeviceLostInfo)?.reason ?? 'unknown'}); falling back to CPU.`); }).catch(() => {});
-  async function run(code: string, storage: Float32Array[], uniform: Uint32Array | Float32Array | null, outLen: number, dispatch: [number, number, number]) {
-    const inBufs = storage.map((arr) => { const b = device.createBuffer({ size: Math.max(4, arr.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
+  async function run(code: string, storage: (Float32Array | Uint16Array)[], uniform: Uint32Array | Float32Array | null, outLen: number, dispatch: [number, number, number]) {
+    // buffer size must be a multiple of 4 bytes; an f16 (Uint16) array with an odd element count is 2 mod 4.
+    const inBufs = storage.map((arr) => { const b = device.createBuffer({ size: Math.max(4, (arr.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
     const outBytes = Math.max(4, outLen * 4);
     const outBuf = device.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const readBuf = device.createBuffer({ size: outBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -220,8 +252,9 @@ async function makeGpuBackend(): Promise<Backend | null> {
   // (data mode allows up to 16M elements) never exceed it — each chunk is an independent dispatch.
   const MAXW = device.limits.maxComputeWorkgroupsPerDimension || 65535;
   const ELEM_PER = MAXW * 64;   // max elements per elementwise dispatch (workgroup_size 64)
-  return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}`,
+  return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}${hasF16 ? '+f16' : ''}`, hasF16,
     matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]),
+    matmulF16: hasF16 ? ((a, b, M, N, K) => run(WGSL.matmulF16, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1])) : undefined,
     elementwise: async (kernel, a, b, scalar) => {
       const op = ELEM_OP[kernel] ?? 0;
       const unary = kernel === 'relu' || kernel === 'scale' || kernel === 'gelu';
@@ -346,10 +379,19 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
   if (backend.kind === 'gpu' && gpuLost) { console.error('[worker] GPU marked lost — switching to CPU backend.'); backend = makeCpuBackend(); }
   const run = async (): Promise<Float32Array> => {
     if (req.kernel === 'matmul') {
-      // resident-weight matmul: B comes from this worker's cache (never re-sent over the network)
-      const B = req.bRef ? residentWeights.get(req.bRef) : b64ToF32(req.b!);
-      if (!B) throw new Error(`weight ${req.bRef} not resident on this worker`);
-      return await backend.matmul(b64ToF32(req.a), B, req.rows!, req.N!, req.K!);
+      const A = b64ToF32(req.a);
+      if (req.bRef) {  // resident-weight matmul: B comes from this worker's cache (never re-sent)
+        const rw = residentWeights.get(req.bRef);
+        if (!rw) throw new Error(`weight ${req.bRef} not resident on this worker`);
+        if (rw.dtype === 'f16') {
+          if (backend.kind === 'gpu' && backend.matmulF16) {                    // f16 A × f16 B, f32 accumulate
+            return await backend.matmulF16(f32ToF16bits(A), rw.data as Uint16Array, req.rows!, req.N!, req.K!);
+          }
+          return await backend.matmul(A, f16bitsToF32(rw.data as Uint16Array), req.rows!, req.N!, req.K!);  // dequantize fallback
+        }
+        return await backend.matmul(A, rw.data as Float32Array, req.rows!, req.N!, req.K!);
+      }
+      return await backend.matmul(A, b64ToF32(req.b!), req.rows!, req.N!, req.K!);
     }
     if (ROWWISE.has(req.kernel)) return backend.rowwise ? await backend.rowwise(req.kernel, b64ToF32(req.a), req.cols!) : runRowwise(req.kernel, b64ToF32(req.a), req.cols!);
     if (ELEMENTWISE.has(req.kernel)) return backend.elementwise ? await backend.elementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1) : await runElementwise(req.kernel, b64ToF32(req.a), req.b ? b64ToF32(req.b) : null, req.scalar ?? 1);
@@ -366,7 +408,10 @@ let tenantKey: Uint8Array | null = null;
 // Weight RESIDENCY: named tensors cached on this worker so a matmul can reference one by id (bRef)
 // instead of re-uploading it every call. This is what lets a model be split across workers (place each
 // layer's weights on a different worker → activations pipeline through; weights are sent ONCE).
-const residentWeights = new Map<string, Float32Array>();
+const residentWeights = new Map<string, { data: Float32Array | Uint16Array; dtype: 'f32' | 'f16' }>();
+const b64ToU16 = (s: string) => new Uint16Array(b64d(s).buffer);
+const f32ToF16bits = (a: Float32Array) => new Uint16Array(new Float16Array(a).buffer);
+const f16bitsToF32 = (u: Uint16Array) => Float32Array.from(new Float16Array(u.buffer, u.byteOffset, u.length));
 
 function connect() {
   const ws = new WebSocket(SERVER);
@@ -399,8 +444,9 @@ function connect() {
       try {
         if (!tenantKey) throw new Error('no tenant key');
         const w = JSON.parse(new TextDecoder().decode(await unseal(tenantKey, msg.sealed)));
-        residentWeights.set(msg.id, b64ToF32(w.data));
-        console.log(`[worker] cached weight ${msg.id} (${w.rows}x${w.cols}) · resident=${residentWeights.size}`);
+        const dtype = w.dtype === 'f16' ? 'f16' : 'f32';
+        residentWeights.set(msg.id, { data: dtype === 'f16' ? b64ToU16(w.data) : b64ToF32(w.data), dtype });
+        console.log(`[worker] cached weight ${msg.id} (${w.rows}x${w.cols} ${dtype}) · resident=${residentWeights.size}`);
         ws.send(JSON.stringify({ t: 'cached', id: msg.id, ok: true }));
       } catch (e) { ws.send(JSON.stringify({ t: 'cached', id: msg.id, ok: false, error: String(e) })); }
       return;

@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-26
+
 ### Added
 
+- **fp16 (half-precision) weights** — a shader-f16 GPU worker runs a dedicated f16 tiled GEMM
+  (f16 storage, f32 accumulate); resident weights uploaded with `dtype='f16'` halve worker
+  memory + upload + GEMM bandwidth. CPU / non-f16 workers dequantize transparently. Verified:
+  GPT-2 runs on the pool with f16 weights and still produces an **identical** generation.
 - **Real LLM inference on the pool** — `examples/llm_infer.py` loads a real **GPT-2 (124M)**,
   pins the 12 transformer layers' weights resident across the workers, and runs the full
   forward pass on the pool (via weight residency + the shipped primitives), using the real

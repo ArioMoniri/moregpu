@@ -49,13 +49,14 @@ def main() -> int:
     sd = model.state_dict()
     npf = lambda n: sd[n].detach().numpy().astype(np.float32)
 
-    print(f"   pinning {L}-layer weights resident across {len(pool.workers())} worker(s) …")
+    DT = "f16" if os.environ.get("MOREGPU_FP16") == "1" else "f32"
+    print(f"   pinning {L}-layer weights resident ({DT}) across {len(pool.workers())} worker(s) …")
     for i in range(L):
         p = f"transformer.h.{i}."
         for wid, name in [(f"l{i}.attn", "attn.c_attn.weight"), (f"l{i}.aproj", "attn.c_proj.weight"),
                           (f"l{i}.fc", "mlp.c_fc.weight"), (f"l{i}.proj", "mlp.c_proj.weight")]:
             W = npf(p + name)
-            pool.upload_weight(wid, W.reshape(-1).tolist(), W.shape[0], W.shape[1])
+            pool.upload_weight(wid, W.reshape(-1).tolist(), W.shape[0], W.shape[1], dtype=DT)
     wte, wpe = npf("transformer.wte.weight"), npf("transformer.wpe.weight")
     lnw = {i: tuple(npf(f"transformer.h.{i}.ln_{j}.{k}") for j in (1, 2) for k in ("weight", "bias")) for i in range(L)}
     bA = {i: npf(f"transformer.h.{i}.attn.c_attn.bias") for i in range(L)}
