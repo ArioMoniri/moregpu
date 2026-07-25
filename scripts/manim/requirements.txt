@@ -1,0 +1,6 @@
+# Render the README animation locally:
+#   python3 -m venv .venv-manim && source .venv-manim/bin/activate
+#   pip install -r scripts/manim/requirements.txt
+#   manim -qm --format=gif -o moregpu scripts/manim/system.py MoreGPUFlow
+# then optimize with ffmpeg + gifsicle (see scripts/manim/render.sh)
+manim>=0.18

@@ -52,3 +52,9 @@ loops.md
 docs/ROADMAP.md
 docs/DEFINITION_OF_DONE.md
 docs/adr/
+
+# Python venv (Manim renders) — local only
+.venv-manim/
+__pycache__/
+media/
+*.pyc
