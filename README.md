@@ -16,71 +16,124 @@ MoreGPU is a native GPU compute pool: an admin runs a coordinator, worker machin
 
 ## Run it
 
-Three steps. Every pool generates its own tokens on first run, so nobody shares another pool's credentials.
+There are **two roles** — pick yours:
 
-### 1. Start the admin server
+| | 👑 **Admin** | 🖥️ **Worker** |
+|---|---|---|
+| You… | run the pool's server, hold the tokens, submit jobs | lend a machine's GPU/CPU with a one-liner |
+| Go to | [Admin track](#-admin-track) | [Worker track](#-worker-track) |
 
-Run the coordinator. Deno is the only prerequisite — a single cross-platform binary that runs the server directly from the URL, the same way on every OS. On its first run the server launches a setup wizard that generates this pool's admin token, worker join token, and encryption key, then prints the exact worker command to copy.
+> Every pool generates its **own** tokens on first run — nobody shares another pool's credentials. Deno is the only prerequisite (one cross-platform binary; the apps run straight from the URL).
+
+---
+
+### 👑 Admin track
+
+**1 · Start the admin server.** First run prints a setup wizard with this pool's tokens and the exact worker command to hand out.
 
 ```sh
 deno run --allow-net --allow-env --allow-read --allow-write \
   https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts
 ```
 
-The dashboard serves on `http://HOST:8787`. Optional environment variables: `PORT`, `MOREGPU_HOST`, `MOREGPU_TLS_CERT` + `MOREGPU_TLS_KEY` (enables `wss://` TLS), `MOREGPU_DUTY`. Keep the printed admin and join tokens; the admin token controls the pool, and the join token lets machines enroll.
+<details><summary><b>▶ What to expect · verify it's up · monitor · stop</b></summary>
 
-### 2. Join machines as workers
+**Expect:** a colored ASCII wizard printing the **Admin token**, the **Worker join token**, the dashboard URL (`http://HOST:8787`), and a ready-to-paste worker one-liner. Copy the two tokens — the admin token controls the pool; the join token lets machines enroll.
 
-On each machine you own or are authorized to use, run the one-liner with the join token from step 1. The worker makes an outbound WebSocket connection to the admin server, installs Deno if needed, and starts pulling work. GPU machines compute on the physical GPU via WebGPU (Metal / Vulkan / D3D12); machines without a usable GPU fall back to CPU and still contribute.
+**Verify it's up:**
+```sh
+curl -s http://localhost:8787/health            # → {"ok":true,"fleet":0,"queue":0}
+```
+**Monitor:** open `http://HOST:8787` (dashboard: fleet, per-worker contribution + trends, queue, logs), or query the pool as a GPU slot:
+```sh
+curl -s http://localhost:8787/device -H "authorization: Bearer <admin-token>"
+```
+**Stop:** `Ctrl-C` in its terminal. Tokens/key persist in `.moregpu-server.json`, so the next start reuses the same pool.
 
-Linux / macOS:
+Optional env: `PORT`, `MOREGPU_HOST`, `MOREGPU_TLS_CERT`+`MOREGPU_TLS_KEY` (→ `wss://` TLS), `MOREGPU_DUTY`.
+</details>
+
+**2 · Submit a job.** Benchmark mode (the pool generates data), or send your own tensors (data mode).
 
 ```sh
+curl -X POST http://ADMIN:8787/submit -H "authorization: Bearer <admin-token>" \
+  -H "content-type: application/json" -d '{"kernel":"matmul","size":1024}'
+```
+
+<details><summary><b>▶ What to expect · send your own data · async · verify</b></summary>
+
+**Expect:** a job record `{"status":"done","gflops":…,"verified":true,"shards":[…]}`. `verified:true` means the pooled GPU result matched the CPU reference.
+
+**Send your own tensors and get results back** (data mode) — easiest via the [SDKs](#use-it-from-your-code):
+```python
+pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 139, 154]
+```
+**Async (GPU-style submit + poll):** add `?async=1` to get a job handle immediately, then poll `GET /jobs/<id>`.
+
+Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale` (extensible). The whole fleet is presented as one **virtual GPU slot** — `GET /device` returns its backends, kernels, limits, queue and capabilities.
+</details>
+
+The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live contribution + trend sparklines, the queue, and the error/debug log. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).
+
+---
+
+### 🖥️ Worker track
+
+**Join a machine to a pool** with the admin's join token. Installs Deno if needed; uses the GPU (WebGPU → Metal / Vulkan / D3D12) or falls back to CPU. Nothing shows on screen — it only dials **out**.
+
+```sh
+# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.sh \
   | MOREGPU_SERVER=wss://ADMIN:8787/ws MOREGPU_TOKEN=<join-token> sh
 ```
-
-Windows (PowerShell) — set the two environment variables first, then run the installer:
-
 ```powershell
-$env:MOREGPU_SERVER = "wss://ADMIN:8787/ws"
-$env:MOREGPU_TOKEN  = "<join-token>"
+# Windows (PowerShell)
+$env:MOREGPU_SERVER="wss://ADMIN:8787/ws"; $env:MOREGPU_TOKEN="<join-token>"
 irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps1 | iex
 ```
 
-Worker environment options:
+<details><summary><b>▶ What to expect · verify you joined · monitor your impact · stop · run as a service</b></summary>
+
+**Expect:** log lines like `[worker] <name> · backend=gpu:… · server=wss://…` then `[worker] joined pool · duty ceiling=60% · adaptive …`. It keeps running and pulling work; you'll see `… done in Nms on gpu/cpu` as shards complete.
+
+**Verify you joined:** you appear in the admin's dashboard / `/workers` with your backend and a live contribution **share**. The installer self-heals (retries the Deno install; supervised restart loop).
+
+**Monitor your impact:** the adaptive throttle keeps *total* machine utilization under `MOREGPU_MAX_UTIL` (default 85%) — the harder **you** use your PC, the less the pool takes. Watch the worker log, or your row in the admin dashboard.
+
+**Stop:**
+| How you started it | Stop command |
+|---|---|
+| Foreground | `Ctrl-C` |
+| Service (`MOREGPU_SERVICE=1`) | `moregpu stop` · or `systemctl --user stop moregpu-worker` (Linux) · `launchctl unload ~/Library/LaunchAgents/dev.moregpu.worker.plist` (macOS) · `schtasks /end /tn MoreGPUWorker` (Windows) |
+| tmux (`MOREGPU_TMUX=1`) | `tmux kill-session -t moregpu` |
+
+**Run as a reboot-surviving, self-healing service:** add `MOREGPU_SERVICE=1` to the one-liner.
+</details>
+
+**Worker options** (environment variables):
 
 | Variable | Effect |
 |---|---|
-| `MOREGPU_SERVICE=1` | Install a reboot-surviving service (systemd on Linux, launchd on macOS, a scheduled task on Windows) so the worker restarts after logout or reboot. |
-| `MOREGPU_THROTTLE=0.4` | Duty-cycle **ceiling**, range `0.05`–`1`. The effective duty adapts below this in real time from the machine's own load. |
-| `MOREGPU_MAX_UTIL=0.85` | Total-utilization cap. The pool only uses the slack below it, so the worker backs off as its user gets busier. |
-| `MOREGPU_FORCE_CPU=1` or `--cpu` | Skip the GPU and compute on CPU only. |
-| `MOREGPU_NAME` | Human-readable name for this worker in the dashboard. |
-| `MOREGPU_TMUX=1` | Run the worker inside a tmux session. |
+| `MOREGPU_SERVICE=1` | Install a reboot-surviving service (systemd / launchd / Windows task); restarts after logout or reboot. |
+| `MOREGPU_THROTTLE=0.4` | Duty-cycle **ceiling** (`0.05`–`1`). The effective duty adapts below this from the machine's live load. |
+| `MOREGPU_MAX_UTIL=0.85` | Total-utilization cap. The pool uses only the slack below it, backing off as its user gets busier. |
+| `MOREGPU_FORCE_CPU=1` (or `--cpu`) | Contribute with CPU only (skip the GPU). |
+| `MOREGPU_NAME` | Name for this worker in the dashboard. |
+| `MOREGPU_TMUX=1` | Run detached inside a tmux session. |
 
-The installer self-heals: it retries the Deno install and runs the worker under a supervised restart loop.
-
-### 3. Submit a job (or use the dashboard)
-
-Authenticate with the admin token from step 1. Submit over HTTP, or open the dashboard at `http://ADMIN:8787` and submit there.
-
-```sh
-curl -X POST http://ADMIN:8787/submit \
-  -H "authorization: Bearer <admin-token>" \
-  -H "content-type: application/json" \
-  -d '{"size":1024}'
-```
-
-The coordinator shards the job across connected workers, AES-GCM seals each work unit so only ciphertext travels the wire, collects and pools the results, and verifies them. Task types available today: `matmul`, `vector_add`, `vector_mul`, `saxpy`, `relu`, `scale`. The set is extensible — add a WGSL kernel plus a CPU reference to support a new task type.
-
-The fleet is presented as one virtual GPU with a Slurm-like job queue. The admin dashboard — reachable from any browser even when the server host is headless/CLI-only — shows the virtual-GPU view, per-worker live load and adaptive duty, the job queue, and an errors/debug log. A Prometheus `/metrics` endpoint exposes the pool's numbers; scrape it with Prometheus and build Grafana dashboards on top. See the [admin guide](docs/ADMIN.md).
+> **Or use the [`moregpu` CLI](scripts/moregpu)** (installable via Homebrew): `moregpu serve`, `moregpu join --server … --token …`, `moregpu stop`, `moregpu status`, `moregpu monitor`.
 
 ---
 
 ## Use it from your code
 
-Drive the pool from an application with the client SDK.
+Drive the pool from an application with the client SDK, or the CLI.
+
+```sh
+pip install moregpu-client          # Python SDK + `moregpu-client` CLI (stdlib only)
+npm install @moregpu/client         # TypeScript/JS SDK (Deno / Node / browser)
+brew install --HEAD ariomoniri/moregpu/moregpu   # the `moregpu` CLI (serve / join / stop / monitor)
+```
 
 **JavaScript / TypeScript** ([`@moregpu/client`](packages/client), runs in Deno / Node / browsers):
 
