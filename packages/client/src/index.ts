@@ -40,6 +40,8 @@ export interface Job {
   ms?: number;
   gflops?: number;
   verified?: boolean;
+  /** true when every shard's result carried a valid Ed25519 signature from its worker. */
+  signed?: boolean;
   shards?: { worker: string; backend: string; work: number; ms: number }[];
   error?: string;
   note?: string;

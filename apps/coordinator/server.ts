@@ -132,32 +132,43 @@ interface Worker {
   // contribution accounting
   shards: number; units: number; errors: number; totalMs: number;
   lastUnits: number; history: number[]; // per-sample units completed → sparkline trend
+  pubkey?: CryptoKey; // Ed25519 public key for verifying this worker's result signatures
 }
 const workers = new Map<string, Worker>();
-type ResultMsg = { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number };
+type ResultMsg = { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: string; backend?: string; ms?: number; signed?: boolean };
 interface Pending { resolve: (r: ResultMsg) => void; reject: (e: Error) => void; workerId: string; }
 const pending = new Map<string, Pending>();
 const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 120_000);
 
 function wireWorker(ws: WebSocket) {
   let id = '';
-  ws.onmessage = (ev) => {
+  ws.onmessage = async (ev) => {
     let m: Record<string, unknown>;
     try { m = JSON.parse(ev.data as string); } catch { log('warn', 'bad frame from worker'); return; }
     if (m.t === 'register') {
       if (!constEq(String(m.joinToken ?? ''), cfg.joinToken)) { ws.send(JSON.stringify({ t: 'denied', reason: 'bad join token' })); log('warn', 'worker rejected: bad join token'); ws.close(); return; }
       const node = m.node as { id: string; backend: string; label: string; os: string };
       id = node.id;
-      workers.set(id, { id, backend: node.backend, label: node.label, os: node.os, ws, load1: 0, util: 0, duty: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, totalMs: 0, lastUnits: 0, history: [] });
+      let pubkey: CryptoKey | undefined;
+      try { if (typeof m.pubkey === 'string') pubkey = await crypto.subtle.importKey('raw', b64d(m.pubkey) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
+      workers.set(id, { id, backend: node.backend, label: node.label, os: node.os, ws, load1: 0, util: 0, duty: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, totalMs: 0, lastUnits: 0, history: [], pubkey });
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
-      log('info', `worker joined: ${id} (${node.label}, ${node.os}) · fleet=${workers.size}`);
+      log('info', `worker joined: ${id} (${node.label}, ${node.os})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
     } else if (m.t === 'heartbeat') {
       const w = workers.get(String(m.id)); if (w) { w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty; }
     } else if (m.t === 'result') {
       const p = pending.get(String(m.shardId));
-      // only the worker the shard was dispatched to may complete it (ignore forged/foreign results)
-      if (p && p.workerId === id) p.resolve({ ok: m.ok as boolean, sealedOut: m.sealedOut as { iv: string; ct: string } | undefined, error: m.error as string | undefined, backend: m.backend as string | undefined, ms: m.ms as number | undefined });
+      if (!p || p.workerId !== id) return; // forged/foreign result for another worker's shard → ignored
+      const w = workers.get(id);
+      let signed = false;
+      if (m.ok && m.sealedOut && w?.pubkey && typeof m.sig === 'string') {
+        const blob = m.sealedOut as { iv: string; ct: string };
+        const okSig = await crypto.subtle.verify({ name: 'Ed25519' }, w.pubkey, b64d(m.sig) as BufferSource, new TextEncoder().encode(`${m.shardId}|${blob.iv}|${blob.ct}`));
+        if (!okSig) { log('warn', `result signature INVALID from ${id} — rejecting shard`); p.reject(new Error('invalid result signature')); return; }
+        signed = true;
+      }
+      p.resolve({ ok: m.ok as boolean, sealedOut: m.sealedOut as { iv: string; ct: string } | undefined, error: m.error as string | undefined, backend: m.backend as string | undefined, ms: m.ms as number | undefined, signed });
     }
   };
   ws.onclose = () => {
@@ -225,11 +236,12 @@ function cpuMatmul(a: Float32Array, b: Float32Array, Mm: number, N: number, K: n
 
 // ---------- jobs + Slurm-like queue ----------
 type JobStatus = 'queued' | 'running' | 'done' | 'failed';
-interface JobRec { id: string; status: JobStatus; kernel: string; size: number; sealed: boolean; submittedAt: number; ms?: number; gflops?: number; verified?: boolean; shards?: { worker: string; backend: string; work: number; ms: number }[]; error?: string; dataMode?: boolean; output?: string; outLen?: number; }
+interface JobRec { id: string; status: JobStatus; kernel: string; size: number; sealed: boolean; submittedAt: number; ms?: number; gflops?: number; verified?: boolean; signed?: boolean; shards?: { worker: string; backend: string; work: number; ms: number }[]; error?: string; dataMode?: boolean; output?: string; outLen?: number; }
 /** Real input a caller submitted (data mode); the pool computes on THIS data and returns the output. */
 interface JobInput { a?: Float32Array; b?: Float32Array; scalar?: number; M?: number; N?: number; K?: number; }
 const jobs = new Map<string, JobRec>();
 const jobInputs = new Map<string, JobInput>();
+const jobSigned = new Map<string, { signed: number; total: number }>(); // Ed25519 verification tally per job
 const queue: JobRec[] = [];
 let jobSeq = 0, shardSeq = 0, draining = false;
 
@@ -272,6 +284,7 @@ async function dispatchShard(w: Worker, jobId: string, payload: Record<string, u
   const outObj = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealedOut)));
   const out = b64ToF32(outObj.out);
   w.shards++; w.units += out.length; w.totalMs += r.ms ?? 0; // contribution accounting
+  const js = jobSigned.get(jobId) ?? { signed: 0, total: 0 }; js.total++; if (r.signed) js.signed++; jobSigned.set(jobId, js);
   return out;
 }
 
@@ -336,7 +349,8 @@ async function runJob(rec: JobRec) {
     rec.verified = md < 1e-4; rec.ms = performance.now() - t0; rec.shards = sh;
     if (data) { rec.output = f32ToB64(O); rec.outLen = O.length; }
   } else { throw new Error(`unknown kernel ${rec.kernel}`); }
-  log('info', `${rec.id} done: ${rec.kernel} · ${(rec.ms ?? 0).toFixed(0)}ms · verified=${rec.verified}${data ? ' · data' : ''}`);
+  const js = jobSigned.get(rec.id); rec.signed = !!js && js.total > 0 && js.signed === js.total; jobSigned.delete(rec.id);
+  log('info', `${rec.id} done: ${rec.kernel} · ${(rec.ms ?? 0).toFixed(0)}ms · verified=${rec.verified} · signed=${rec.signed}${data ? ' · data' : ''}`);
 }
 
 // ---------- device descriptor (the pool presented as a real GPU slot) ----------
@@ -354,7 +368,7 @@ function deviceDescriptor() {
     queue: { depth: g.queueDepth, running: g.busy },
     throughput: { totalUnits: g.totalUnits, totalShards: g.totalShards, trend: g.poolTrend },
     seal: 'AES-256-GCM',
-    capabilities: { dataMode: true, verifiedResults: true, adaptiveThrottle: true, asyncSubmit: true, sealedWire: true, tokenIsolated: true },
+    capabilities: { dataMode: true, verifiedResults: true, signedResults: true, adaptiveThrottle: true, asyncSubmit: true, sealedWire: true, tokenIsolated: true },
   };
 }
 
@@ -455,6 +469,24 @@ function prometheus(): string {
 const serveOpts: Deno.ServeTcpOptions & { cert?: string; key?: string } = { port: PORT, hostname: BIND, onListen: () => wizardBanner() };
 if (CERT_PATH && KEY_PATH) { serveOpts.cert = await Deno.readTextFile(CERT_PATH); serveOpts.key = await Deno.readTextFile(KEY_PATH); }
 Deno.serve(serveOpts, handler);
+
+// Built-in worker: with --worker (or MOREGPU_SELF_WORKER=1) the admin's OWN machine joins its own pool
+// as a compute slot — so a solo admin needs nothing else; submitting a job "just works" like a local GPU.
+const SELF_WORKER = Deno.args.includes('--worker') || Deno.env.get('MOREGPU_SELF_WORKER') === '1';
+if (SELF_WORKER) {
+  try {
+    const workerUrl = new URL('../worker/worker.ts', import.meta.url).href;
+    const wsUrl = `ws://127.0.0.1:${PORT}/ws`;
+    new Deno.Command(Deno.execPath(), {
+      args: ['run', '--unstable-webgpu', '--allow-net', '--allow-env', '--allow-sys', workerUrl,
+        '--server', wsUrl, '--token', cfg.joinToken, '--name', Deno.env.get('MOREGPU_NAME') ?? 'admin-slot'],
+      stdout: 'inherit', stderr: 'inherit',
+    }).spawn();
+    log('info', 'built-in worker started — this machine is a pool slot (admin-slot). Submit a job; it just runs.');
+  } catch (e) {
+    log('warn', `could not start the built-in worker (the server needs --allow-run for --worker): ${e}`);
+  }
+}
 
 function dashboard(): string {
   return DASHBOARD_HTML;

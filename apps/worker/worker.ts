@@ -128,6 +128,16 @@ async function unseal(key: Uint8Array, blob: { iv: string; ct: string }) { retur
 const f32ToB64 = (a: Float32Array) => b64e(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
 const b64ToF32 = (s: string) => new Float32Array(b64d(s).buffer);
 
+// ---------- Ed25519 result signing (per-worker authenticity + tamper-evidence) ----------
+// The worker signs every result with a fresh keypair; the coordinator verifies against the public key
+// it registered. A worker cannot forge or tamper another worker's result, and altered bytes are caught.
+const SIGN_KEYS = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as CryptoKeyPair;
+const PUBKEY_B64 = b64e(new Uint8Array(await crypto.subtle.exportKey('raw', SIGN_KEYS.publicKey)));
+async function signResult(shardId: string, blob: { iv: string; ct: string }): Promise<string> {
+  const sig = await crypto.subtle.sign({ name: 'Ed25519' }, SIGN_KEYS.privateKey, new TextEncoder().encode(`${shardId}|${blob.iv}|${blob.ct}`));
+  return b64e(new Uint8Array(sig));
+}
+
 // ---------- elementwise tensor kernels (index-sharded; memory-bound so run on CPU, duty-throttled) ----------
 const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale']);
 async function runElementwise(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Promise<Float32Array> {
@@ -180,7 +190,7 @@ function connect() {
   const ws = new WebSocket(SERVER);
   let hb: ReturnType<typeof setInterval> | undefined;
   ws.onopen = () => {
-    ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os } }));
+    ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os } }));
     // Heartbeat: report live load + the adaptive duty so the admin panel can show throttle in real time.
     hb = setInterval(() => {
       let load1 = 0; try { load1 = Deno.loadavg()[0]; } catch { /* */ }
@@ -203,7 +213,8 @@ function connect() {
         else throw new Error(`unknown kernel ${req.kernel}`);
         const sealedOut = await seal(tenantKey, new TextEncoder().encode(JSON.stringify({ out: f32ToB64(out) })));
         const ms = performance.now() - t0;
-        ws.send(JSON.stringify({ t: 'result', shardId: msg.shardId, jobId: msg.jobId, ok: true, sealedOut, ms, backend: backend.label }));
+        const sig = await signResult(msg.shardId, sealedOut);
+        ws.send(JSON.stringify({ t: 'result', shardId: msg.shardId, jobId: msg.jobId, ok: true, sealedOut, sig, ms, backend: backend.label }));
         console.log(`[worker] ${msg.shardId} done in ${ms.toFixed(1)}ms on ${backend.kind}`);
         const cool = effectiveDuty(); if (cool < 1) await sleep(ms * (1 / cool - 1)); // adaptive cool-down between shards
       } catch (e) { ws.send(JSON.stringify({ t: 'result', shardId: msg.shardId, jobId: msg.jobId, ok: false, error: String(e) })); }
