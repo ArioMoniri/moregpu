@@ -1,0 +1,22 @@
+{
+  "name": "@moregpu/runtime",
+  "version": "0.1.0",
+  "description": "Worker-side adaptive throttle governor: yields to the interactive user and respects thermal/battery/power caps.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@moregpu/protocol": "0.1.0"
+  },
+  "license": "Apache-2.0"
+}

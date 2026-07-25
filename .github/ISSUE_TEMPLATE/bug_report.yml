@@ -1,0 +1,102 @@
+name: Bug report
+description: Report a problem with the MoreGPU coordinator, worker, or installers.
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in the details below.
+
+        Do not paste real admin tokens, worker join tokens, or encryption keys.
+        Every pool generates its own; treat them as secrets and redact before posting.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and this has not already been reported.
+          required: true
+        - label: I am running the worker only on machines I own or am explicitly authorized to use.
+          required: true
+        - label: I have redacted any tokens, keys, hostnames, or other secrets from this report.
+          required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of MoreGPU is affected?
+      options:
+        - Coordinator / admin server (apps/coordinator/server.ts)
+        - Worker (apps/worker/worker.ts)
+        - Installer (scripts/install.sh / install.ps1)
+        - Dashboard (http://HOST:8787)
+        - Tested libraries (packages/*)
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran (with secrets redacted) and what you observed.
+      placeholder: |
+        1. Started the admin server with `deno run --allow-net ... server.ts`
+        2. Joined a worker with the install one-liner
+        3. Submitted `{"size":1024}` to /submit
+        4. Saw ...
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Role
+      description: How were you using MoreGPU when the bug occurred?
+      options:
+        - Admin running the coordinator
+        - Worker joining a pool
+        - Both
+    validations:
+      required: true
+  - type: dropdown
+    id: compute
+    attributes:
+      label: Compute path
+      description: Was the worker on GPU or CPU?
+      options:
+        - GPU (WebGPU / Metal / Vulkan / D3D12)
+        - CPU fallback
+        - Forced CPU (MOREGPU_FORCE_CPU=1 or --cpu)
+        - Not applicable
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system & version
+      placeholder: e.g. macOS 15.4, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: deno-version
+    attributes:
+      label: Deno version
+      description: Output of `deno --version` (the installer manages Deno for workers).
+      placeholder: e.g. deno 2.1.4
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Coordinator or worker output. Redact tokens, keys, and hostnames first.
+      render: shell
+    validations:
+      required: false

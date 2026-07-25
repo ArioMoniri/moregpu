@@ -1,0 +1,63 @@
+<svg viewBox="0 0 1280 600" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe Print','Bradley Hand',ui-rounded,'Comic Sans MS',cursive">
+  <rect width="1280" height="600" fill="#ffffff"/>
+
+  <!-- title, handwritten feel -->
+  <text x="80" y="88" font-size="34" fill="#1a1a1a" font-weight="700">MoreGPU</text>
+  <text x="80" y="120" font-size="17" fill="#555">idle machines → one pooled compute</text>
+
+  <!-- LEFT: a few small machines, generous whitespace. Two GPU, one CPU. -->
+  <g stroke="#1a1a1a" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- machine 1 (gpu) -->
+    <g transform="translate(120,210)">
+      <path d="M2 2 q60 -3 120 0 q3 42 0 84 q-60 3 -120 0 q-3 -42 0 -84 z" fill="#fff"/>
+      <path d="M20 100 q42 -4 84 0"/>
+      <text x="62" y="52" font-size="15" fill="#3a7bd5" text-anchor="middle" stroke="none">GPU</text>
+    </g>
+    <!-- machine 2 (gpu) -->
+    <g transform="translate(120,340)">
+      <path d="M2 3 q60 -4 120 0 q2 42 0 84 q-60 4 -120 0 q-2 -42 0 -84 z" fill="#fff"/>
+      <path d="M20 100 q42 -3 84 0"/>
+      <text x="62" y="52" font-size="15" fill="#3a7bd5" text-anchor="middle" stroke="none">GPU</text>
+    </g>
+    <!-- machine 3 (cpu) -->
+    <g transform="translate(120,470)">
+      <path d="M2 2 q60 -3 120 0 q3 30 0 60 q-60 3 -120 0 q-3 -30 0 -60 z" fill="#fff"/>
+      <text x="62" y="40" font-size="14" fill="#e07b20" text-anchor="middle" stroke="none">CPU</text>
+    </g>
+  </g>
+  <text x="118" y="196" font-size="13" fill="#c0392b" transform="rotate(-3 118 196)">nights &amp; idle hours</text>
+  <text x="128" y="556" font-size="13" fill="#e07b20">CPU helps too ↑</text>
+
+  <!-- thin wavy compute threads flowing right toward the mascot -->
+  <g stroke="#e0a020" stroke-width="2" fill="none" stroke-linecap="round">
+    <path d="M250 250 q120 -6 190 20 q60 24 120 34"/>
+    <path d="M250 385 q120 4 190 6 q60 0 120 -2"/>
+    <path d="M250 500 q130 -2 200 -34 q50 -22 110 -30"/>
+  </g>
+
+  <!-- CENTER: the mascot braiding the threads into one bundle (the core action) -->
+  <g transform="translate(560,330)">
+    <!-- body -->
+    <path d="M40 6 q40 0 46 40 q4 40 -20 54 q-26 14 -52 0 q-24 -14 -20 -54 q6 -40 46 -40 z" fill="#1a1a1a"/>
+    <circle cx="30" cy="40" r="5.5" fill="#fff"/><circle cx="54" cy="40" r="5.5" fill="#fff"/>
+    <!-- thin legs -->
+    <path d="M28 106 l-5 26 M44 108 l0 26 M60 106 l5 26" stroke="#1a1a1a" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+    <!-- arms pulling threads together -->
+    <path d="M8 56 q-26 -6 -40 -2" stroke="#1a1a1a" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+    <path d="M78 56 q26 4 44 8" stroke="#1a1a1a" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <!-- one thick bundle → to the pool -->
+  <path d="M690 388 q60 8 120 6 q40 -1 80 -6" stroke="#e0a020" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+
+  <!-- RIGHT: the pool box, one clear target -->
+  <g stroke="#1a1a1a" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M902 300 q120 -5 210 0 q5 55 0 110 q-120 5 -210 0 q-5 -55 0 -110 z" fill="#fff"/>
+  </g>
+  <text x="1007" y="345" font-size="18" fill="#1a1a1a" text-anchor="middle" font-weight="700">POOL</text>
+  <text x="1007" y="372" font-size="13" fill="#555" text-anchor="middle">shard · run · verify</text>
+  <!-- little play/compute glyph -->
+  <path d="M985 388 l24 14 l-24 14 z" fill="#2a9d55"/>
+  <text x="1035" y="406" font-size="12.5" fill="#2a9d55">results back</text>
+  <text x="905" y="452" font-size="13" fill="#3a7bd5">one admin pushes jobs here</text>
+</svg>

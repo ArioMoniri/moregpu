@@ -1,0 +1,67 @@
+name: Feature request
+description: Suggest a new capability or improvement for MoreGPU.
+title: "[feat]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please describe the problem you want solved, not just
+        the solution — that helps us find the best design.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and this has not already been requested.
+          required: true
+        - label: This request does not involve running workers on machines or platforms I am not authorized to use, or circumventing any platform's Terms of Service.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and where does MoreGPU fall short today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the capability you would like. Be as concrete as you can.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project would this touch?
+      options:
+        - Coordinator / admin server
+        - Worker
+        - New task type / kernel (WGSL + CPU reference)
+        - Scheduler / sharding
+        - Crypto / sealed jobs
+        - Installers / services
+        - Dashboard
+        - Docs / contributor experience
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: kernel
+    attributes:
+      label: New task type or kernel? (optional)
+      description: >
+        If you are proposing a new compute task, note that adding one means a WGSL
+        GPU kernel plus a matching CPU reference implementation. Sketch what the
+        kernel would compute and the shape of its inputs/outputs.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed and why you set them aside.
+    validations:
+      required: false

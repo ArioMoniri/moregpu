@@ -1,0 +1,19 @@
+{
+  "name": "@moregpu/crypto",
+  "version": "0.1.0",
+  "description": "Tenant-isolated sealing of work units and results so the coordinator relays only ciphertext it cannot read.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "license": "Apache-2.0"
+}

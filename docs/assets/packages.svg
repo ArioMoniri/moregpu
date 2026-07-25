@@ -1,0 +1,64 @@
+<svg viewBox="0 0 1280 470" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, sans-serif">
+  <defs>
+    <filter id="s2" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="2" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.09"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="470" rx="16" fill="#f8fafc"/>
+  <text x="56" y="54" font-size="22" font-weight="700" fill="#0f172a" letter-spacing="-0.3">Packages</text>
+  <text x="56" y="79" font-size="14" fill="#64748b">A tested TypeScript monorepo. Every box is a real package with unit tests.</text>
+
+  <!-- group: Execution -->
+  <text x="56" y="128" font-size="12" font-weight="700" fill="#4f46e5" letter-spacing="0.6">EXECUTION</text>
+  <g filter="url(#s2)"><rect x="56" y="140" width="260" height="96" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+  <text x="78" y="170" font-size="14" font-weight="650" fill="#0f172a" font-family="ui-monospace, monospace">@moregpu/gpu</text>
+  <text x="78" y="192" font-size="12" fill="#64748b">WGSL kernels + WebGPU executor;</text>
+  <text x="78" y="209" font-size="12" fill="#64748b">runs on Metal / Vulkan / D3D12</text>
+  <text x="78" y="228" font-size="11" fill="#10b981" font-family="ui-monospace, monospace">11 tests · real-GPU smoke</text>
+
+  <g filter="url(#s2)"><rect x="332" y="140" width="260" height="96" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+  <text x="354" y="170" font-size="14" font-weight="650" fill="#0f172a" font-family="ui-monospace, monospace">@moregpu/runtime</text>
+  <text x="354" y="192" font-size="12" fill="#64748b">true-idle throttle governor +</text>
+  <text x="354" y="209" font-size="12" fill="#64748b">CPU/WASM fallback executor</text>
+  <text x="354" y="228" font-size="11" fill="#10b981" font-family="ui-monospace, monospace">25 tests</text>
+
+  <!-- group: Control plane -->
+  <text x="56" y="284" font-size="12" font-weight="700" fill="#0ea5e9" letter-spacing="0.6">CONTROL PLANE</text>
+  <g font-family="ui-monospace, monospace">
+    <g filter="url(#s2)"><rect x="56" y="296" width="200" height="86" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+    <text x="76" y="324" font-size="13.5" font-weight="650" fill="#0f172a">@moregpu/coordinator</text>
+    <text x="76" y="346" font-size="11.5" fill="#64748b" font-family="ui-sans-serif, sans-serif">registry · job lifecycle</text>
+    <text x="76" y="368" font-size="11" fill="#10b981">8 tests</text>
+
+    <g filter="url(#s2)"><rect x="272" y="296" width="200" height="86" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+    <text x="292" y="324" font-size="13.5" font-weight="650" fill="#0f172a">@moregpu/scheduler</text>
+    <text x="292" y="346" font-size="11.5" fill="#64748b" font-family="ui-sans-serif, sans-serif">shard · assign · pool</text>
+    <text x="292" y="368" font-size="11" fill="#10b981">14 tests</text>
+
+    <g filter="url(#s2)"><rect x="488" y="296" width="200" height="86" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+    <text x="508" y="324" font-size="13.5" font-weight="650" fill="#0f172a">@moregpu/transport</text>
+    <text x="508" y="346" font-size="11.5" fill="#64748b" font-family="ui-sans-serif, sans-serif">framed channel · WS</text>
+    <text x="508" y="368" font-size="11" fill="#10b981">7 tests</text>
+
+    <g filter="url(#s2)"><rect x="704" y="296" width="200" height="86" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+    <text x="724" y="324" font-size="13.5" font-weight="650" fill="#0f172a">@moregpu/protocol</text>
+    <text x="724" y="346" font-size="11.5" fill="#64748b" font-family="ui-sans-serif, sans-serif">wire envelope · types</text>
+    <text x="724" y="368" font-size="11" fill="#10b981">10 tests</text>
+  </g>
+
+  <!-- group: Integrity & privacy (right column) -->
+  <text x="944" y="128" font-size="12" font-weight="700" fill="#334155" letter-spacing="0.6">INTEGRITY &amp; PRIVACY</text>
+  <g filter="url(#s2)"><rect x="944" y="140" width="280" height="96" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+  <text x="966" y="170" font-size="14" font-weight="650" fill="#0f172a" font-family="ui-monospace, monospace">@moregpu/integrity</text>
+  <text x="966" y="192" font-size="12" fill="#64748b">reproducibility rings, exact</text>
+  <text x="966" y="209" font-size="12" fill="#64748b">quorum, canary + reputation</text>
+  <text x="966" y="228" font-size="11" fill="#10b981" font-family="ui-monospace, monospace">12 tests</text>
+
+  <g filter="url(#s2)"><rect x="944" y="296" width="280" height="86" rx="11" fill="#fff" stroke="#e2e8f0" stroke-width="1.4"/></g>
+  <text x="966" y="324" font-size="14" font-weight="650" fill="#0f172a" font-family="ui-monospace, monospace">@moregpu/crypto</text>
+  <text x="966" y="346" font-size="12" fill="#64748b">per-tenant AES-GCM sealing</text>
+  <text x="966" y="368" font-size="11" fill="#10b981" font-family="ui-monospace, monospace">8 tests</text>
+
+  <rect x="56" y="418" width="1168" height="34" rx="9" fill="#eef2ff"/>
+  <text x="640" y="440" font-size="13" font-weight="600" fill="#4338ca" text-anchor="middle">95 tests passing · tsc --build clean · one physical GPU proven, built to pool many</text>
+</svg>

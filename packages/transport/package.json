@@ -1,0 +1,22 @@
+{
+  "name": "@moregpu/transport",
+  "version": "0.1.0",
+  "description": "Framed envelope transport: a Channel abstraction with in-memory (test) and WebSocket (prod) adapters plus a typed dispatcher.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@moregpu/protocol": "0.1.0"
+  },
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@moregpu/coordinator",
+  "version": "0.1.0",
+  "description": "Control-plane orchestrator: node registry, job intake, shard assignment, and result pooling.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@moregpu/protocol": "0.1.0",
+    "@moregpu/scheduler": "0.1.0"
+  },
+  "license": "Apache-2.0"
+}

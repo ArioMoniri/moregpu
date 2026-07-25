@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+coverage/
+.vitest/
+
+# Env & secrets — NEVER commit
+.env
+.env.*
+*.pem
+*.key
+secrets/
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+watchdog-*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+*.swp
+.vscode/*
+!.vscode/extensions.json
+
+# Local agent/tool state
+.claude-flow/
+.swarm/
+.hive-mind/
+
+# Worker runtime artifacts
+*.wasm.map
+worker-cache/
+
+# Local server pool config (contains this pool's secret tokens/keys — never commit)
+.moregpu-server.json
+.moregpu-*.json
+
+# Local planning / working notes — kept on disk, not published to the remote
+GOAL.md
+loops.md
+docs/ROADMAP.md
+docs/DEFINITION_OF_DONE.md
+docs/adr/

@@ -1,0 +1,41 @@
+{
+  "name": "moregpu",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Harvest idle institutional GPU/CPU through headless-browser WebGPU/WASM into a central, privacy-isolated, dynamically-throttled compute pool.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArioMoniri/moregpu.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "typecheck": "tsc --build --dry 2>/dev/null; tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "lint": "eslint . --ext .ts,.mjs",
+    "watchdog": "node scripts/watchdog.mjs",
+    "demo:gpu": "npm run build && deno run --unstable-webgpu --allow-read examples/gpu-smoke.ts",
+    "demo:pool": "npm run build && deno run --unstable-webgpu --allow-read examples/pool-demo.ts",
+    "clean": "rm -rf packages/*/dist apps/*/dist tsconfig.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vitest/coverage-v8": "^2.1.8",
+    "@webgpu/types": "^0.1.71",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

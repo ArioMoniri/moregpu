@@ -1,0 +1,19 @@
+{
+  "name": "@moregpu/gpu",
+  "version": "0.1.0",
+  "description": "Real WGSL compute kernels and a WebGPU executor that runs on the physical GPU (Metal/Vulkan/D3D12), with CPU reference implementations for verification and fallback.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "license": "Apache-2.0"
+}
