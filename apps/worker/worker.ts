@@ -70,27 +70,41 @@ function effectiveDuty(): number {
   return lastDuty;
 }
 
-// ---------- WGSL kernels (identical to @moregpu/gpu) ----------
+// ---------- WGSL kernels ----------
+// Workgroup-tiled dense fp32 GEMM: each 16×16 workgroup cooperatively stages a 16×16 tile of A and B
+// into shared memory, so each A/B element is read from global memory once per tile instead of once per
+// output — the standard tiling optimization. Boundary tiles are zero-padded via select(); no early
+// return (all invocations must reach every workgroupBarrier). Still fp32, no tensor cores.
+const TILE = 16;
 const WGSL = {
-  vector_add: `@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> o: array<f32>;
-@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let i = g.x; if (i >= arrayLength(&a)) { return; } o[i] = a[i] + b[i]; }`,
   matmul: `@group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 @group(0) @binding(3) var<uniform> d: vec4<u32>;
-@compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let M=d.x; let N=d.y; let K=d.z; let r=g.y; let c=g.x;
-  if (r>=M || c>=N) { return; }
-  var acc=0.0; for (var k=0u;k<K;k=k+1u){ acc=acc+A[r*K+k]*B[k*N+c]; } C[r*N+c]=acc; }`,
+var<workgroup> As: array<f32, 256>;
+var<workgroup> Bs: array<f32, 256>;
+@compute @workgroup_size(16,16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+  let M=d.x; let N=d.y; let K=d.z;
+  let row=g.y; let col=g.x; let lr=l.y; let lc=l.x;
+  var acc=0.0;
+  let tiles=(K+15u)/16u;
+  for (var t=0u; t<tiles; t=t+1u) {
+    let aCol=t*16u+lc; let bRow=t*16u+lr;
+    As[lr*16u+lc]=select(0.0, A[row*K+aCol], row<M && aCol<K);
+    Bs[lr*16u+lc]=select(0.0, B[bRow*N+col], bRow<K && col<N);
+    workgroupBarrier();
+    for (var k=0u;k<16u;k=k+1u){ acc=acc+As[lr*16u+k]*Bs[k*16u+lc]; }
+    workgroupBarrier();
+  }
+  if (row<M && col<N){ C[row*N+col]=acc; }
+}`,
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 // ---------- backends ----------
-interface Backend { kind: 'gpu' | 'cpu'; label: string; matmul(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Promise<Float32Array>; vectorAdd(a: Float32Array, b: Float32Array): Promise<Float32Array>; }
+interface Backend { kind: 'gpu' | 'cpu'; label: string; matmul(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Promise<Float32Array>; }
 
 let gpuLost = false; // set if the GPU device is lost (Metal reset, driver crash) → we fall back to CPU
 async function makeGpuBackend(): Promise<Backend | null> {
@@ -130,7 +144,6 @@ async function makeGpuBackend(): Promise<Backend | null> {
   }
   const info = adapter.info ?? {};
   return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}`,
-    vectorAdd: (a, b) => run(WGSL.vector_add, [a, b], null, a.length, [Math.ceil(a.length / 64), 1, 1]),
     matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]) };
 }
 
@@ -138,7 +151,6 @@ async function makeGpuBackend(): Promise<Backend | null> {
  *  so the machine stays responsive for its user and average power draw stays low. */
 function makeCpuBackend(): Backend {
   return { kind: 'cpu', label: `cpu:${Deno.build.arch}`,
-    async vectorAdd(a, b) { const o = new Float32Array(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] + b[i]; return o; },
     async matmul(a, b, M, N, K) {
       const o = new Float32Array(M * N);
       const chunk = Math.max(1, Math.min(M, Math.ceil(32768 / (K + 1)))); // ~constant work per chunk
@@ -173,7 +185,8 @@ async function signResult(shardId: string, blob: { iv: string; ct: string }): Pr
 }
 
 // ---------- elementwise tensor kernels (index-sharded; memory-bound so run on CPU, duty-throttled) ----------
-const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale']);
+const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu']);
+const gelu = (x: number) => 0.5 * x * (1 + Math.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 async function runElementwise(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Promise<Float32Array> {
   const n = a.length, o = new Float32Array(n);
   const chunk = Math.max(4096, Math.ceil(n / 32));
@@ -186,6 +199,7 @@ async function runElementwise(kernel: string, a: Float32Array, b: Float32Array |
         case 'saxpy': o[i] = scalar * a[i] + (b as Float32Array)[i]; break;
         case 'relu': o[i] = a[i] > 0 ? a[i] : 0; break;
         case 'scale': o[i] = a[i] * scalar; break;
+        case 'gelu': o[i] = gelu(a[i]); break;
       }
     }
     const d = effectiveDuty(); if (d < 1) await sleep((performance.now() - t) * (1 / d - 1));

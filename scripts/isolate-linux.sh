@@ -42,10 +42,12 @@ gpu_sel="${MOREGPU_CUDA_VISIBLE_DEVICES:-${MOREGPU_GPU_UUID:-}}"
 
 # ---- helpers -----------------------------------------------------------------
 pct() { case "$1" in *%) printf '%s' "$1" ;; *) printf '%s%%' "$1" ;; esac; }  # 40 -> 40%
-derive_high() {  # ~75% of a size like 2G / 2048M / 4096; leaves the unit intact
+derive_high() {  # ~75% of a size; always emit an INTEGER (awk %g would turn 6G into "4.5e+09", which systemd rejects)
   case "$1" in
-    *[0-9][KkMmGgTt]) local n="${1%[KkMmGgTt]}" u="${1: -1}"; awk -v n="$n" -v u="$u" 'BEGIN{printf "%g%s", n*0.75, u}' ;;
-    *[0-9])           awk -v n="$1" 'BEGIN{printf "%g", n*0.75}' ;;
+    *[Gg]) local n="${1%[GgIiBb]}"; awk -v n="$n" 'BEGIN{printf "%.0fM", n*768}' ;;   # 0.75 * 1024 M per G
+    *[Mm]) local n="${1%[MmIiBb]}"; awk -v n="$n" 'BEGIN{printf "%.0fK", n*768}' ;;   # 0.75 * 1024 K per M
+    *[Kk]) local n="${1%[KkIiBb]}"; awk -v n="$n" 'BEGIN{printf "%.0f",  n*768}' ;;
+    *[0-9]) awk -v n="$1" 'BEGIN{printf "%.0f", n*0.75}' ;;                            # plain bytes
     *) printf '' ;;  # non-numeric (e.g. a percentage) -> skip auto-derive
   esac
 }
@@ -103,10 +105,10 @@ probe() { systemd-run "${SCOPE[@]}" --quiet --collect "$@" -- true >/dev/null 2>
 
 if probe "${props[@]}"; then
   log "isolating: [${props[*]}] nice=${NICE} ionice=${IONICE_CLASS} uid=${uid}"
-  exec systemd-run "${SCOPE[@]}" --quiet --collect --unit="$SCOPE_NAME" "${props[@]}" -- "${prio[@]}" "$@"
+  exec systemd-run "${SCOPE[@]}" --quiet --collect --unit="${SCOPE_NAME}-$$" "${props[@]}" -- "${prio[@]}" "$@"
 elif [ "${#memprops[@]}" -gt 0 ] && probe "${memprops[@]}"; then
   log "partial isolation (memory only): [${memprops[*]}] nice=${NICE} ionice=${IONICE_CLASS}"
-  exec systemd-run "${SCOPE[@]}" --quiet --collect --unit="$SCOPE_NAME" "${memprops[@]}" -- "${prio[@]}" "$@"
+  exec systemd-run "${SCOPE[@]}" --quiet --collect --unit="${SCOPE_NAME}-$$" "${memprops[@]}" -- "${prio[@]}" "$@"
 else
   exec_prio "$@"
 fi

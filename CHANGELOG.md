@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-25
+
 ### Added
 
+- **Inference primitives & helpers** — a workgroup-tiled WGSL GEMM (shared-memory
+  tiling) replaces the naive kernel on the GPU; a new `gelu` activation; and SDK
+  composition helpers `attention()`, `linear()`, `mlp()`, and reductions
+  (`sum/mean/dot/norm`) in both the Python and TypeScript clients, each verified
+  against a CPU reference. New runnable demos: `examples/conv2d_im2col.py` and
+  expanded `examples/verify_workloads.py` (11 checks).
 - **Contribution scheduling** — a worker sets `MOREGPU_SCHEDULE` (`always` ·
   `idle-only` · `HH:MM-HH:MM` active window, may wrap midnight) to control *when*
   its machine is lent. Outside the window it takes no new work; in-flight shards
@@ -37,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SECURITY.md`, plus a hardware-grounded confidential-computing/TEE roadmap.
 - Client SDKs distributed as GitHub Release artifacts (wheel + npm tarball);
   publishing to PyPI/npm/Homebrew documented in `CONTRIBUTING.md`.
+
+### Security
+
+Hardening from an expert review council (34 confirmed findings):
+- Reject `heartbeat`/`result` frames before a socket authenticates, and trust only
+  the socket's own registered id — closes unauthenticated worker-state spoofing.
+- Reject a `register` for an already-live id (worker-identity hijack); ban an
+  admin-removed worker by its Ed25519 key; close sockets that never register.
+- Sanitize worker id/backend/label (also blocks `/metrics` label injection).
+- Worker requests the adapter's real buffer limits and falls back to CPU on GPU
+  device loss. Evict old job records (and their output blobs) past a cap.
 
 ## [0.1.0] - 2026-07-25
 

@@ -9,7 +9,7 @@
  *   const gpu = await pool.gpu();                         // pool state (virtual GPU)
  */
 
-export type Kernel = 'matmul' | 'vector_add' | 'vector_mul' | 'saxpy' | 'relu' | 'scale' | 'softmax' | 'layernorm';
+export type Kernel = 'matmul' | 'vector_add' | 'vector_mul' | 'saxpy' | 'relu' | 'scale' | 'gelu' | 'softmax' | 'layernorm';
 
 export interface JobSpec { kernel: Kernel; size: number; }
 
@@ -172,6 +172,8 @@ export class MoreGPUClient {
     const res = await this.f(`${this.base}/submit`, { method: 'POST', headers: this.authHeaders(), body: JSON.stringify(body) });
     const job = (await res.json()) as Job & { output?: string };
     if (!res.ok && res.status !== 202) throw new Error(`moregpu: run ${kernel} → ${res.status}: ${job.error ?? ''}`);
+    // Don't silently return an empty output for a queued/running/failed job — the caller would feed [] downstream.
+    if (job.status !== 'done') throw new Error(`moregpu: run ${kernel} not done (status=${job.status}${job.error ? ', ' + job.error : job.note ? ', ' + job.note : ''})`);
     return { job, output: job.output ? b64ToF32(job.output) : new Float32Array(0) };
   }
 
@@ -180,6 +182,39 @@ export class MoreGPUClient {
     const { output } = await this.run('matmul', { a: A, b: B, M, N, K });
     return output;
   }
+
+  // ---- composition helpers for inference (compose the verified primitives above) ----
+
+  /** Dense layer y = X(M×K)·W(K×N) [+ b(N)]; bias is row-broadcast client-side. */
+  async linear(X: ArrayLike<number>, W: ArrayLike<number>, b: ArrayLike<number> | null, M: number, K: number, N: number): Promise<Float32Array> {
+    const y = await this.matmul(X, W, M, N, K);
+    if (b) { const bb = Float32Array.from(b); for (let i = 0; i < M; i++) for (let j = 0; j < N; j++) { const p = i * N + j; y[p] = (y[p] ?? 0) + (bb[j] ?? 0); } }
+    return y;
+  }
+
+  /** Chain dense layers with an activation between them. layers = [{ W, b?, out }]. */
+  async mlp(X: ArrayLike<number>, layers: { W: ArrayLike<number>; b?: ArrayLike<number> | null; out: number }[], M: number, K: number, act: Kernel = 'relu'): Promise<Float32Array> {
+    let cur: ArrayLike<number> = X, k = K;
+    for (const L of layers) { const lin = await this.linear(cur, L.W, L.b ?? null, M, k, L.out); cur = (await this.run(act, { a: lin })).output; k = L.out; }
+    return Float32Array.from(cur);
+  }
+
+  /** Single-head scaled dot-product attention softmax(Q·Kᵀ/√d)·V. Q,K,V row-major seq×d → seq×d. */
+  async attention(Q: ArrayLike<number>, K: ArrayLike<number>, V: ArrayLike<number>, seq: number, d: number, scale?: number): Promise<Float32Array> {
+    const s = scale ?? 1 / Math.sqrt(d);
+    const Ka = Float32Array.from(K), Kt = new Float32Array(seq * d);
+    for (let r = 0; r < seq; r++) for (let c = 0; c < d; c++) Kt[c * seq + r] = Ka[r * d + c] ?? 0;
+    const scores = await this.matmul(Q, Kt, seq, seq, d);
+    const scaled = (await this.run('scale', { a: scores, scalar: s })).output;
+    const attn = (await this.run('softmax', { a: scaled, M: seq, N: seq })).output;
+    return this.matmul(attn, V, seq, d, seq);
+  }
+
+  /** Reductions via the GEMM trick (convenience; run single-worker/single-thread, not for throughput). */
+  async dot(a: ArrayLike<number>, b: ArrayLike<number>): Promise<number> { return (await this.matmul(a, b, 1, 1, a.length))[0] ?? NaN; }
+  async sum(a: ArrayLike<number>): Promise<number> { return (await this.matmul(a, new Float32Array(a.length).fill(1), 1, 1, a.length))[0] ?? NaN; }
+  async mean(a: ArrayLike<number>): Promise<number> { return (await this.sum(a)) / a.length; }
+  async norm(a: ArrayLike<number>): Promise<number> { return Math.sqrt(await this.dot(a, a)); }
 
   /** Fetch one job's status/result by id. */
   job(id: string): Promise<Job> {

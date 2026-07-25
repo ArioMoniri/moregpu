@@ -36,7 +36,7 @@ check "$(curl -s "$B/workers" -H "$A" | jq 'len(d)>=1')" "True" "GET /workers (>
 check "$(curl -s "$B/metrics" -H "$A" | grep -c '^moregpu_fleet ')" "1" "GET /metrics has moregpu_fleet"
 
 echo "== every kernel (benchmark mode; expect verified + signed) =="
-for k in matmul vector_add vector_mul saxpy relu scale softmax layernorm; do
+for k in matmul vector_add vector_mul saxpy relu scale gelu softmax layernorm; do
   sz=$([ "$k" = matmul ] && echo 256 || echo 100000)
   r=$(curl -s -X POST "$B/submit" -H "$A" -d "{\"kernel\":\"$k\",\"size\":$sz}")
   v=$(echo "$r" | jq 'str(d.get("verified")).lower()'); s=$(echo "$r" | jq 'str(d.get("signed")).lower()')

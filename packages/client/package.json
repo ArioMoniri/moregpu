@@ -1,6 +1,6 @@
 {
   "name": "@moregpu/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Client SDK for the MoreGPU pool — submit tensor/compute jobs, batch them, and read fleet contribution. Works in Deno, Node, and browsers.",
   "type": "module",
   "main": "./dist/index.js",

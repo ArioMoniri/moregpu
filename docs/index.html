@@ -7,7 +7,7 @@
 <meta name="description" content="Turn the GPUs (or CPUs) you already own into one pooled, AES-256-GCM-sealed, Ed25519-verified, adaptively-throttled compute pool. One-liner install, any OS.">
 <meta property="og:title" content="MoreGPU — native GPU compute pool">
 <meta property="og:description" content="Pool the GPUs/CPUs you already own into one virtual GPU. Sealed, signed, adaptively throttled. One-liner install, any OS.">
-<meta property="og:image" content="assets/admin-panel.png">
+<meta property="og:image" content="assets/admin-panel-mac.png">
 <style>
 :root{--bg:#0b0f17;--card:#121826;--line:#1f2937;--ink:#e6edf3;--mut:#8b98ad;--acc:#6366f1;--grn:#34d399;--yel:#fbbf24;--red:#f87171}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
@@ -137,8 +137,8 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 <p>An honest, verified <b>fp32</b> linear-algebra service — <span class="y">✅ native</span> · <span class="p">🧩 compose from primitives</span> · <span class="pa">🟡 partial</span> · <span class="n">❌ not supported</span>.</p>
 <table>
 <tr><th>Workload</th><th></th><th>How / why</th></tr>
-<tr><td>Dense fp32 matmul / GEMM</td><td class="y">✅</td><td>Native WGSL GEMM <b>on the GPU</b> (naive, non-tiled), verified. fp32 only, <b>no tensor cores</b> → correct but slower than cuBLAS.</td></tr>
-<tr><td>Elementwise + activations</td><td class="y">✅</td><td>add / mul / scale / saxpy / relu — memory-bound, so they run on the worker <b>CPU</b> even on a GPU machine.</td></tr>
+<tr><td>Dense fp32 matmul / GEMM</td><td class="y">✅</td><td>Workgroup-tiled WGSL GEMM <b>on the GPU</b> (shared-memory tiling), verified. fp32 only, <b>no tensor cores</b> → correct but slower than cuBLAS.</td></tr>
+<tr><td>Elementwise + activations</td><td class="y">✅</td><td>add / mul / scale / saxpy / relu / <b>gelu</b> — memory-bound, so they run on the worker <b>CPU</b> even on a GPU machine.</td></tr>
 <tr><td>Softmax / LayerNorm</td><td class="y">✅</td><td>Dedicated row-wise kernels (on the worker <b>CPU</b>), match a CPU reference to ~1e-8.</td></tr>
 <tr><td>Scaled dot-product attention (1 head)</td><td class="p">🧩</td><td><code>matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)</code> — verified. Not flash-attention; no KV cache.</td></tr>
 <tr><td>Transformer block / small MLP inference</td><td class="p">🧩</td><td>Compose LN → matmuls → attention → FFN from the SDK. Weights per-request, no residency.</td></tr>
@@ -152,7 +152,7 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 
 <h2>Admin dashboard</h2>
 <figure>
-  <div class="shot"><img src="assets/admin-panel.png" alt="MoreGPU admin dashboard — virtual GPU slot, live per-worker contribution and trend sparklines, per-kernel jobs, and the error/debug log"></div>
+  <div class="shot"><img src="assets/admin-panel-mac.png" alt="MoreGPU admin dashboard — virtual GPU slot, live per-worker contribution and trend sparklines, per-kernel jobs, and the error/debug log"></div>
   <figcaption>The live admin dashboard — viewable from any browser even when the server host is headless/CLI-only: the virtual-GPU slot, per-worker contribution + trend sparklines, per-kernel jobs, and the error/debug log. The <code>admin-slot</code> row is the built-in worker.</figcaption>
 </figure>
 
@@ -161,7 +161,7 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 A Prometheus <code>/metrics</code> endpoint exposes fleet size, queue depth, throughput and <b>per-worker contribution</b>. A turnkey Prometheus + Grafana bundle with a pre-provisioned dashboard ships in <a href="https://github.com/ArioMoniri/moregpu/tree/main/config/observability"><code>config/observability</code></a> — <code>docker compose up</code>, then Grafana on <code>:3000</code>.
 </div>
 <figure>
-  <div class="shot"><img src="assets/grafana.png" alt="MoreGPU Grafana dashboard — fleet size, queue depth, total units pooled, jobs done/failed, average user utilization and pool duty, and per-worker share and units"></div>
+  <div class="shot"><img src="assets/grafana-mac.png" alt="MoreGPU Grafana dashboard — fleet size, queue depth, total units pooled, jobs done/failed, average user utilization and pool duty, and per-worker share and units"></div>
   <figcaption>The pre-provisioned Grafana dashboard, live: fleet size, queue depth, units pooled, jobs done/failed, avg user-util &amp; pool-duty, and per-worker share + units.</figcaption>
 </figure>
 

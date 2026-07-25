@@ -56,6 +56,10 @@ def ref_layernorm_row(x, eps=1e-5):
     return [(v - mu) * inv for v in x]
 
 
+def ref_gelu(x):
+    return [0.5 * v * (1 + math.tanh(0.7978845608028654 * (v + 0.044715 * v ** 3))) for v in x]
+
+
 def close(got, want, tol=TOL):
     if len(got) != len(want):
         return False, f"length {len(got)} != {len(want)}"
@@ -143,6 +147,27 @@ def main() -> int:
     r_attn = ref_softmax_row(r_scaled[0:2]) + ref_softmax_row(r_scaled[2:4])
     r_out = ref_matmul(r_attn, V, 2, 2, 2)
     check("Attention  softmax(Q·Kᵀ/√d)·V (1 head)", out, r_out)
+
+    # 8) GELU activation (new kernel used by MLPs/transformers).
+    check("GELU activation", pool.run("gelu", feats)["output_decoded"], ref_gelu(feats))
+
+    # 9) attention() SDK helper matches the manual composition above.
+    check("attention() SDK helper == manual",
+          pool.attention(Q, Kmat, V, seq=2, d=2), r_out)
+
+    # 10) linear() SDK helper (dense layer with bias).
+    bias = [0.05, -0.1]
+    r_lin = ref_matmul(X, W, 4, 2, 3)
+    for i in range(4):
+        for j in range(2):
+            r_lin[i * 2 + j] += bias[j]
+    check("linear() SDK helper x·W + b", pool.linear(X, W, bias, M=4, K=3, N=2), r_lin)
+
+    # 11) reductions via the GEMM trick (sum/mean/dot/norm).
+    vec = [1.0, 2.0, 3.0, 4.0]
+    check("reductions sum/mean/dot/norm",
+          [pool.sum(vec), pool.mean(vec), pool.dot(vec, vec), pool.norm(vec)],
+          [10.0, 2.5, 30.0, math.sqrt(30.0)])
 
     print(f"\n==================== {passed} passed, {failed} failed ====================")
     return 0 if failed == 0 else 1

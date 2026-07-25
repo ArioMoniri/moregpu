@@ -53,9 +53,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 };
 
 /**
- * Tiled dense matmul: C[MxN] = A[MxK] * B[KxN]. Dispatched over an (N, M) grid of 16x16 tiles.
- * Dimensions arrive as a uniform vec4<u32> (M, N, K, _). This is the showcase kernel that actually
- * exercises the GPU's throughput.
+ * Workgroup-tiled dense matmul: C[MxN] = A[MxK] * B[KxN], over an (N, M) grid of 16x16 tiles. Each
+ * workgroup cooperatively stages a 16x16 tile of A and B into shared memory (var<workgroup>), so each
+ * A/B element is read from global memory once per tile instead of once per output — the standard tiling
+ * optimization. Boundary tiles are zero-padded via select() (no early return, so every invocation
+ * reaches each workgroupBarrier). Dimensions arrive as a uniform vec4<u32> (M, N, K, _). fp32, no tensor cores.
  */
 export const MATMUL: KernelSpec = {
   name: 'matmul',
@@ -67,16 +69,23 @@ export const MATMUL: KernelSpec = {
 @group(0) @binding(1) var<storage, read> B: array<f32>;
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 @group(0) @binding(3) var<uniform> dims: vec4<u32>;
+var<workgroup> As: array<f32, 256>;
+var<workgroup> Bs: array<f32, 256>;
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let M = dims.x; let N = dims.y; let K = dims.z;
-  let row = gid.y; let col = gid.x;
-  if (row >= M || col >= N) { return; }
+  let row = gid.y; let col = gid.x; let lr = lid.y; let lc = lid.x;
   var acc = 0.0;
-  for (var k = 0u; k < K; k = k + 1u) {
-    acc = acc + A[row * K + k] * B[k * N + col];
+  let tiles = (K + 15u) / 16u;
+  for (var t = 0u; t < tiles; t = t + 1u) {
+    let aCol = t * 16u + lc; let bRow = t * 16u + lr;
+    As[lr * 16u + lc] = select(0.0, A[row * K + aCol], row < M && aCol < K);
+    Bs[lr * 16u + lc] = select(0.0, B[bRow * N + col], bRow < K && col < N);
+    workgroupBarrier();
+    for (var k = 0u; k < 16u; k = k + 1u) { acc = acc + As[lr * 16u + k] * Bs[k * 16u + lc]; }
+    workgroupBarrier();
   }
-  C[row * N + col] = acc;
+  if (row < M && col < N) { C[row * N + col] = acc; }
 }`,
 };
 

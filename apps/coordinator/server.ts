@@ -225,7 +225,8 @@ setInterval(() => {
 }, 3000);
 
 // ---------- kernels ----------
-const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale']);
+const ELEMENTWISE = new Set(['vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu']);
+const geluF = (x: number) => 0.5 * x * (1 + Math.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 const ROWWISE = new Set(['softmax', 'layernorm']); // per-row reductions; sharded by whole rows
 function cpuRowwise(kernel: string, a: Float32Array, cols: number): Float32Array {
   const rows = Math.floor(a.length / cols), o = new Float32Array(a.length);
@@ -253,6 +254,7 @@ function cpuKernel(kernel: string, a: Float32Array, b: Float32Array | null, scal
       case 'saxpy': o[i] = scalar * a[i] + (b as Float32Array)[i]; break;
       case 'relu': o[i] = a[i] > 0 ? a[i] : 0; break;
       case 'scale': o[i] = a[i] * scalar; break;
+      case 'gelu': o[i] = geluF(a[i]); break;
     }
   }
   return o;
@@ -346,7 +348,7 @@ async function runJob(rec: JobRec) {
     rec.gflops = (2 * M * N * K) / (wall / 1000) / 1e9; rec.ms = wall; rec.shards = sh;
     if (data) { rec.output = f32ToB64(Cm); rec.outLen = Cm.length; }
   } else if (ELEMENTWISE.has(rec.kernel)) {
-    const binary = rec.kernel !== 'relu' && rec.kernel !== 'scale';
+    const binary = rec.kernel !== 'relu' && rec.kernel !== 'scale' && rec.kernel !== 'gelu';
     const a = data ? input!.a! : new Float32Array(rec.size).map(() => Math.random() * 2 - 1);
     const b = data ? (input!.b ?? new Float32Array(a.length)) : new Float32Array(a.length).map(() => Math.random());
     const scalar = data ? (input!.scalar ?? 1) : 2;
@@ -419,7 +421,7 @@ function virtualGpu() {
 // ---------- HTTP + WS ----------
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o, null, 2), { status, headers: { 'content-type': 'application/json' } });
 const authOk = (req: Request) => constEq((req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '') || (req.headers.get('x-admin-token') ?? ''), cfg.adminToken);
-const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'softmax', 'layernorm'];
+const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu', 'softmax', 'layernorm'];
 
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);

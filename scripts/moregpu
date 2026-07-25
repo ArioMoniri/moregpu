@@ -70,8 +70,10 @@ case "$cmd" in
   isolate) # Linux: join as a worker pinned to bounded, isolated hardware (cgroups v2 / systemd scope)
     need_deno
     command -v bash >/dev/null 2>&1 || { echo "[moregpu] isolate needs bash (Linux, systemd + cgroups v2)"; exit 1; }
-    exec bash <(curl -fsSL "$RAW/scripts/isolate-linux.sh") \
-      deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
+    f="$(mktemp)"; trap 'rm -f "$f"' EXIT
+    curl -fsSL "$RAW/scripts/isolate-linux.sh" -o "$f" || { echo "[moregpu] failed to fetch isolate-linux.sh" >&2; exit 1; }
+    [ -s "$f" ] || { echo "[moregpu] fetched isolate-linux.sh is empty" >&2; exit 1; }
+    exec bash "$f" deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
 
   # ---- admin fleet control (needs MOREGPU_SERVER + MOREGPU_ADMIN_TOKEN) ----
   workers) # list connected workers

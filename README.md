@@ -106,14 +106,14 @@ pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 
 ```
 **Async (GPU-style submit + poll):** add `?async=1` to get a job handle immediately, then poll `GET /jobs/<id>`.
 
-Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale, softmax, layernorm` (extensible). Enough to compose a real transformer block — see [`examples/attention_demo.py`](examples/attention_demo.py) and [AI usage](docs/AI_USAGE.md). The whole fleet is presented as one **virtual GPU slot** — `GET /device` returns its backends, kernels, limits, queue and capabilities.
+Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale, gelu, softmax, layernorm` (extensible). Enough to compose a real transformer block — SDK helpers `pool.attention()`, `pool.linear()`, `pool.mlp()` are verified in [`examples/verify_workloads.py`](examples/verify_workloads.py); see also [AI usage](docs/AI_USAGE.md). The whole fleet is presented as one **virtual GPU slot** — `GET /device` returns its backends, kernels, limits, queue and capabilities.
 
 </details>
 
 The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live contribution + trend sparklines, the queue, and the error/debug log. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).
 
 <p align="center">
-  <img src="docs/assets/admin-panel.png" alt="MoreGPU admin dashboard — virtual GPU, live per-worker contribution and trend sparklines, per-kernel jobs, and the error/debug log" width="900">
+  <img src="docs/assets/admin-panel-mac.png" alt="MoreGPU admin dashboard — virtual GPU, live per-worker contribution and trend sparklines, per-kernel jobs, and the error/debug log" width="900">
   <br><sub>The live admin dashboard: virtual-GPU slot, per-worker contribution + trends, per-kernel jobs, error/debug log. The <code>admin-slot</code> row is this machine's built-in worker.</sub>
 </p>
 
@@ -173,8 +173,9 @@ irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps
 > 🔒 **Dedicated hardware isolation (Linux).** Pin a worker to bounded, isolated resources (a cgroups‑v2 scope: CPU quota, cpuset, memory cap, idle I/O) so the pool can never disturb you, via [`scripts/isolate-linux.sh`](scripts/isolate-linux.sh) or `moregpu isolate`:
 > ```sh
 > MOREGPU_CPU_QUOTA=40% MOREGPU_CPUS=2-3 MOREGPU_MEM_MAX=2G \
->   moregpu isolate --server wss://ADMIN:8787/ws --token <join-token>
+>   sudo -E moregpu isolate --server wss://ADMIN:8787/ws --token <join-token>
 > ```
+> The **memory cap + idle I/O/nice** always apply. The **CPU quota + cpuset** need a *system* scope (`sudo`) or a one-time admin delegation to your user slice (`Delegate=cpu cpuset io memory pids` on `user@.service`) — without it, the script warns and degrades to memory-cap + low priority. (GPU-side, MIG/MPS only bind a CUDA backend, not this WebGPU worker — it uses device pinning + the adaptive duty throttle.)
 
 > **Or use the [`moregpu` CLI](scripts/moregpu)**: `moregpu serve [--worker]`, `moregpu join --server … --token … [--schedule 22:00-07:00]`, `moregpu isolate …`, `moregpu stop`, `moregpu status`, and admin fleet control — `moregpu workers`, `moregpu pause <id>`, `moregpu resume <id>`, `moregpu set <id> <duty>`, `moregpu rm <id>`.
 
@@ -247,10 +248,10 @@ Drive the pool from an application with the client SDK, or the CLI.
 Install from the [**latest GitHub Release**](https://github.com/ArioMoniri/moregpu/releases/latest) — no registry account needed:
 
 ```sh
-# Python SDK (standard library only)
-pip install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu_client-0.1.0-py3-none-any.whl
+# Python SDK (standard library only) — matmul, attention(), linear(), mlp(), reductions
+pip install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu_client-0.2.0-py3-none-any.whl
 # TypeScript/JS SDK (Deno / Node / browser)
-npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.1.0.tgz
+npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.2.0.tgz
 # `moregpu` CLI (serve / join / isolate / stop / monitor)
 curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/moregpu -o /usr/local/bin/moregpu && chmod +x /usr/local/bin/moregpu
 ```
@@ -293,7 +294,7 @@ docker compose up -d                              # Grafana → http://localhost
 ```
 
 <p align="center">
-  <img src="docs/assets/grafana.png" alt="MoreGPU Grafana dashboard — fleet size, queue depth, total units pooled, jobs done/failed, avg user util & pool duty, and per-worker share/units" width="900">
+  <img src="docs/assets/grafana-mac.png" alt="MoreGPU Grafana dashboard — fleet size, queue depth, total units pooled, jobs done/failed, avg user util & pool duty, and per-worker share/units" width="900">
   <br><sub>The pre-provisioned Grafana dashboard, live: fleet size, queue depth, units pooled, jobs done/failed, avg user-util & pool-duty, and per-worker share + units (here <code>cpu-x</code> and the built-in <code>admin-slot</code>).</sub>
 </p>
 
@@ -336,17 +337,17 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 
 | Workload | | How / why |
 |---|---|---|
-| Dense fp32 matmul / GEMM | ✅ | Native **WGSL GEMM on the GPU** (naive, non-tiled), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
-| Elementwise + activations (add/mul/scale/saxpy/relu) | ✅ | First-class kernels; each op is its own pass. These are memory-bound, so they run on the worker's **CPU** (not the GPU) even on a GPU machine. |
+| Dense fp32 matmul / GEMM | ✅ | **Workgroup-tiled WGSL GEMM on the GPU** (shared-memory tiling), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
+| Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class kernels; each op is its own pass. These are memory-bound, so they run on the worker's **CPU** (not the GPU) even on a GPU machine. |
 | Softmax / LayerNorm | ✅ | Dedicated row-wise kernels (run on the worker's **CPU**), match a CPU reference to ~1e-8. |
-| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** ([`attention_demo.py`](examples/attention_demo.py)). Not flash-attention; no KV cache. |
+| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention; no KV cache. |
 | Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN. You orchestrate the graph from the SDK; weights are per-request, no residency. |
-| Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.). Works; fp32. |
+| Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.); `pool.sum/mean/dot/norm` SDK helpers. Convenience, not throughput — each runs on one worker/one thread. |
 | Large / out-of-core matmul | 🟡 | Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink. |
 | Monte-Carlo / RNG-heavy sims | 🟡 | You supply random inputs (host-side RNG); the pool does the arithmetic. |
 | Full LLM inference (checkpoints, tokenizer, KV cache) | ❌ | No model loader/tokenizer/sampling/KV-cache, no fp16/int8. Impractical to hand-compose at scale. |
 | Training (autograd / backprop / optimizer) | ❌ | No autograd or gradient/optimizer kernels. Not a training platform. |
-| Conv2d / CNNs | 🧩 | im2col on the host, then native matmul — borderline practical, off-GPU unfold. |
+| Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
 | CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
 
 **In one line:** it runs the small, correct primitive set it ships — matmul (on your real GPU via WGSL), plus elementwise, softmax and layernorm (on the worker's CPU) — with verified fp32 results, and lets you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
