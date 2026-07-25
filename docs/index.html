@@ -141,9 +141,10 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 <tr><td>Elementwise + activations</td><td class="y">✅</td><td>add / mul / scale / saxpy / relu / <b>gelu</b> — WGSL kernels that run <b>on the GPU</b> on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU.</td></tr>
 <tr><td>Softmax / LayerNorm</td><td class="y">✅</td><td>Row-wise WGSL reductions <b>on the GPU</b> on a GPU worker (CPU otherwise), match a CPU reference to ~1e-8.</td></tr>
 <tr><td>Scaled dot-product attention (1 head)</td><td class="p">🧩</td><td><code>matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)</code> — verified. Not flash-attention; no KV cache.</td></tr>
-<tr><td>Transformer block / small MLP inference</td><td class="p">🧩</td><td>Compose LN → matmuls → attention → FFN from the SDK. Weights per-request, no residency.</td></tr>
+<tr><td>Transformer block / small MLP inference</td><td class="p">🧩</td><td>Compose LN → matmuls → attention → FFN from the SDK; split a model across workers with weight residency.</td></tr>
+<tr><td>Small LLM (real GPT-2 124M)</td><td class="pa">🟡</td><td><b>A real GPT-2 runs on the pool</b> (<code>examples/llm_infer.py</code>) and matches Hugging Face token-for-token. Slow — activations round-trip per layer (~seconds/token).</td></tr>
 <tr><td>Large / out-of-core matmul</td><td class="pa">🟡</td><td>Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink.</td></tr>
-<tr><td>Full LLM inference (tokenizer, KV cache)</td><td class="n">❌</td><td>No model loader / tokenizer / sampling / KV-cache; no fp16/int8.</td></tr>
+<tr><td>Big / fast LLM inference (7B+, low latency)</td><td class="n">❌</td><td>fp32, no fp16/int8/tensor cores, no KV cache, activations cross the network — needs a native fp16/CUDA worker (roadmap).</td></tr>
 <tr><td>Training (autograd / backprop)</td><td class="n">❌</td><td>No autograd or optimizer kernels. Not a training platform.</td></tr>
 <tr><td>CUDA/PTX · Stable Diffusion · NVENC · tensor cores</td><td class="n">❌</td><td>WGSL backend, compute-only, fp32 — these paths don't exist.</td></tr>
 </table>

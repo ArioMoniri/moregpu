@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Real LLM inference on the pool** — `examples/llm_infer.py` loads a real **GPT-2 (124M)**,
+  pins the 12 transformer layers' weights resident across the workers, and runs the full
+  forward pass on the pool (via weight residency + the shipped primitives), using the real
+  Hugging Face tokenizer. Validated: next-token logits match transformers to 0.000 and greedy
+  generation is a **token-for-token exact match**. Slow (fp32, activations round-trip per
+  layer) — a proof of capability, not a fast serving stack.
+- `examples/tiny_llm.py` (toy transformer forward + the honest scaling wall).
+
+### Fixed
+
+- **GPU GELU NaN on large activations** — the WGSL GELU's `tanh` argument grows as x³; some GPU
+  `tanh` implementations (Metal) overflow to NaN on huge inputs. The argument is now clamped
+  (tanh saturates to ±1 well before, so it's exact). Only real-model activation magnitudes
+  triggered it; isolated small-value tests missed it.
+- Resident-weight uploads are capped (`MOREGPU_MAX_WEIGHT_ELEMENTS`, default 16M) so an
+  oversized weight returns 413 instead of OOM-crashing the coordinator.
+
 ## [0.4.0] - 2026-07-25
 
 ### Added
