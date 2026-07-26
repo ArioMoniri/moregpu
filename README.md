@@ -153,7 +153,7 @@ Kernels: `matmul, vector_add, vector_mul, saxpy, relu, scale, gelu, softmax, lay
 
 </details>
 
-The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live contribution + trend sparklines, the queue, and the error/debug log. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).
+The dashboard (any browser, even if the server host is headless/CLI-only) shows the virtual-GPU view, per-worker live **activity** + trend sparklines, the queue, and the error/debug log. Activity is measured in **compute operations** (one kernel shard, one LLM serving call, or one training round = 1 op — a single consistent unit, so a serving node's contribution is never a meaningless tokens-vs-matrix-elements ratio), with **tokens served** and **kernel output-elements** shown as separate detail columns. Resident-serving and fine-tuning move the trend just like kernel jobs do, and a node holding a model reads **serving** rather than idle; a node merely *receiving* a download is not counted as compute. Turnkey Grafana bundle in [`config/observability`](config/observability). Full ops guide: [docs/ADMIN.md](docs/ADMIN.md).
 
 <p align="center">
   <img src="docs/assets/admin-panel-mac.png" alt="MoreGPU admin dashboard — virtual GPU, live per-worker contribution and trend sparklines, per-kernel jobs, and the error/debug log" width="900">

@@ -148,9 +148,11 @@ const KM: Record<string, number> = {}; // jobs per kernel
 interface Worker {
   id: string; backend: string; label: string; os: string; ws: WebSocket;
   load1: number; util: number; duty: number; busy: boolean; joinedAt: number;
-  // contribution accounting
-  shards: number; units: number; errors: number; consecErrors: number; healthyBeats: number; busyCount: number; totalMs: number;
-  lastUnits: number; history: number[]; // per-sample units completed → sparkline trend
+  // contribution accounting. `ops` is the CONSISTENT activity currency (one kernel shard OR one serving call
+  // OR one training round = 1 op) — the trend + share are built from it so they never conflate LLM tokens
+  // with kernel matrix-elements. `units` = kernel output-elements (detail); `tokens` = LLM tokens served (detail).
+  shards: number; units: number; ops: number; tokens: number; errors: number; consecErrors: number; healthyBeats: number; busyCount: number; totalMs: number;
+  lastOps: number; history: number[]; // per-sample ops completed → sparkline trend (consistent unit)
   pubkey?: CryptoKey; // Ed25519 public key for verifying this worker's result signatures
   pubkeyB64?: string; // raw public key (for the removed-worker denylist)
   paused: boolean; // scheduled-off or admin-paused → coordinator assigns it no new work
@@ -202,7 +204,7 @@ function wireWorker(ws: WebSocket) {
       let pubkey: CryptoKey | undefined;
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastUnits: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
       log('info', `worker joined: ${id} (${safeId(node.label)}, ${safeId(node.os)})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
@@ -274,15 +276,15 @@ function wireWorker(ws: WebSocket) {
 
 // ---------- contribution trend sampler (per-worker + pool throughput sparklines) ----------
 const poolHistory: number[] = [];
-let lastPoolUnits = 0;
+let lastPoolOps = 0;
 setInterval(() => {
-  let totalUnits = 0;
+  let totalOps = 0;
   for (const w of workers.values()) {
-    const delta = Math.max(0, w.units - w.lastUnits); w.lastUnits = w.units;
+    const delta = Math.max(0, w.ops - w.lastOps); w.lastOps = w.ops; // ops/interval — consistent across kernel + serving
     w.history.push(delta); if (w.history.length > 30) w.history.shift();
-    totalUnits += w.units;
+    totalOps += w.ops;
   }
-  const pd = Math.max(0, totalUnits - lastPoolUnits); lastPoolUnits = totalUnits;
+  const pd = Math.max(0, totalOps - lastPoolOps); lastPoolOps = totalOps;
   poolHistory.push(pd); if (poolHistory.length > 30) poolHistory.shift();
 }, 3000);
 
@@ -389,12 +391,32 @@ async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, Re
   // (and, for a train op, may still commit optimizer/step state). Needs a cancel/epoch protocol (send an
   // abort frame, or a generation counter the worker checks between steps) so a timed-out round is truly voided.
   const ack = new Promise<RelayReply>((res) => { const t = setTimeout(() => { pend.delete(reqId); res({ ok: false, error: `${kind} rpc timeout` }); }, RELAY_TIMEOUT_MS); pend.set(reqId, { workerId: w.id, cb: (r) => { clearTimeout(t); res(r); } }); });
-  try { w.ws.send(JSON.stringify({ t: kind, reqId, op, sealed })); } catch (e) { return { ok: false, error: `send failed: ${e}` }; }
-  const r = await ack;
-  if (!r.ok) return { ok: false, error: r.error };
-  if (!r.sealed) return { ok: true, data: {} };
-  try { return { ok: true, data: JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealed))) as Record<string, unknown> }; } catch (e) { return { ok: false, error: `bad ${kind} reply: ${e}` }; }
+  // Resident serving + training run through this relay, NOT the kernel-shard path — so without accounting here
+  // they'd never show in the per-worker contribution / trend (flat while you chat). Mark the node busy for the
+  // op's duration; on success credit ONE op (the consistent activity currency) for actual COMPUTE ops only —
+  // never for weight-transfer/control ops (push_*/load/unload/arch/shard_unload), which the worker only
+  // receives, not computes (crediting those would make a downloading node look like a top contributor).
+  w.busyCount++; w.busy = true;
+  try {
+    w.ws.send(JSON.stringify({ t: kind, reqId, op, sealed }));
+  } catch (e) { w.busyCount = Math.max(0, w.busyCount - 1); w.busy = w.busyCount > 0; return { ok: false, error: `send failed: ${e}` }; }
+  try {
+    const r = await ack;
+    if (!r.ok) return { ok: false, error: r.error };
+    if (!r.sealed) return { ok: true, data: {} };
+    let data: Record<string, unknown>;
+    try { data = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealed))) as Record<string, unknown>; }
+    catch (e) { return { ok: false, error: `bad ${kind} reply: ${e}` }; }
+    // NB: keep w.totalMs (→ avgMs) shard-only — mixing serve/train ms into a kernel-shard average corrupts it.
+    if (SERVE_OPS.has(op)) { w.ops++; w.tokens += Math.max(0, Math.round(Number(data.n) || 0)); }
+    else if (TRAIN_OPS.has(op)) { w.ops++; }
+    return { ok: true, data };
+  } finally { w.busyCount = Math.max(0, w.busyCount - 1); w.busy = w.busyCount > 0; }
 }
+// COMPUTE relay ops that count toward a node's contribution (one call = one op). Serving forwards/decodes and
+// pipeline-shard stages, plus training inner-loops/steps. Everything else on the relay is transfer/setup.
+const SERVE_OPS = new Set(['forward', 'generate', 'chat', 'shard_forward']);
+const TRAIN_OPS = new Set(['inner', 'step']);
 const trainRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'train', pendingTrain, op, payload);
 const modelRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'model', pendingModel, op, payload);
 
@@ -598,7 +620,7 @@ async function dispatchShard(w: Worker, jobId: string, payload: Record<string, u
   M.shardsDone++; (r.backend?.startsWith('gpu') ? M.gpuShards++ : M.cpuShards++);
   const outObj = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealedOut)));
   const out = b64ToF32(outObj.out);
-  w.shards++; w.units += out.length; w.totalMs += r.ms ?? 0; // contribution accounting
+  w.shards++; w.ops++; w.units += out.length; w.totalMs += r.ms ?? 0; // contribution accounting (one shard = one op)
   const js = jobSigned.get(jobId) ?? { signed: 0, total: 0 }; js.total++; if (r.signed) js.signed++; jobSigned.set(jobId, js);
   return out;
 }
@@ -704,7 +726,7 @@ function deviceDescriptor() {
     kernels: KERNELS,
     limits: LIMITS,
     queue: { depth: g.queueDepth, running: g.busy },
-    throughput: { totalUnits: g.totalUnits, totalShards: g.totalShards, trend: g.poolTrend },
+    throughput: { totalOps: g.totalOps, totalUnits: g.totalUnits, totalShards: g.totalShards, tokensServed: g.totalTokens, trend: g.poolTrend },
     seal: 'AES-256-GCM',
     capabilities: { dataMode: true, verifiedResults: true, signedResults: true, adaptiveThrottle: true, asyncSubmit: true, sealedWire: true, tokenIsolated: true },
   };
@@ -719,7 +741,9 @@ function virtualGpu() {
   const avgDuty = slots ? fleet.reduce((s, w) => s + w.duty, 0) / slots : 0;
   const totalUnits = fleet.reduce((s, w) => s + w.units, 0);
   const totalShards = fleet.reduce((s, w) => s + w.shards, 0);
-  return { device: 'MoreGPU-Pool', slots, gpuSlots: gpu, cpuSlots: slots - gpu, busy: fleet.filter((w) => w.busy).length, avgUserUtil: +avgUtil.toFixed(3), avgPoolDuty: +avgDuty.toFixed(3), queueDepth: queue.length, totalUnits, totalShards, poolTrend: poolHistory, perKernel: KM, sealed: 'AES-256-GCM' };
+  const totalOps = fleet.reduce((s, w) => s + w.ops, 0);
+  const totalTokens = fleet.reduce((s, w) => s + w.tokens, 0);
+  return { device: 'MoreGPU-Pool', slots, gpuSlots: gpu, cpuSlots: slots - gpu, busy: fleet.filter((w) => w.busy).length, avgUserUtil: +avgUtil.toFixed(3), avgPoolDuty: +avgDuty.toFixed(3), queueDepth: queue.length, totalUnits, totalShards, totalOps, totalTokens, poolTrend: poolHistory, perKernel: KM, sealed: 'AES-256-GCM' };
 }
 
 // ---------- HTTP + WS ----------
@@ -739,11 +763,13 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === '/gpu') return json(virtualGpu());
   if (url.pathname === '/device') return json(deviceDescriptor());
   if (url.pathname === '/workers') {
-    const total = [...workers.values()].reduce((s, w) => s + w.units, 0) || 1;
+    const totalOps = [...workers.values()].reduce((s, w) => s + w.ops, 0) || 1; // share of compute OPERATIONS (consistent unit)
+    // which workers currently HOLD a resident model or a pipeline stage → they read "serving" even while idle between requests
+    const serveWorkers = new Set<string>([...modelHome.values(), ...[...shardPlans.values()].flatMap((p) => p.stages.map((s) => s.worker))]);
     return json([...workers.values()].map((w) => ({
       id: w.id, nick: w.nick, backend: w.backend, label: w.label, os: w.os, userUtil: w.util, poolDuty: w.duty, ceil: w.ceil, busy: w.busy,
-      paused: w.paused, pausedReason: w.pausedReason ?? null, schedule: w.schedule ?? 'always',
-      shards: w.shards, units: w.units, share: +(w.units / total).toFixed(3), errors: w.errors,
+      paused: w.paused, pausedReason: w.pausedReason ?? null, schedule: w.schedule ?? 'always', serving: serveWorkers.has(w.id),
+      shards: w.shards, ops: w.ops, units: w.units, tokens: w.tokens, share: +(w.ops / totalOps).toFixed(3), errors: w.errors,
       avgMs: w.shards ? +(w.totalMs / w.shards).toFixed(1) : 0, uptimeS: Math.round((Date.now() - w.joinedAt) / 1000), trend: w.history,
     })));
   }
@@ -1139,7 +1165,7 @@ async function handler(req: Request): Promise<Response> {
 
 function prometheus(): string {
   const g = virtualGpu();
-  const total = g.totalUnits || 1;
+  const totalOps = g.totalOps || 1; // share is a fraction of compute OPERATIONS (never tokens-vs-elements)
   const lines = [
     '# HELP moregpu_fleet Connected workers', '# TYPE moregpu_fleet gauge', `moregpu_fleet ${g.slots}`,
     '# TYPE moregpu_gpu_slots gauge', `moregpu_gpu_slots ${g.gpuSlots}`,
@@ -1150,14 +1176,18 @@ function prometheus(): string {
     '# TYPE moregpu_avg_pool_duty gauge', `moregpu_avg_pool_duty ${g.avgPoolDuty}`,
     '# TYPE moregpu_total_units counter', `moregpu_total_units ${g.totalUnits}`,
     '# TYPE moregpu_total_shards counter', `moregpu_total_shards ${g.totalShards}`,
+    '# TYPE moregpu_total_ops counter', `moregpu_total_ops ${g.totalOps}`,
+    '# HELP moregpu_tokens_served LLM tokens generated across the pool', '# TYPE moregpu_tokens_served counter', `moregpu_tokens_served ${g.totalTokens}`,
     '# TYPE moregpu_jobs_total counter', `moregpu_jobs_total ${M.jobsTotal}`, `moregpu_jobs_done ${M.jobsDone}`, `moregpu_jobs_failed ${M.jobsFailed}`,
     `moregpu_shards_done ${M.shardsDone}`, `moregpu_shards_failed ${M.shardsFailed}`, `moregpu_gpu_shards ${M.gpuShards}`, `moregpu_cpu_shards ${M.cpuShards}`,
-    '# HELP moregpu_worker_units Units of work completed per worker', '# TYPE moregpu_worker_units counter',
+    '# HELP moregpu_worker_units Kernel output-elements completed per worker (detail)', '# TYPE moregpu_worker_units counter',
   ];
   for (const w of workers.values()) {
     const lbl = `{worker="${w.id.replace(/"/g, '')}",backend="${w.backend}"}`;
     lines.push(`moregpu_worker_units${lbl} ${w.units}`);
-    lines.push(`moregpu_worker_share${lbl} ${(w.units / total).toFixed(4)}`);
+    lines.push(`moregpu_worker_ops${lbl} ${w.ops}`);
+    lines.push(`moregpu_worker_tokens${lbl} ${w.tokens}`);
+    lines.push(`moregpu_worker_share${lbl} ${(w.ops / totalOps).toFixed(4)}`);
     lines.push(`moregpu_worker_shards${lbl} ${w.shards}`);
     lines.push(`moregpu_worker_errors${lbl} ${w.errors}`);
     lines.push(`moregpu_worker_user_util${lbl} ${w.util}`);
@@ -1233,7 +1263,7 @@ a{color:#a5b4fc}.sp{margin-top:16px}.k{display:inline-block;background:#1a2133;c
   <div class="card gpu"><h3>Virtual GPU</h3><div class=big id=slots>—</div><div class=mut id=slotsub>slots</div>
     <div class=mut style="margin-top:10px">user load <span id=uu>–</span></div><div class=bar><i id=uubar style=width:0%></i></div>
     <div class=mut style="margin-top:6px">pool duty <span id=pd>–</span></div><div class=bar><i id=pdbar style="width:0%;background:var(--grn)"></i></div>
-    <div class=mut style="margin-top:10px">throughput · <span id=units>0</span> units total</div><div id=tpspark style="margin-top:4px"></div>
+    <div class=mut style="margin-top:10px">throughput · <span id=ops>0</span> ops · <span id=toks>0</span> tokens · <span id=units>0</span> kernel-elts</div><div id=tpspark style="margin-top:4px"></div>
   </div>
   <div class=card><h3>Queue</h3><div class=big id=q>0</div><div class=mut>waiting jobs</div>
     <div class=sp><span class=mut>done</span> <b id=jd>0</b> · <span class=mut>failed</span> <b id=jf>0</b></div></div>
@@ -1245,7 +1275,7 @@ a{color:#a5b4fc}.sp{margin-top:16px}.k{display:inline-block;background:#1a2133;c
   <label class=mut>size <input id=size value=512 style=width:110px></label><button onclick=submit()>Submit</button><span id=jobmsg class=mut></span></div></div>
 <div class="card sp"><h3>Fleet — live contribution &amp; control</h3>
   <div class=row><input id=fsearch placeholder="filter by name / type / OS" style="flex:1;min-width:200px" oninput=renderFleet()><button class=ghost onclick=pauseAll(true)>Pause all</button><button class=ghost onclick=pauseAll(false)>Resume all</button><span id=fcount class=mut></span></div>
-  <div style="overflow:auto"><table><thead><tr><th>worker</th><th>type</th><th>share</th><th>trend</th><th>shards</th><th>units</th><th>user load</th><th>pool duty</th><th>state</th><th>control</th></tr></thead><tbody id=fleet><tr><td class=mut colspan=10>connect a worker…</td></tr></tbody></table></div></div>
+  <div style="overflow:auto"><table><thead><tr><th>worker</th><th>type</th><th title="share of compute OPERATIONS (kernel shards + serving calls + training rounds — one consistent unit; not tokens-vs-elements)">activity</th><th title="ops/interval: kernel shards + LLM serving calls + training rounds">trend</th><th>shards</th><th title="kernel output-elements (matmul/etc.)">units</th><th title="LLM tokens generated on this node">tokens</th><th>user load</th><th>pool duty</th><th>state</th><th>control</th></tr></thead><tbody id=fleet><tr><td class=mut colspan=11>connect a worker…</td></tr></tbody></table></div></div>
 <div class="card sp"><h3>Per-kernel jobs</h3><div id=kernels class=mut>—</div></div>
 <div class="card sp"><h3>Errors &amp; debug log</h3><pre id=logs>—</pre></div>
 </div>
@@ -1273,9 +1303,9 @@ function renderFleet(){
    '<td><span class="pill '+(x.backend==='gpu'?'gpuP':'cpuP')+'">'+esc(x.backend)+'</span></td>'+
    '<td><b>'+pct(x.share)+'</b></td>'+
    '<td>'+spark(x.trend,72,20,x.backend==='gpu'?'#34d399':'#fbbf24')+'</td>'+
-   '<td>'+(x.shards|0)+'</td><td class=mut>'+fmt(x.units)+'</td>'+
+   '<td>'+(x.shards|0)+'</td><td class=mut>'+fmt(x.units)+'</td><td class=mut>'+fmt(x.tokens||0)+'</td>'+
    '<td>'+pct(x.userUtil)+'</td><td>'+pct(x.poolDuty)+'</td>'+
-   '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':(x.pausedReason==='errors'?'<span class=lvl-error>auto-paused</span>':'<span class=lvl-warn>paused</span>')):(x.busy?'working':'idle'))+'</td>'+
+   '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':(x.pausedReason==='errors'?'<span class=lvl-error>auto-paused</span>':'<span class=lvl-warn>paused</span>')):(x.busy?'working':(x.serving?'<span style="color:#34d399">serving</span>':'idle')))+'</td>'+
    '<td class=ctl>'+
      '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'" title="'+(paused?'resume':'pause')+'">'+(paused?'▶':'⏸')+'</button>'+
      '<input type=range class=dutyslider min=0.05 max=1 step=0.05 value='+(x.ceil!=null?x.ceil:(x.poolDuty||0.6))+' data-id="'+esc(x.id)+'" title="usage ceiling — drag to change live">'+
@@ -1297,6 +1327,8 @@ async function refresh(){
   document.getElementById('slotsub').textContent=g.gpuSlots+' GPU · '+g.cpuSlots+' CPU · '+g.busy+' busy';
   document.getElementById('uu').textContent=pct(g.avgUserUtil);document.getElementById('uubar').style.width=pct(g.avgUserUtil);
   document.getElementById('pd').textContent=pct(g.avgPoolDuty);document.getElementById('pdbar').style.width=pct(g.avgPoolDuty);
+  document.getElementById('ops').textContent=fmt(g.totalOps||0);
+  document.getElementById('toks').textContent=fmt(g.totalTokens||0);
   document.getElementById('units').textContent=fmt(g.totalUnits);
   document.getElementById('tpspark').innerHTML=spark(g.poolTrend,190,30,'#6366f1');
   document.getElementById('q').textContent=g.queueDepth;
