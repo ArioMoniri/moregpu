@@ -214,14 +214,18 @@ function wireWorker(ws: WebSocket) {
       if (w) {
         w.load1 = Number(m.load1) || 0; w.util = Number(m.util) || 0; w.duty = Number(m.duty) || w.duty;
         if (typeof m.ceil === 'number') w.ceil = m.ceil;
-        if (typeof m.schedule === 'string') w.schedule = m.schedule;
+        // A coordinator-owned time-window schedule must NOT be clobbered by the worker's self-report (the torch
+        // worker always reports "always"); non-window schedules ("always"/"idle-only") stay worker-reported.
+        if (typeof m.schedule === 'string' && !isWindow(w.schedule)) w.schedule = m.schedule;
         if (w.pausedReason === 'errors') {
           // auto-recover: a worker that heartbeats healthy for a few beats is un-paused automatically (no operator needed)
           if (m.paused === false) {
             w.healthyBeats++;
             if (w.healthyBeats >= AUTO_RESUME_BEATS) { w.paused = false; w.pausedReason = null; w.consecErrors = 0; w.healthyBeats = 0; log('info', `auto-resumed ${w.id} after recovery`); pumpQueue(); }
           } else w.healthyBeats = 0;
-        } else { // the worker's own schedule/admin pause state
+        } else if (isWindow(w.schedule) || w.pausedReason === 'schedule') {
+          // the COORDINATOR owns the pause state for a time-window schedule → ignore the worker's paused report here
+        } else { // the worker's own schedule/admin pause state (always / idle-only)
           if (typeof m.paused === 'boolean') w.paused = m.paused;
           w.pausedReason = (m.pausedReason as string | null) ?? null;
           if (m.paused === false) pumpQueue();
@@ -287,6 +291,33 @@ setInterval(() => {
   const pd = Math.max(0, totalOps - lastPoolOps); lastPoolOps = totalOps;
   poolHistory.push(pd); if (poolHistory.length > 30) poolHistory.shift();
 }, 3000);
+
+// ---------- coordinator-side schedule (time windows) ----------
+// "always"/"idle-only" are honoured by the worker itself (self-reported via heartbeat). A time window
+// "HH:MM-HH:MM" (the ON hours, may wrap past midnight, e.g. 22:00-07:00 = nights only) is evaluated HERE so it
+// works for ANY worker type — the torch worker doesn't self-schedule — pausing/resuming the node as the wall
+// clock enters/leaves the window. Set live from the admin panel; the coordinator owns the pause state for it.
+const isWindow = (s?: string) => /^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test((s ?? '').trim());
+function scheduleOff(s: string): boolean {
+  const [a, b] = s.split('-'); const [ah, am] = a.split(':').map(Number); const [bh, bm] = b.split(':').map(Number);
+  if ([ah, am, bh, bm].some((n) => !Number.isFinite(n))) return false;
+  const start = ah * 60 + am, end = bh * 60 + bm, now = new Date(), cur = now.getHours() * 60 + now.getMinutes();
+  const active = start <= end ? (cur >= start && cur < end) : (cur >= start || cur < end); // wraps past midnight
+  return !active;
+}
+function reconcileSchedules() {
+  for (const w of workers.values()) {
+    if (w.pausedReason === 'admin' || w.pausedReason === 'errors') continue; // admin/error pause outranks schedule
+    if (isWindow(w.schedule)) {
+      const off = scheduleOff(w.schedule!.trim());
+      if (off && !(w.paused && w.pausedReason === 'schedule')) { w.paused = true; w.pausedReason = 'schedule'; log('info', `${w.id} scheduled-off (outside ${w.schedule})`); }
+      else if (!off && w.pausedReason === 'schedule') { w.paused = false; w.pausedReason = null; log('info', `${w.id} scheduled-on (inside ${w.schedule})`); pumpQueue(); }
+    } else if (w.pausedReason === 'schedule') { // schedule cleared back to always/idle-only → resume
+      w.paused = false; w.pausedReason = null; pumpQueue();
+    }
+  }
+}
+setInterval(reconcileSchedules, 30_000);
 
 // Backstop: fail any job that has sat un-schedulable in the queue too long, so a caller never hangs forever.
 setInterval(() => {
@@ -918,7 +949,7 @@ async function handler(req: Request): Promise<Response> {
     if (body.action === 'pause') { w.paused = true; w.pausedReason = 'admin'; ctl.pause = true; }
     if (body.action === 'resume') { w.paused = false; w.pausedReason = null; w.consecErrors = 0; ctl.pause = false; }
     if (typeof body.ceil === 'number' && isFinite(body.ceil)) { const c = Math.max(0.05, Math.min(1, body.ceil)); w.duty = c; w.ceil = c; ctl.ceil = c; }
-    if (typeof body.schedule === 'string') { w.schedule = body.schedule.trim().toLowerCase().slice(0, 40); ctl.schedule = w.schedule; }
+    if (typeof body.schedule === 'string') { w.schedule = body.schedule.trim().toLowerCase().slice(0, 40); ctl.schedule = w.schedule; if (w.pausedReason === 'schedule') { w.paused = false; w.pausedReason = null; } reconcileSchedules(); } // apply the window now (coordinator-owned)
     if (typeof body.nick === 'string') w.nick = body.nick.slice(0, 40);
     try { if (Object.keys(ctl).length > 1) w.ws.send(JSON.stringify(ctl)); } catch { /* */ }
     log('info', `admin control → ${id}: ${JSON.stringify(body)}`);
@@ -1468,6 +1499,7 @@ button.mini{padding:4px 8px;font-size:11px;border-radius:7px;background:#26304a;
 button.mini.danger{background:#3a1d24;color:#fca5a5}
 .dutyin{width:50px;padding:4px 6px;font-size:11px}
 .dutyslider{width:96px;vertical-align:middle;accent-color:#818cf8;cursor:pointer}.dutyval{display:inline-block;width:34px;font-size:11px;color:var(--mut);text-align:right}
+.schedin{width:92px;padding:3px 6px;font-size:11px}
 td.ctl{white-space:nowrap}
 .logo{font-size:9px;line-height:1.05;margin:0 0 10px;font-family:ui-monospace,Menlo,monospace;overflow:auto;white-space:pre;background:linear-gradient(90deg,#5f5fff,#875fff,#af5fff,#d75fff,#ff5faf,#ff5f5f);-webkit-background-clip:text;background-clip:text;color:transparent}
 pre{background:#0e1420;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;max-height:260px;font-size:12px;margin:0}
@@ -1532,7 +1564,7 @@ function netTest(){var b=document.getElementById('netbtn');b.disabled=true;b.tex
  }).catch(function(e){b.disabled=false;b.textContent='Run self-test';document.getElementById('netnote').textContent='✗ '+e;});}
 function renderFleet(){
  var el=document.getElementById('fleet');if(!el)return;
- var ae=document.activeElement;if(ae&&ae.classList&&(ae.classList.contains('dutyin')||ae.classList.contains('dutyslider')))return; // don't clobber a duty field/slider mid-edit
+ var ae=document.activeElement;if(ae&&ae.classList&&(ae.classList.contains('dutyin')||ae.classList.contains('dutyslider')||ae.classList.contains('schedin')))return; // don't clobber a duty field/slider/schedule mid-edit
  var q=(document.getElementById('fsearch').value||'').toLowerCase();
  var list=(FLEET||[]).filter(function(x){return !q||((x.nick||'')+' '+x.id+' '+x.backend+' '+(x.os||'')+' '+(x.label||'')).toLowerCase().indexOf(q)>=0;});
  list.sort(function(a,b){return (b.share||0)-(a.share||0);});
@@ -1550,6 +1582,7 @@ function renderFleet(){
      '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'" title="'+(paused?'resume':'pause')+'">'+(paused?'▶':'⏸')+'</button>'+
      '<input type=range class=dutyslider min=0.05 max=1 step=0.05 value='+(x.ceil!=null?x.ceil:(x.poolDuty||0.6))+' data-id="'+esc(x.id)+'" title="usage ceiling — drag to change live">'+
      '<span class=dutyval>'+Math.round((x.ceil!=null?x.ceil:(x.poolDuty||0.6))*100)+'%</span>'+
+     '<input class=schedin value="'+esc(x.schedule||'always')+'" data-id="'+esc(x.id)+'" title="when this worker contributes — always · idle-only · a window like 22:00-07:00 (its off-hours). Applied on Enter/blur.">'+
      '<button class="mini danger" data-act=remove data-id="'+esc(x.id)+'">✕</button>'+
    '</td></tr>';}).join(''):'<tr><td class=mut colspan=10>connect a worker…</td></tr>';
 }
@@ -1595,6 +1628,9 @@ document.getElementById('fleet').addEventListener('click',function(ev){
 // usage slider: live label while dragging, apply the ceiling on release (no full refresh, so it stays smooth)
 document.getElementById('fleet').addEventListener('input',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('dutyslider'))return;var v=s.parentNode.querySelector('.dutyval');if(v)v.textContent=Math.round(s.value*100)+'%';});
 document.getElementById('fleet').addEventListener('change',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('dutyslider'))return;ctl(s.getAttribute('data-id'),{ceil:parseFloat(s.value)},true);});
+// schedule: apply on blur/Enter (always · idle-only · HH:MM-HH:MM). Blank → always.
+document.getElementById('fleet').addEventListener('change',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('schedin'))return;ctl(s.getAttribute('data-id'),{schedule:(s.value||'always').trim()});});
+document.getElementById('fleet').addEventListener('keydown',function(ev){if(ev.key==='Enter'&&ev.target.classList&&ev.target.classList.contains('schedin'))ev.target.blur();});
 refresh();setInterval(refresh,2500);
 </script>`;
 
