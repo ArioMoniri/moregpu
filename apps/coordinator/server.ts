@@ -1288,6 +1288,11 @@ async function handler(req: Request): Promise<Response> {
             const budget = { left: PUSH_MAX_BYTES };
             const cb = new TextEncoder().encode(configText!);
             const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+            if (st.first) { // stream the tokenizer to the FIRST stage so a browser can chat this sharded model
+              for (const f of ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja', 'generation_config.json']) {
+                const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
+              }
+            }
             const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
             stageBytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
             r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
@@ -1377,6 +1382,33 @@ async function handler(req: Request): Promise<Response> {
       },
     });
     return new Response(stream, { headers: { 'content-type': 'application/x-ndjson', 'cache-control': 'no-cache' } });
+  }
+  // Text-in/text-out chat over a SHARDED model — so all nodes contribute to a chat. The FIRST stage holds the
+  // tokenizer: tokenize the prompt there, pipe the ids through every stage per token (shardPipe), decode there.
+  if (req.method === 'POST' && url.pathname === '/model/shard_chat') {
+    const body = await req.json().catch(() => ({})) as { id?: string; prompt?: string; max_new_tokens?: number };
+    const sid = body.id ?? [...shardPlans.keys()][0];
+    if (!sid || !shardPlans.has(sid) || shardPlans.get(sid)!.stages.length === 0) return json({ error: 'no ready sharded model — POST /model/shard first', id: sid }, 409);
+    if (typeof body.prompt !== 'string' || !body.prompt.trim()) return json({ error: 'need {prompt}' }, 400);
+    const plan = shardPlans.get(sid)!;
+    const first = workers.get(plan.stages[0].worker);
+    if (!first) { shardPlans.delete(sid); return json({ error: 'first-stage worker disconnected — re-shard', id: sid }, 503); }
+    const tk = await modelRPC(first, 'shard_tok', { id: sid, prompt: body.prompt.slice(0, 8000) });
+    if (!tk.ok) return json({ error: `tokenize failed (re-shard — the tokenizer streams to the first stage): ${tk.error}` }, 502);
+    const seq = (tk.data!.input_ids as number[]).slice();
+    const promptLen = seq.length, eos = Number(tk.data!.eos);
+    const n = Math.max(1, Math.min(Number(body.max_new_tokens ?? 64), 512));
+    const t0 = Date.now();
+    for (let k = 0; k < n; k++) {
+      const out = await shardPipe(sid, seq, false);
+      if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
+      const tok = Number(out.data.argmax); seq.push(tok);
+      if (Number.isFinite(eos) && tok === eos) break;
+    }
+    const newTokens = seq.slice(promptLen);
+    const dt = await modelRPC(first, 'shard_detok', { id: sid, tokens: newTokens });
+    if (!dt.ok) return json({ error: `decode failed: ${dt.error}` }, 502);
+    return json({ ok: true, id: sid, text: dt.data!.text, n: newTokens.length, ms: Date.now() - t0, workers: plan.stages.map((s) => s.worker) });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard_unload') {
     const body = await req.json().catch(() => ({})) as { id?: string };
@@ -1662,6 +1694,7 @@ button.g{background:#0e1420;color:var(--fg);border-color:var(--line);font-weight
 <input id=model value="gpt2" placeholder="HF model (gpt2 · Qwen/Qwen2.5-0.5B …)">
 <input id=worker placeholder="worker (optional, e.g. colab-cuda)" style="min-width:150px">
 <label class=mut title="OFF (default, fast): the worker downloads the model itself — quick on a machine with good internet (e.g. a Colab GPU). ON: the coordinator streams the weights so the worker never touches the HF hub and keeps nothing on its disk — but it's SLOWER (sealed streaming, ~minutes on Colab)."><input id=pushfree type=checkbox> download-free</label>
+<label class=mut title="Split the model across ALL torch workers (pipeline parallel) so EVERY node contributes to each token — for a model too big for one node. Slower per token (each token hops between nodes), always download-free. Ignores the worker field."><input id=shardmode type=checkbox> shard across fleet</label>
 <button onclick=load()>Load</button>
 <span id=status class=mut></span>
 </div>
@@ -1678,15 +1711,31 @@ button.g{background:#0e1420;color:var(--fg);border-color:var(--line);font-weight
 var K='moregpu_admin_token',tokEl=document.getElementById('tok');tokEl.value=localStorage.getItem(K)||'';
 tokEl.onchange=function(){localStorage.setItem(K,tokEl.value.trim());};
 function H(){return {'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||tokEl.value.trim())};}
-var MID=null;
+var MID=null,SHARDED=false;
 function add(role,text){var d=document.getElementById('chat'),el=document.createElement('div');el.className='msg '+role;el.textContent=text;d.appendChild(el);d.scrollTop=d.scrollHeight;return el;}
-function ready(m,r,s){MID=r.id||m;var sb=document.getElementById('sendb');sb.disabled=false;sb.title='';s.textContent='✓ ready — '+MID+' on '+(r.worker||'?')+(r.device?' · '+r.device:'')+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'')+' — type a message and Send';}
+function enableSend(){var sb=document.getElementById('sendb');sb.disabled=false;sb.title='';}
+function ready(m,r,s){MID=r.id||m;SHARDED=false;enableSend();s.textContent='✓ ready — '+MID+' on '+(r.worker||'?')+(r.device?' · '+r.device:'')+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'')+' — type a message and Send';}
+function readyShard(m,r,s){MID=m;SHARDED=true;enableSend();var st=(r.stages||[]).map(function(x){return x.worker+'['+x.start+'-'+x.end+')';}).join(' → ');s.textContent='✓ ready — '+m+' SHARDED across '+((r.stages||[]).length)+' nodes: '+st+' — every node contributes per token';}
+function pollShard(m,s,t0){fetch('/model/shard_status?id='+encodeURIComponent(m),{headers:H()}).then(function(r){return r.json();}).then(function(r){
+  if(r.status==='ready'){readyShard(m,r,s);return;}
+  if(r.status==='error'){s.textContent='✗ '+r.error;return;}
+  s.textContent='sharding '+m+' across the fleet… '+Math.round((Date.now()-t0)/1000)+'s ('+(r.stages_done||0)+'/'+(r.stages_total||'?')+' stages streamed)';setTimeout(function(){pollShard(m,s,t0);},2000);
+ }).catch(function(){setTimeout(function(){pollShard(m,s,t0);},2500);});}
 function poll(m,s,t0){fetch('/model/status?id='+encodeURIComponent(m),{headers:H()}).then(function(r){return r.json();}).then(function(r){
   if(r.status==='ready'){ready(m,r,s);return;}
   if(r.status==='error'){s.textContent='✗ '+r.error;return;}
   s.textContent='streaming '+m+'… '+Math.round((Date.now()-t0)/1000)+'s (weights → worker)';setTimeout(function(){poll(m,s,t0);},2000);
  }).catch(function(){setTimeout(function(){poll(m,s,t0);},2500);});}
-function load(){localStorage.setItem(K,tokEl.value.trim());MID=null;var sb=document.getElementById('sendb');sb.disabled=true;sb.title='Loading… Send enables when the model is ready';var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),pf=document.getElementById('pushfree').checked,s=document.getElementById('status');s.textContent=(pf?'streaming ':'loading ')+m+'… (Send disabled until ready)';
+function load(){localStorage.setItem(K,tokEl.value.trim());MID=null;var sb=document.getElementById('sendb');sb.disabled=true;sb.title='Loading… Send enables when the model is ready';var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),pf=document.getElementById('pushfree').checked,sh=document.getElementById('shardmode').checked,s=document.getElementById('status');
+ if(sh){ // SHARD across all nodes — always download-free + async; every node contributes per token
+  s.textContent='sharding '+m+' across the fleet… (Send disabled until ready)';
+  fetch('/model/shard',{method:'POST',headers:H(),body:JSON.stringify({model:m,id:m,push:true,async:true})}).then(function(r){return r.json();}).then(function(r){
+   if(r.error){s.textContent='✗ '+r.error;return;}
+   if(r.status==='loading'){pollShard(m,s,Date.now());return;}
+   readyShard(m,r,s);}).catch(function(e){s.textContent='✗ '+e;});
+  return;
+ }
+ s.textContent=(pf?'streaming ':'loading ')+m+'… (Send disabled until ready)';
  // async for download-free (a big push outlives a public tunnel's request timeout) — return fast, then poll status
  var b={model:m,id:m,push:pf};if(wk)b.worker=wk;if(pf)b.async=true;
  fetch('/model/load',{method:'POST',headers:H(),body:JSON.stringify(b)}).then(function(r){return r.json();}).then(function(r){
@@ -1695,7 +1744,9 @@ function load(){localStorage.setItem(K,tokEl.value.trim());MID=null;var sb=docum
   ready(m,r,s);}).catch(function(e){s.textContent='✗ '+e;});}
 function send(){var p=document.getElementById('prompt'),text=p.value.trim();if(!text)return;if(!MID){alert('Load a model first (top bar).');return;}
  add('user',text);p.value='';var rep=add('bot','…'),sb=document.getElementById('sendb');sb.disabled=true;
- var body={id:MID,prompt:text,max_new_tokens:(+document.getElementById('mnt').value)||96,do_sample:document.getElementById('samp').checked};
- fetch('/model/chat',{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(r){
-  rep.textContent=r.error?('✗ '+r.error):((r.text||'(empty)')+(r.ms?'   ·  '+(r.ms/1000).toFixed(1)+'s on '+r.worker:''));sb.disabled=false;}).catch(function(e){rep.textContent='✗ '+e;sb.disabled=false;});}
+ var mnt=(+document.getElementById('mnt').value)||96;
+ var url=SHARDED?'/model/shard_chat':'/model/chat';
+ var body=SHARDED?{id:MID,prompt:text,max_new_tokens:mnt}:{id:MID,prompt:text,max_new_tokens:mnt,do_sample:document.getElementById('samp').checked};
+ fetch(url,{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(r){
+  rep.textContent=r.error?('✗ '+r.error):((r.text||'(empty)')+(r.ms?'   ·  '+(r.ms/1000).toFixed(1)+'s '+(SHARDED?('across '+((r.workers||[]).length)+' nodes'):('on '+r.worker)):''));sb.disabled=false;}).catch(function(e){rep.textContent='✗ '+e;sb.disabled=false;});}
 </script>`;

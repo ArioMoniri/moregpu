@@ -491,6 +491,26 @@ def model_generate(payload: dict) -> dict:
 # stage keeps the embedding. That one tied matrix is duplicated across the two end stages.
 # ---------------------------------------------------------------------------
 SHARDS: dict = {}  # shard id -> kept stage modules (blocks slice + optional embeddings / final head)
+SHARD_TOKS: dict = {}  # shard id -> tokenizer (only on the FIRST stage) so a browser can chat a sharded model
+
+def shard_tok(payload: dict) -> dict:
+    """Tokenize a text prompt for a sharded model (runs on the FIRST stage, which holds the tokenizer). Applies
+    the chat template when present. Returns input_ids so the coordinator can pipe them through the shard."""
+    sid = payload.get("id"); tk = SHARD_TOKS.get(sid)
+    if tk is None:
+        raise RuntimeError("no tokenizer for this shard — re-shard (the tokenizer is streamed to the first stage)")
+    prompt = str(payload.get("prompt", ""))[:8000]
+    text = tk.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True) \
+        if getattr(tk, "chat_template", None) else prompt
+    ids = tk(text, return_tensors=None)["input_ids"]
+    return {"ok": True, "input_ids": ids, "eos": tk.eos_token_id}
+
+def shard_detok(payload: dict) -> dict:
+    """Decode generated token ids back to text (runs on the FIRST stage's tokenizer)."""
+    sid = payload.get("id"); tk = SHARD_TOKS.get(sid)
+    if tk is None:
+        raise RuntimeError("no tokenizer for this shard")
+    return {"ok": True, "text": tk.decode(payload.get("tokens", []), skip_special_tokens=True)}
 
 
 def _shard_arch(model: nn.Module) -> str:
@@ -574,9 +594,21 @@ def shard_load(cfg: dict) -> dict:
     del base, model
     _empty_cache()
     SHARDS[sid] = shard
+    tok_ok = False
+    if first:
+        # The FIRST stage keeps the tokenizer so a browser can chat a SHARDED model (tokenize prompt → ids here,
+        # pipe ids through the stages, decode the output here). from a push shard it's in the staged dir; else HF.
+        SHARD_TOKS.pop(sid, None)
+        try:
+            from transformers import AutoTokenizer
+            src = PUSH[sid]["dir"] if (cfg.get("push") and sid in PUSH) else cfg["model"]
+            SHARD_TOKS[sid] = AutoTokenizer.from_pretrained(src, local_files_only=bool(cfg.get("push")))
+            tok_ok = True
+        except Exception as e:
+            print(f"[torch-worker] shard {sid}: tokenizer unavailable ({e}) — sharded chat disabled, token-id path still works")
     if cfg.get("push"):
         _push_cleanup(sid)  # stage weights are now sliced into SHARDS — drop the staged partial safetensors
-    return {"ok": True, "id": sid, "layers": [start, end], "first": first, "last": last,
+    return {"ok": True, "id": sid, "layers": [start, end], "first": first, "last": last, "tokenizer": tok_ok,
             "n_layer": shard["n_layer"], "arch": arch, "params_held": params_held, "mode": "download-free" if cfg.get("push") else "download"}
 
 def shard_forward(payload: dict) -> dict:
@@ -695,7 +727,9 @@ def model_dispatch(op: str, payload: dict) -> dict:
     if op == "unload": _push_cleanup(payload.get("id")); MODELS.pop(payload.get("id"), None); MODEL_NAMES.pop(payload.get("id"), None); _TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     if op == "shard_load": return shard_load(payload)
     if op == "shard_forward": return shard_forward(payload)
-    if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
+    if op == "shard_tok": return shard_tok(payload)
+    if op == "shard_detok": return shard_detok(payload)
+    if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); SHARD_TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     raise ValueError(f"unknown model op {op}")
 
 async def run():
@@ -793,7 +827,7 @@ async def run():
                                 # fresh session: the coordinator forgets our resident state on disconnect, so a
                                 # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
                                 for _pid in list(PUSH): _push_cleanup(_pid)  # drop any staged (un-finished) weight pushes
-                                resident.clear(); MODELS.clear(); SHARDS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
+                                resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":
                                 if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
