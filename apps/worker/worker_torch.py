@@ -377,12 +377,22 @@ def _push_cleanup(mid) -> None:
 def model_push_begin(payload: dict) -> dict:
     import tempfile
     mid = payload.get("id") or payload.get("model")
-    _push_cleanup(mid)  # drop any stale half-streamed staging for this id
+    st = PUSH.get(mid)
+    # RESUME: a stage that dropped mid-stream reconnects and we keep its partial staging — report the bytes
+    # already written per file so the coordinator re-streams only the tail (append continues each file).
+    if payload.get("resume") and st is not None and os.path.isdir(st["dir"]):
+        sizes = {}
+        for fn in os.listdir(st["dir"]):
+            try: sizes[fn] = os.path.getsize(os.path.join(st["dir"], fn))
+            except OSError: pass
+        st["bytes"] = sum(sizes.values())  # re-sync the cap counter to what's actually on disk
+        return {"ok": True, "id": mid, "staging": "ram" if st["ram"] else "disk", "resumed": True, "sizes": sizes}
+    _push_cleanup(mid)  # fresh push: drop any stale half-streamed staging for this id
     root = _stage_root()
     safe = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in str(mid))[:40]
     d = tempfile.mkdtemp(prefix=f"moregpu-{safe}-", dir=root)
     PUSH[mid] = {"dir": d, "bytes": 0, "ram": root == "/dev/shm"}
-    return {"ok": True, "id": mid, "staging": "ram" if root == "/dev/shm" else "disk"}
+    return {"ok": True, "id": mid, "staging": "ram" if root == "/dev/shm" else "disk", "resumed": False, "sizes": {}}
 
 def model_push_chunk(payload: dict) -> dict:
     mid = payload.get("id"); st = PUSH.get(mid)
@@ -826,7 +836,9 @@ async def run():
                                 key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6))
                                 # fresh session: the coordinator forgets our resident state on disconnect, so a
                                 # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
-                                for _pid in list(PUSH): _push_cleanup(_pid)  # drop any staged (un-finished) weight pushes
+                                # KEEP in-progress PUSH staging, though: a stage that dropped mid-stream can then
+                                # RESUME (the coordinator re-streams only the missing bytes). A genuinely new
+                                # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
                                 resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":

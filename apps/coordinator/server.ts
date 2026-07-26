@@ -465,7 +465,10 @@ const modelRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'model
 // "all weights on the admin, fleet = pure GPU compute". It's a ONE-TIME transfer (unlike the per-token
 // pipeline pipe), so it tolerates a slow/flaky tunnel far better.
 const HF_BASE = Deno.env.get('MOREGPU_HF_BASE') ?? 'https://huggingface.co';
-const PUSH_CHUNK = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_CHUNK') ?? (32 << 20))); // 32 MiB raw / chunk — fewer sealed round-trips
+// 4 MiB raw / chunk. Smaller than you'd pick for pure throughput on purpose: each acked chunk is PERSISTED on the
+// worker, so on a churning link this is the RESUME granularity (a dropped stage restarts from the last flushed
+// chunk, not from zero) and a smaller frame is likelier to cross a flaky tunnel intact. Raise on a fast/LAN link.
+const PUSH_CHUNK = Math.max(1 << 18, Number(Deno.env.get('MOREGPU_PUSH_CHUNK') ?? (4 << 20)));
 // Safety rail against a runaway/oversized repo OOM-ing the coordinator or a donated worker (default 20 GiB,
 // env-tunable). The index.json is metadata (KB) so it gets a much tighter cap of its own.
 const PUSH_MAX_BYTES = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_MAX_BYTES') ?? (20 * (1 << 30))));
@@ -613,7 +616,10 @@ function stageTensors(header: STHeader, start: number, end: number, first: boole
 }
 
 // Build a valid per-stage safetensors (recomputed contiguous offsets) and stream it as "model.safetensors".
-async function streamStageSafetensors(w: Worker, id: string, model: string, file: string, header: STHeader, srcHeaderLen: number, names: string[], budget: { left: number }): Promise<number> {
+// `resumeFrom` = bytes already staged on the worker (from a dropped attempt): the byte layout is deterministic
+// (same tensor order → same header), so we skip whole segments before the offset (no HF re-fetch) and append only
+// the tail — a churned stage makes forward progress across reconnects instead of restarting from zero.
+async function streamStageSafetensors(w: Worker, id: string, model: string, file: string, header: STHeader, srcHeaderLen: number, names: string[], budget: { left: number }, resumeFrom = 0): Promise<number> {
   const newHeader: STHeader = {}; const parts: { srcStart: number; len: number }[] = []; let off = 0;
   const dataStart = 8 + srcHeaderLen;
   for (const name of names) {
@@ -626,7 +632,7 @@ async function streamStageSafetensors(w: Worker, id: string, model: string, file
   const hbytes = new TextEncoder().encode(hstr);
   const prefix = new Uint8Array(8); new DataView(prefix.buffer).setBigUint64(0, BigInt(hbytes.length), true);
   // chunked push of: [8-byte len][header][each tensor's bytes, in order] → appended into the worker's model.safetensors
-  let pending = new Uint8Array(0), seq = 0, total = 0;
+  let pending = new Uint8Array(0), seq = 0, total = 0, pos = 0; // pos = absolute offset in the full stream
   const push = async (data: Uint8Array, last: boolean) => { const r = await modelRPC(w, 'push_chunk', { id, name: 'model.safetensors', seq: seq++, data: b64e(data), last }); if (!r.ok) throw new Error(`push_chunk safetensors: ${r.error}`); };
   const feed = async (b: Uint8Array) => {
     total += b.length; budget.left -= b.length;
@@ -634,10 +640,20 @@ async function streamStageSafetensors(w: Worker, id: string, model: string, file
     const merged = new Uint8Array(pending.length + b.length); merged.set(pending); merged.set(b, pending.length); pending = merged;
     while (pending.length >= PUSH_CHUNK) { await push(pending.slice(0, PUSH_CHUNK), false); pending = pending.slice(PUSH_CHUNK); }
   };
-  await feed(prefix); await feed(hbytes);
-  for (const p of parts) await feed(await hfFetchRange(model, file, p.srcStart, p.srcStart + p.len - 1)); // Range-fetch just this tensor
+  // Emit one stream segment [pos, pos+len). Fully before resumeFrom → skip (and skip the HF fetch); straddling →
+  // fetch and append only the tail; fully after → append whole.
+  const emit = async (len: number, get: () => Promise<Uint8Array>) => {
+    const segStart = pos; pos += len;
+    if (pos <= resumeFrom) return;
+    let bytes = await get();
+    if (segStart < resumeFrom) bytes = bytes.slice(resumeFrom - segStart);
+    await feed(bytes);
+  };
+  await emit(prefix.length, () => Promise.resolve(prefix));
+  await emit(hbytes.length, () => Promise.resolve(hbytes));
+  for (const p of parts) await emit(p.len, () => hfFetchRange(model, file, p.srcStart, p.srcStart + p.len - 1)); // Range-fetch just this tensor
   await push(pending, true);
-  return total;
+  return resumeFrom + total; // full staged size (already-there + this attempt's tail)
 }
 
 // Run ONE forward across a shard plan: stage 0 embeds input_ids → hidden; each next stage runs its blocks on
@@ -1288,22 +1304,28 @@ async function handler(req: Request): Promise<Response> {
     const runLoad = async (): Promise<(ShardStage & { params_held?: number; bytes?: number })[]> => {
       const info: (ShardStage & { params_held?: number; bytes?: number })[] = [];
       const unloadAll = async () => { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }).catch(() => {}); } };
-      // Stream ONE stage's slice to a worker. A fresh push_begin wipes the worker's staging for this id, so every
-      // attempt starts clean (no half-file resume needed). Any transport/disconnect error becomes {ok:false}.
-      const loadStage = async (st: ShardStage, w: Worker): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> => {
+      // Stream ONE stage's slice to a worker. On `resume` (a retry after a mid-stream drop) push_begin keeps the
+      // partial staging and reports per-file sizes, so we skip files already fully staged and re-stream only the
+      // TAIL of model.safetensors — a churned stage makes progress across reconnects. Any error → {ok:false}.
+      const loadStage = async (st: ShardStage, w: Worker, resume: boolean): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> => {
         if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last }); return { ...r, bytes: 0 }; }
         try {
-          const begin = await modelRPC(w, 'push_begin', { id: sid, model }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+          const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+          const sizes = (begin.data?.sizes ?? {}) as Record<string, number>; // {} unless the worker resumed → all re-streamed
+          if (resume && Number(sizes['model.safetensors']) > 0) log('info', `shard ${sid} stage ${st.worker}: resuming — ${(Number(sizes['model.safetensors']) / 1e6).toFixed(1)}MB already staged, streaming the rest`);
           const budget = { left: PUSH_MAX_BYTES };
-          const cb = new TextEncoder().encode(configText!);
-          const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+          if (!(Number(sizes['config.json']) > 0)) { // config is one chunk (last=true) → size>0 means fully staged
+            const cb = new TextEncoder().encode(configText!);
+            const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+          }
           if (st.first) { // stream the tokenizer to the FIRST stage so a browser can chat this sharded model
             for (const f of ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja', 'generation_config.json']) {
+              if (Number(sizes[f]) > 0) continue; // already staged (the first stage is normally the stable/local one, so no partial-tokenizer risk)
               const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
             }
           }
           const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
-          const bytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
+          const bytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget, Number(sizes['model.safetensors']) || 0);
           const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
           return { ...r, bytes };
         } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }
@@ -1321,11 +1343,12 @@ async function handler(req: Request): Promise<Response> {
           if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); }
           const w = workers.get(st.worker) ?? await waitForWorker(st.worker);
           if (!w) { await unloadAll(); throw new Error(`stage worker ${st.worker} never (re)connected within ${SHARD_RECONNECT_WAIT_MS}ms (layers ${st.start}-${st.end})`); }
-          r = await loadStage(st, w);
+          r = await loadStage(st, w, attempt > 1); // retry ⇒ resume: keep the partial staging, re-stream only the tail
           if (r.ok) break;
-          const cw = workers.get(st.worker); if (cw) await modelRPC(cw, 'shard_unload', { id: sid }).catch(() => {}); // drop partial staging before retry
-          if (attempt >= SHARD_STAGE_TRIES) { await unloadAll(); throw new Error(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}) after ${attempt} tries: ${r.error}`); }
-          log('warn', `shard ${sid} stage ${st.worker} (layers ${st.start}-${st.end}) attempt ${attempt}/${SHARD_STAGE_TRIES} failed (${r.error}) — waiting for reconnect, then re-streaming`);
+          // NB: do NOT unload here — keeping the partial staging is what lets the next attempt resume. Only the
+          // terminal-failure path below drops it (a worker that never streams enough between drops).
+          if (attempt >= SHARD_STAGE_TRIES) { const cw = workers.get(st.worker); if (cw) await modelRPC(cw, 'shard_unload', { id: sid }).catch(() => {}); await unloadAll(); throw new Error(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}) after ${attempt} tries: ${r.error}`); }
+          log('warn', `shard ${sid} stage ${st.worker} (layers ${st.start}-${st.end}) attempt ${attempt}/${SHARD_STAGE_TRIES} failed (${r.error}) — reconnect + resume from staged bytes`);
           await sleep(1500);
         }
         info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: r.bytes || undefined });
@@ -1345,7 +1368,7 @@ async function handler(req: Request): Promise<Response> {
       // push_chunk only errors after RELAY_TIMEOUT_MS). On expiry flag aborted + unload finished stages. NB: this
       // can't cancel an in-flight push_chunk on the worker (no worker-side cancel yet) — it stops the bookkeeping
       // hang and blocks resurrection; runLoad checks `aborted` before finalizing.
-      const DEADLINE_MS = Number(Deno.env.get('MOREGPU_SHARD_LOAD_DEADLINE_MS') ?? 1_800_000); // 30 min default
+      const DEADLINE_MS = Number(Deno.env.get('MOREGPU_SHARD_LOAD_DEADLINE_MS') ?? 7_200_000); // 2h default — a churning tunnel resumes a stage across many reconnects; the retry/reconnect caps bound a truly stuck load
       const deadline = setTimeout(async () => {
         const s = shardLoads.get(sid);
         if (s && s.status === 'loading') {
