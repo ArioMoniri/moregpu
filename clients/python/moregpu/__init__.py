@@ -272,14 +272,17 @@ class MoreGPU:
     # ---- pipeline-parallel sharding (GPT-2 family only): split the layers into contiguous STAGES,
     # one per torch worker; each worker holds ONLY its stage. Needs apps/worker/worker_torch.py (≥2 for a real split). ----
     def shard_load(self, model: str, layers: int | None = None, workers: Sequence[str] | None = None,
-                   id: str | None = None, push: bool = False) -> dict:
+                   id: str | None = None, push: bool = False, async_: bool = False) -> dict:
         """Split `model`'s transformer layers into contiguous stages across the torch workers (or the listed
         `workers`) and load each stage on its worker. GPT-2 and Llama-family (RMSNorm/RoPE).
 
         push=True → DOWNLOAD-FREE: the coordinator fetches the model once and streams each worker ONLY its
         stage's weights (its layer slice + embeddings on the first stage / final norm+head on the last), so the
         fleet never touches the HF hub. Needs a single-file model.safetensors source.
-        Returns {id, mode, stages:[{worker, start, end, first, last, params_held, bytes}]}."""
+        async_=True → return immediately {status:'loading'} and stream the stages in the background; poll
+        shard_status() / call shard_wait(). Use this over a slow or tunneled link where a long synchronous
+        load would exceed the request timeout.
+        Returns {id, mode, stages:[...]} (sync) or {status:'loading', poll} (async)."""
         body: dict[str, Any] = {"model": model}
         if layers is not None:
             body["layers"] = layers
@@ -289,7 +292,25 @@ class MoreGPU:
             body["id"] = id
         if push:
             body["push"] = True
+        if async_:
+            body["async"] = True
         return self._req("/model/shard", "POST", body)
+
+    def shard_status(self, id: str | None = None) -> dict:
+        """Poll an async shard load → {status: loading|ready|error, stages_done, stages_total, ...}."""
+        q = f"?id={id}" if id else ""
+        return self._req(f"/model/shard_status{q}", "GET")
+
+    def shard_wait(self, id: str | None = None, timeout_s: float = 3600, poll_s: float = 3.0) -> dict:
+        """Block until an async shard load is ready (or errors / times out). For a slow link — 'possible, not fast'."""
+        import time as _t
+        t0 = _t.time()
+        while _t.time() - t0 < timeout_s:
+            s = self.shard_status(id)
+            if s.get("status") in ("ready", "error", "unknown"):
+                return s
+            _t.sleep(poll_s)
+        raise TimeoutError(f"shard {id} not ready after {timeout_s}s")
 
     def shard_forward(self, input_ids: Sequence[int], id: str | None = None, return_logits: bool = False) -> dict:
         """Run ONE full forward across the pipeline: the coordinator pipes the hidden state stage→stage

@@ -372,6 +372,10 @@ const modelHome = new Map<string, string>(); // resident model id → worker id
 // polls GET /model/status. This is also the answer to "heavy models over a slow link" — the request is short.
 type LoadState = { status: 'loading' | 'ready' | 'error'; worker: string; model: string; started: number; info?: Record<string, unknown>; error?: string };
 const modelLoads = new Map<string, LoadState>(); // model id → last load's progress/outcome
+// Same idea for a download-free SHARD load: streaming each stage's slice across the fleet can outlast a tunnel's
+// request timeout, so /model/shard?async loads the stages in the background and the caller polls /model/shard_status.
+type ShardLoadState = { status: 'loading' | 'ready' | 'error'; model: string; started: number; stagesDone: number; stagesTotal: number; info?: unknown; error?: string };
+const shardLoads = new Map<string, ShardLoadState>();
 // Pipeline-parallel sharding (GPT-2 family): a model's transformer layers are split into contiguous
 // STAGES, one per worker — each worker holds ONLY its stage resident. The plan records, per shard id,
 // the ordered stages (which worker owns which layer range + which is first/last); /model/shard_forward
@@ -1163,8 +1167,15 @@ async function handler(req: Request): Promise<Response> {
   //   POST /model/shard          { model, id?, layers?, workers? }              → { id, stages:[{worker,start,end,first,last,params_held}] }
   //   POST /model/shard_forward  { id?, input_ids:[...], return_logits? }       → { argmax, logits? }  (pipes hidden state stage→stage)
   //   POST /model/shard_unload   { id? }                                        → unload every stage + drop the plan
+  if (req.method === 'GET' && url.pathname === '/model/shard_status') {
+    const id = url.searchParams.get('id') ?? [...shardLoads.keys()].pop();
+    if (!id) return json({ status: 'unknown', shards: [...shardPlans.keys()] });
+    const s = shardLoads.get(id);
+    if (!s) return json({ status: shardPlans.get(id)?.stages.length ? 'ready' : 'unknown', id });
+    return json({ status: s.status, id, model: s.model, stages_done: s.stagesDone, stages_total: s.stagesTotal, elapsed_ms: Date.now() - s.started, ...(s.error ? { error: s.error } : {}), ...(s.status === 'ready' && s.info ? { stages: s.info } : {}) });
+  }
   if (req.method === 'POST' && url.pathname === '/model/shard') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean; async?: boolean };
     if (!body.model) return json({ error: 'need {model} (GPT-2 / Llama-family)' }, 400);
     if (body.push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free shard` }, 400);
     // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
@@ -1206,35 +1217,50 @@ async function handler(req: Request): Promise<Response> {
       stages.push({ worker: cands[i].id, start: cursor, end: cursor + size, first: i === 0, last: i === nStages - 1 });
       cursor += size;
     }
-    // load each stage; if any fails, unload the ones already loaded so we never leave a half-loaded pipe
-    const info: (ShardStage & { params_held?: number; bytes?: number })[] = [];
-    for (const st of stages) {
-      const w = workers.get(st.worker);
-      if (!w) { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }); } return fail(`stage worker ${st.worker} vanished`, 503); }
-      let r: { ok: boolean; data?: Record<string, unknown>; error?: string }; let stageBytes = 0;
-      if (body.push) {
-        try {
-          const begin = await modelRPC(w, 'push_begin', { id: sid, model: body.model }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
-          const budget = { left: PUSH_MAX_BYTES };
-          const cb = new TextEncoder().encode(configText!);
-          const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
-          const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
-          stageBytes = await streamStageSafetensors(w, sid, body.model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
-          r = await modelRPC(w, 'shard_load', { model: body.model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
-        } catch (e) { r = { ok: false, error: e instanceof Error ? e.message : String(e) }; }
-      } else {
-        r = await modelRPC(w, 'shard_load', { model: body.model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last });
+    // Load every stage (streaming its slice for a push shard). Returns the stage info or throws after cleaning
+    // up any stages already loaded — so a half-loaded pipe never lingers. Runnable in the background for async.
+    const model = body.model, push = !!body.push;
+    const runLoad = async (): Promise<(ShardStage & { params_held?: number; bytes?: number })[]> => {
+      const info: (ShardStage & { params_held?: number; bytes?: number })[] = [];
+      const unloadAll = async () => { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }).catch(() => {}); } };
+      for (const st of stages) {
+        const w = workers.get(st.worker);
+        if (!w) { await unloadAll(); throw new Error(`stage worker ${st.worker} vanished`); }
+        let r: { ok: boolean; data?: Record<string, unknown>; error?: string }; let stageBytes = 0;
+        if (push) {
+          try {
+            const begin = await modelRPC(w, 'push_begin', { id: sid, model }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+            const budget = { left: PUSH_MAX_BYTES };
+            const cb = new TextEncoder().encode(configText!);
+            const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+            const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
+            stageBytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
+            r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
+          } catch (e) { r = { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+        } else {
+          r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last });
+        }
+        if (!r.ok) { await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); await unloadAll(); throw new Error(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}): ${r.error}`); }
+        info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: stageBytes || undefined });
+        const ls = shardLoads.get(sid); if (ls) ls.stagesDone = info.length; // progress for the poller
       }
-      if (!r.ok) {
-        for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }); }
-        if (body.push) await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); // drop this stage's partial staging
-        return fail(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}): ${r.error}`, 502);
-      }
-      info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: stageBytes || undefined });
+      shardPlans.set(sid, { model, stages }); // finalize the reservation with the real plan (unblocks shard_forward)
+      log('info', `sharded ${model} (${nLayer} layers) → ${nStages} stages${push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
+      return info;
+    };
+    if (body.async) {
+      // return immediately (short request → survives a slow/tunneled link); stream stages in the background.
+      shardLoads.set(sid, { status: 'loading', model, started: Date.now(), stagesDone: 0, stagesTotal: nStages });
+      runLoad()
+        .then((info) => { shardLoads.set(sid, { status: 'ready', model, started: shardLoads.get(sid)!.started, stagesDone: nStages, stagesTotal: nStages, info }); })
+        .catch((e) => { shardPlans.delete(sid); shardLoads.set(sid, { status: 'error', model, started: shardLoads.get(sid)!.started, stagesDone: shardLoads.get(sid)!.stagesDone, stagesTotal: nStages, error: e instanceof Error ? e.message : String(e) }); log('warn', `shard ${sid} failed: ${e instanceof Error ? e.message : e}`); });
+      return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages_total: nStages, status: 'loading', poll: `/model/shard_status?id=${encodeURIComponent(sid)}` });
     }
-    shardPlans.set(sid, { model: body.model, stages }); // finalize the reservation with the real plan
-    log('info', `sharded ${body.model} (${nLayer} layers) → ${nStages} stages${body.push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
-    return json({ ok: true, id: sid, model: body.model, layers: nLayer, mode: body.push ? 'download-free' : 'download', stages: info });
+    try {
+      const info = await runLoad();
+      shardLoads.set(sid, { status: 'ready', model, started: Date.now(), stagesDone: nStages, stagesTotal: nStages, info });
+      return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages: info });
+    } catch (e) { return fail(e instanceof Error ? e.message : String(e), 502); }
   }
   if (req.method === 'POST' && url.pathname === '/model/shard_forward') {
     const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean };
