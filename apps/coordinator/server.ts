@@ -215,7 +215,8 @@ function wireWorker(ws: WebSocket) {
       }
     } else if (m.t === 'cached') {
       if (!registered) return;
-      const cb = pendingCache.get(String(m.id)); if (cb) { pendingCache.delete(String(m.id)); cb({ ok: !!m.ok, error: m.error as string | undefined }); }
+      const e = pendingCache.get(String(m.id)); if (e && e.workerId === id) { pendingCache.delete(String(m.id)); e.cb({ ok: !!m.ok, error: m.error as string | undefined }); } // ignore a cached ack from a worker other than the home
+
     } else if (m.t === 'train_reply' || m.t === 'model_reply') {
       if (!registered) return;
       const pm = m.t === 'train_reply' ? pendingTrain : pendingModel;
@@ -245,6 +246,8 @@ function wireWorker(ws: WebSocket) {
     // same for in-flight train/model relay RPCs (else the awaiting HTTP handler hangs until the 120s timeout)
     for (const [rid, e] of pendingTrain) if (e.workerId === id) { pendingTrain.delete(rid); e.cb({ ok: false, error: `worker ${id} disconnected mid-rpc` }); }
     for (const [rid, e] of pendingModel) if (e.workerId === id) { pendingModel.delete(rid); e.cb({ ok: false, error: `worker ${id} disconnected mid-rpc` }); }
+    // and any in-flight /weights cache ack destined for this worker (else that POST hangs for the full 30s)
+    for (const [cid, e] of pendingCache) if (e.workerId === id) { pendingCache.delete(cid); e.cb({ ok: false, error: `worker ${id} disconnected before cache ack` }); }
     // drop weights that lived on this worker — they must be re-uploaded (the coordinator forgets its home)
     for (const [wid, home] of weightHome) if (home.worker === id) { weightHome.delete(wid); weightStore.delete(wid); }
     // forget any resident model / training session that lived here
@@ -278,6 +281,7 @@ setInterval(() => {
     const rec = queue[i];
     if (now - rec.submittedAt > STALE_JOB_MS) {
       queue.splice(i, 1); rec.status = 'failed'; rec.error = `stale: no worker available within ${Math.round(STALE_JOB_MS / 1000)}s`;
+      jobInputs.delete(rec.id); jobSigned.delete(rec.id); // free the retained input buffers (runJob never ran for this job)
       M.jobsFailed++; log('warn', `${rec.id} failed: stale in queue (no active worker)`);
     }
   }
@@ -330,7 +334,7 @@ interface JobRec { id: string; status: JobStatus; kernel: string; size: number; 
 /** Real input a caller submitted (data mode); the pool computes on THIS data and returns the output. */
 interface JobInput { a?: Float32Array; b?: Float32Array; scalar?: number; M?: number; N?: number; K?: number; bRef?: string; }
 const residentCount = (wid: string) => [...weightHome.values()].filter((h) => h.worker === wid).length;
-const pendingCache = new Map<string, (r: { ok: boolean; error?: string }) => void>(); // /weights waits for the worker's ack
+const pendingCache = new Map<string, { workerId: string; cb: (r: { ok: boolean; error?: string }) => void }>(); // /weights waits for the worker's ack (tagged with the home worker so a disconnect can reject it)
 // On-pool fine-tuning is relayed to ONE native (torch) worker that runs the whole train step locally.
 // The coordinator seals/accounts the RPC like a shard but can't verify a stochastic loss (it has no
 // torch) — correctness is checked out-of-band against a seeded reference (see examples/lora_finetune.py).
@@ -344,6 +348,10 @@ const pendingTrain = new Map<string, RelayPending>();
 const pendingModel = new Map<string, RelayPending>();
 let relaySeq = 0;
 let trainingHome: string | null = null; // worker id hosting the single (non-DiLoCo) training session
+// TODO(review): a worker LRU-evicts its own resident models/shards past MAX_RESIDENT_MODELS, but the
+// coordinator is never told, so modelHome/shardPlans keep pointing at an id the worker no longer holds
+// (a later /model/forward then errors "not loaded"). Fix: have the worker report evicted ids on load
+// replies so the coordinator can drop the stale bookkeeping, or mirror the worker's cap in lockstep.
 const modelHome = new Map<string, string>(); // resident model id → worker id
 // Pipeline-parallel sharding (GPT-2 family): a model's transformer layers are split into contiguous
 // STAGES, one per worker — each worker holds ONLY its stage resident. The plan records, per shard id,
@@ -358,6 +366,9 @@ async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, Re
   const reqId = `${kind}-${++relaySeq}`;
   const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify(payload)));
   // Bind the reply to THIS worker's id, so another worker can't resolve someone else's RPC (see train_reply handler).
+  // TODO(review): a timeout here only abandons the coordinator's wait — the worker keeps running the compute
+  // (and, for a train op, may still commit optimizer/step state). Needs a cancel/epoch protocol (send an
+  // abort frame, or a generation counter the worker checks between steps) so a timed-out round is truly voided.
   const ack = new Promise<RelayReply>((res) => { const t = setTimeout(() => { pend.delete(reqId); res({ ok: false, error: `${kind} rpc timeout` }); }, RELAY_TIMEOUT_MS); pend.set(reqId, { workerId: w.id, cb: (r) => { clearTimeout(t); res(r); } }); });
   try { w.ws.send(JSON.stringify({ t: kind, reqId, op, sealed })); } catch (e) { return { ok: false, error: `send failed: ${e}` }; }
   const r = await ack;
@@ -406,7 +417,7 @@ function pumpQueue() {
     inflight++;
     runJob(rec)
       .then(() => { rec.status = 'done'; M.jobsDone++; })
-      .catch((e) => { rec.status = 'failed'; rec.error = String(e); M.jobsFailed++; log('error', `${rec.id} failed: ${rec.error}`); })
+      .catch((e) => { rec.status = 'failed'; rec.error = String(e); M.jobsFailed++; jobInputs.delete(rec.id); jobSigned.delete(rec.id); log('error', `${rec.id} failed: ${rec.error}`); })
       .finally(() => { inflight--; pumpQueue(); });
   }
 }
@@ -648,7 +659,7 @@ async function handler(req: Request): Promise<Response> {
       const home = body.worker ? active.find((w) => w.id === body.worker) : active.slice().sort((a, b) => residentCount(a.id) - residentCount(b.id))[0];
       if (!home) return json({ error: `worker ${body.worker} not active` }, 404);
       const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify({ data: body.data, rows: body.rows, cols: body.cols, dtype })));
-      const ack = new Promise<{ ok: boolean; error?: string }>((res) => { const t = setTimeout(() => { pendingCache.delete(body.id!); res({ ok: false, error: 'cache ack timeout' }); }, 30_000); pendingCache.set(body.id!, (r) => { clearTimeout(t); res(r); }); });
+      const ack = new Promise<{ ok: boolean; error?: string }>((res) => { const t = setTimeout(() => { pendingCache.delete(body.id!); res({ ok: false, error: 'cache ack timeout' }); }, 30_000); pendingCache.set(body.id!, { workerId: home.id, cb: (r) => { clearTimeout(t); res(r); } }); });
       home.ws.send(JSON.stringify({ t: 'cache', id: body.id, sealed }));
       const r = await ack;
       if (!r.ok) return json({ error: `cache failed on ${home.id}: ${r.error}` }, 502);
@@ -672,6 +683,10 @@ async function handler(req: Request): Promise<Response> {
     if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; the WebGPU workers cannot train (no autograd)' }, 503);
     const w = body.worker ? cands.find((x) => x.id === body.worker) : cands[0];
     if (!w) return json({ error: `torch worker ${body.worker} not active` }, 404);
+    // A worker holds ONE global TRAIN slot (shared by /train and /train/diloco), so it can't host both at
+    // once. TODO(review): full fix is to key training sessions by id on the worker; this guard prevents the
+    // silent cross-session corruption until then.
+    if (diloco && diloco.workers.includes(w.id)) return json({ error: `worker ${w.id} is part of a live DiLoCo group — it shares the single global TRAIN slot, so it can't also host a /train session; unload the DiLoCo group or pick another worker`, worker: w.id }, 409);
     const r = await trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets });
     if (!r.ok) return json({ error: r.error }, 502);
     trainingHome = w.id;
@@ -689,7 +704,9 @@ async function handler(req: Request): Promise<Response> {
     const body = await req.json().catch(() => ({})) as { input_ids?: number[]; labels?: number[]; lr?: number };
     if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
     const okInts = (a?: number[]) => !a || (a.length <= 100_000 && a.every((x) => Number.isInteger(x) && x >= 0));
-    if (!okInts(body.input_ids) || !okInts(body.labels)) return json({ error: 'input_ids/labels must be non-negative ints, ≤100000' }, 400);
+    // labels may also carry HF's ignore index -100 to mask a position out of the loss (input_ids may not)
+    const okLabels = (a?: number[]) => !a || (a.length <= 100_000 && a.every((x) => Number.isInteger(x) && (x === -100 || x >= 0)));
+    if (!okInts(body.input_ids) || !okLabels(body.labels)) return json({ error: 'input_ids must be non-negative ints ≤100000; labels may also be -100 (ignore index)' }, 400);
     const r = await trainRPC(w, 'step', { input_ids: body.input_ids, labels: body.labels, lr: body.lr });
     if (!r.ok) return json({ error: r.error }, 502);
     return json({ ok: true, ...r.data });
@@ -702,6 +719,12 @@ async function handler(req: Request): Promise<Response> {
     const cands = torchWorkers();
     const group = (Array.isArray(body.workers) && body.workers.length) ? cands.filter((w) => body.workers!.includes(w.id)) : cands;
     if (group.length === 0) return json({ error: 'no native (torch) workers connected for DiLoCo' }, 503);
+    // Each worker holds ONE global TRAIN slot shared by /train and /train/diloco. TODO(review): full fix is
+    // per-session keying on the worker. Loading a DiLoCo group re-loads (and resets) every member's TRAIN slot
+    // below, so it SUPERSEDES any single-worker /train session on those workers — end that session cleanly
+    // rather than refusing (the old session's next /train/step then gets a clean 409). Only a busy round blocks.
+    if (diloco && diloco.busy) return json({ error: 'a DiLoCo round is in progress — reload the group after it finishes' }, 409);
+    if (trainingHome && group.some((w) => w.id === trainingHome)) { log('info', `DiLoCo supersedes the single-worker /train session on ${trainingHome}`); trainingHome = null; }
     const loads = await Promise.all(group.map((w) => trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets, no_dropout: true })));
     const okWorkers = group.filter((_, i) => loads[i].ok);
     if (okWorkers.length === 0) return json({ error: `train_load failed on all workers: ${loads[0]?.error}` }, 502);
@@ -723,7 +746,14 @@ async function handler(req: Request): Promise<Response> {
     const body = await req.json().catch(() => ({})) as { inner_steps?: number; lr?: number; outer_lr?: number; outer_momentum?: number; batches?: Record<string, number[][]> };
     const H = Math.max(1, Math.min(Number(body.inner_steps ?? 4), 1000));
     const lr = Number(body.lr ?? 1e-3), outerLr = Number(body.outer_lr ?? 0.7), mom = Number(body.outer_momentum ?? 0.9);
+    if (![lr, outerLr, mom].every((x) => Number.isFinite(x))) return json({ error: 'lr/outer_lr/outer_momentum must be finite numbers' }, 400);
     const batches = (body.batches ?? {}) as Record<string, number[][]>;
+    // Every DiLoCo batch bypasses the /train/step path, so apply the same id/size validation here: each
+    // window is non-negative int token ids capped at 100000 tokens, capped at 100000 windows per worker.
+    // (train_inner also applies the context-window guard on the worker.)
+    const okInts = (a?: number[]) => !a || (a.length <= 100_000 && a.every((x) => Number.isInteger(x) && x >= 0));
+    const okBatch = (rows?: number[][]) => !rows || (Array.isArray(rows) && rows.length <= 100_000 && rows.every((r) => Array.isArray(r) && okInts(r)));
+    for (const [wid, rows] of Object.entries(batches)) if (!okBatch(rows)) return json({ error: `batches[${wid}] must be arrays of non-negative int token ids (each window ≤100000 tokens, ≤100000 windows)` }, 400);
     const live = diloco.workers.map((id) => workers.get(id)).filter((w): w is Worker => !!w);
     if (live.length === 0) { diloco = null; return json({ error: 'all DiLoCo workers disconnected' }, 503); }
     diloco.busy = true;
@@ -744,15 +774,24 @@ async function handler(req: Request): Promise<Response> {
       const g = diloco.global.get(n)!, v = diloco.momentum.get(n)!, a = avg.get(n)!;
       for (let i = 0; i < g.length; i++) { const d = g[i] - a[i]; v[i] = mom * v[i] + d; g[i] = g[i] - outerLr * (d + mom * v[i]); }
     }
-    // broadcast the new global to every worker
+    // broadcast the new global to every worker, and VERIFY each accepted it: a worker that fails set_adapter
+    // is now out of sync with the global adapter, so drop it from the group (its next round would otherwise
+    // train from a stale adapter and silently corrupt the reduce). If ALL fail, dissolve the group.
     const tensors: Record<string, { data: string; shape: number[] }> = {};
     for (const [n, a] of diloco.global) tensors[n] = { data: f32ToB64(a), shape: diloco.shape.get(n)! };
-    await Promise.all(live.map((w) => trainRPC(w, 'set_adapter', { tensors })));
+    const bcast = await Promise.all(live.map((w) => trainRPC(w, 'set_adapter', { tensors })));
+    const dropped = live.filter((_, i) => !bcast[i].ok).map((w) => w.id);
+    if (dropped.length) {
+      const bad = new Set(dropped);
+      diloco.workers = diloco.workers.filter((wid) => !bad.has(wid));
+      log('warn', `DiLoCo: set_adapter broadcast failed on ${dropped.join(', ')} — dropped from the group (out of sync)`);
+    }
+    if (diloco.workers.length === 0) { diloco = null; return json({ error: 'all DiLoCo workers fell out of sync (set_adapter broadcast failed) — group dissolved', dropped }, 502); }
     diloco.round++;
     const worker_losses = good.map(({ w, r }) => ({ worker: w.id, losses: r.data!.losses as number[] }));
     const avg_last_loss = worker_losses.reduce((s, x) => s + (x.losses[x.losses.length - 1] ?? 0), 0) / worker_losses.length;
-    log('info', `DiLoCo round ${diloco.round}: ${good.length} workers · avg last loss ${avg_last_loss.toFixed(4)}`);
-    return json({ ok: true, round: diloco.round, workers: good.length, avg_last_loss, worker_losses });
+    log('info', `DiLoCo round ${diloco.round}: ${good.length} workers · avg last loss ${avg_last_loss.toFixed(4)}${dropped.length ? ` · dropped ${dropped.length}` : ''}`);
+    return json({ ok: true, round: diloco.round, workers: good.length, avg_last_loss, worker_losses, dropped: dropped.length ? dropped : undefined });
     } finally { if (diloco) diloco.busy = false; }
   }
   if (req.method === 'POST' && url.pathname === '/train/diloco/adapter') {
@@ -825,7 +864,13 @@ async function handler(req: Request): Promise<Response> {
     // Resolve the model's REAL layer count (config-only, no weights) so gpt2-medium/large/xl shard correctly —
     // never a hard-coded 12 that would silently run only the first 12 blocks and return wrong logits.
     const arch = await modelRPC(cands[0], 'arch', { model: body.model });
-    const nLayer = (arch.ok && Number(arch.data?.n_layer) > 0) ? Math.floor(Number(arch.data!.n_layer)) : Math.max(1, Math.floor(Number(body.layers ?? 12)));
+    // Never silently guess 12 layers: a wrong count drops blocks (or over-provisions stages) and returns
+    // wrong logits. Use the real count if the pre-flight succeeded; else honour a caller-supplied `layers`;
+    // else REJECT so the caller learns the arch is unknown instead of getting a broken pipe.
+    let nLayer: number;
+    if (arch.ok && Number(arch.data?.n_layer) > 0) nLayer = Math.floor(Number(arch.data!.n_layer));
+    else if (Number(body.layers) > 0) nLayer = Math.max(1, Math.floor(Number(body.layers)));
+    else return fail(`could not determine layer count for ${body.model} (arch pre-flight failed: ${arch.error ?? 'no n_layer'}) — pass {layers:N} to shard explicitly`, 502);
     const nStages = Math.min(cands.length, nLayer);
     // split [0, nLayer) into nStages contiguous ranges, as even as possible (first `extra` stages get one more)
     const per = Math.floor(nLayer / nStages), extra = nLayer % nStages;

@@ -130,6 +130,29 @@ def _check_ids(vocab, *seqs):
         if s and (max(s) >= vocab or min(s) < 0):
             raise ValueError(f"token id out of range [0,{vocab}) — check the tokenizer matches the model")
 
+def _check_labels(vocab, labels):
+    """Labels (unlike input_ids) may carry HF's ignore index -100 to mask a position out of the loss; every
+    other value must be a valid token id. Kept separate from _check_ids so -100 is allowed ONLY on labels."""
+    for x in labels:
+        if not (x == -100 or 0 <= x < vocab):
+            raise ValueError(f"label id out of range — must be -100 (ignore) or in [0,{vocab})")
+
+def _ctx_window(model) -> int:
+    """The model's max sequence length (positions). GPT-2 exposes n_positions; Llama-style exposes
+    max_position_embeddings. Defaults huge so an unknown config never falsely rejects."""
+    n = getattr(model.config, "n_positions", None)
+    if n is None:
+        n = getattr(model.config, "max_position_embeddings", 1 << 30)
+    return int(n)
+
+def _check_ctx(model, seq_len: int, extra: int = 0):
+    """Guard the context window BEFORE the forward — a position index past n_positions is an out-of-range
+    embedding lookup → CUDA device-assert that bricks the single-thread TORCH_POOL. Mirrors the guard
+    shard_forward already applies; `extra` covers the tokens a generate call will append."""
+    n_pos = _ctx_window(model)
+    if seq_len + extra > n_pos:
+        raise ValueError(f"sequence length {seq_len + extra} exceeds the model's context window {n_pos}")
+
 # ---------------------------------------------------------------------------
 # On-pool fine-tuning (ADR-0007 native-accelerator tier): the WHOLE train step
 # (forward + cross-entropy + backward + optimizer.step) runs LOCALLY here in torch.
@@ -183,6 +206,9 @@ TRAIN: dict = {"model": None, "opt": None, "step": 0, "trainable": {}}
 def train_load(cfg: dict) -> dict:
     from transformers import AutoModelForCausalLM
     torch.manual_seed(int(cfg.get("seed", 0)))
+    # Free the previous training model BEFORE allocating the replacement so we never transiently hold two
+    # full models in VRAM (a single global TRAIN slot; loading first would double-allocate).
+    TRAIN.update(model=None, opt=None, trainable={}); _empty_cache()
     model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV)
     if cfg.get("no_dropout"):  # deterministic training (e.g. DiLoCo) → reproducible against a reference
         for mod in model.modules():
@@ -203,7 +229,10 @@ def train_step(batch: dict) -> dict:
     if "lr" in batch and batch["lr"]:
         for g in opt.param_groups:
             g["lr"] = float(batch["lr"])
-    _check_ids(getattr(model.config, "vocab_size", 1 << 30), batch["input_ids"], batch.get("labels", []))
+    vocab = getattr(model.config, "vocab_size", 1 << 30)
+    _check_ids(vocab, batch["input_ids"])            # input ids: strictly in-vocab
+    _check_labels(vocab, batch.get("labels", []))    # labels: in-vocab OR -100 (HF ignore index)
+    _check_ctx(model, len(batch["input_ids"]))       # context-window guard (before the forward)
     ids = torch.tensor(batch["input_ids"], dtype=torch.long, device=DEV).unsqueeze(0)
     labels = torch.tensor(batch.get("labels", batch["input_ids"]), dtype=torch.long, device=DEV).unsqueeze(0)
     model.train()
@@ -233,6 +262,7 @@ def train_inner(payload: dict) -> dict:
     if not batches:
         raise RuntimeError("no batches supplied for this worker's DiLoCo shard")
     _check_ids(getattr(model.config, "vocab_size", 1 << 30), *batches)
+    _check_ctx(model, max(len(b) for b in batches))  # longest window must fit the context (before the forward)
     steps = int(payload.get("steps", len(batches)))
     lr = float(payload.get("lr", 1e-3))
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -281,13 +311,21 @@ MODELS: dict = {}  # model_id -> torch model (eval, frozen)
 def model_load(cfg: dict) -> dict:
     from transformers import AutoModelForCausalLM, AutoConfig
     mid = cfg.get("id") or cfg["model"]
-    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float16 if cfg.get("fp16") else torch.float32).to(DEV).eval()
-    if mid not in MODELS and len(MODELS) >= MAX_RESIDENT_MODELS:  # LRU-evict to bound VRAM
-        old = next(iter(MODELS)); del MODELS[old]; _empty_cache()
+    # fp16 has no CPU matmul kernel in torch ("not implemented for 'Half'") — force f32 on CPU workers and
+    # report the effective dtype so the caller knows the request was downgraded.
+    fp16_requested = bool(cfg.get("fp16"))
+    fp16_effective = fp16_requested and DEV != "cpu"
+    # Evict the LRU victim (MODELS is kept most-recent-last) and free VRAM BEFORE allocating the replacement,
+    # so peak residency never exceeds the cap (loading first would briefly hold MAX+1 models on-device).
+    if mid not in MODELS and len(MODELS) >= MAX_RESIDENT_MODELS:
+        MODELS.pop(next(iter(MODELS)), None); _empty_cache()
+    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float16 if fp16_effective else torch.float32).to(DEV).eval()
     MODELS.pop(mid, None); MODELS[mid] = model  # (re)insert as most-recent
     c = AutoConfig.from_pretrained(cfg["model"])
     return {"ok": True, "id": mid, "n_layer": getattr(c, "n_layer", getattr(c, "num_hidden_layers", None)),
-            "n_params": sum(p.numel() for p in model.parameters()), "dtype": "f16" if cfg.get("fp16") else "f32", "device": DEV}
+            "n_params": sum(p.numel() for p in model.parameters()),
+            "dtype": "f16" if fp16_effective else "f32", "fp16_requested": fp16_requested,
+            "fp16_effective": fp16_effective, "device": DEV}
 
 def model_forward(payload: dict) -> dict:
     mid = payload.get("id")
@@ -295,6 +333,8 @@ def model_forward(payload: dict) -> dict:
     if model is None:
         raise RuntimeError(f"model {mid} not loaded — call /model/load first")
     _check_ids(getattr(model.config, "vocab_size", 1 << 30), payload["input_ids"])
+    _check_ctx(model, len(payload["input_ids"]))     # context-window guard (before the forward)
+    MODELS[mid] = MODELS.pop(mid)                     # mark most-recently-used → genuine LRU eviction order
     ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=DEV).unsqueeze(0)
     with torch.no_grad():
         logits = model(input_ids=ids).logits[0, -1].float()  # last-token logits [vocab]
@@ -314,8 +354,10 @@ def model_generate(payload: dict) -> dict:
     if model is None:
         raise RuntimeError(f"model {mid} not loaded — call /model/load first")
     _check_ids(getattr(model.config, "vocab_size", 1 << 30), payload["input_ids"])
-    ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=DEV).unsqueeze(0)
     n = max(1, min(int(payload.get("max_new_tokens", 16)), 1024))  # cap to keep a single call bounded
+    _check_ctx(model, len(payload["input_ids"]), extra=n)  # prompt + decode must fit the context window
+    MODELS[mid] = MODELS.pop(mid)                           # mark most-recently-used → genuine LRU
+    ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=DEV).unsqueeze(0)
     attn = torch.ones_like(ids)
     kw = {"max_new_tokens": n, "do_sample": False, "use_cache": True, "attention_mask": attn}
     eos = getattr(model.config, "eos_token_id", None)
@@ -366,7 +408,11 @@ def shard_load(cfg: dict) -> dict:
     from transformers import AutoModelForCausalLM
     sid = cfg["id"]; start, end = int(cfg["start"]), int(cfg["end"])
     first, last = bool(cfg.get("first")), bool(cfg.get("last"))
-    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV).eval()
+    # TODO(review): this still materializes the FULL model on-device before slicing to this stage's blocks,
+    # which defeats the "too big for one machine" story (and can OOM). low_cpu_mem_usage=True keeps the CPU
+    # staging buffer small; the full fix is per-layer loading (meta device + device_map, or a pre-split
+    # checkpoint) so a stage never instantiates the whole model's weights.
+    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
     arch = _shard_arch(model)
     mc = model.config
     shard: dict = {"arch": arch, "first": first, "last": last, "start": start, "end": end,
@@ -441,6 +487,10 @@ def shard_forward(payload: dict) -> dict:
             if last:
                 h = shard["ln_f"](h)
         else:  # llama-style: recompute RoPE cos/sin + a causal mask exactly as LlamaModel.forward does,
+            # TODO(review): this feeds ONE full-causal mask to every layer, which is correct for standard
+            # Llama/Qwen/SmolLM/TinyLlama but WRONG for sliding-window / mixed-attention models (Mistral,
+            # Gemma-2/3, sliding Qwen2): those need per-layer masks dispatched by decoder_layer.attention_type
+            # (create_sliding_window_causal_mask for the sliding layers). Reject such configs until supported.
             from transformers.masking_utils import create_causal_mask  # so the layers see identical inputs
             if first:
                 h = shard["embed_tokens"](ids)  # [1, seq, hidden] — RoPE is applied per-layer, not here
@@ -493,69 +543,103 @@ async def run():
                 await ws.send(json.dumps({"t": "register", "joinToken": A.token, "pubkey": PUBKEY_B64,
                                           "node": {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}}))
                 key = None
+                # websockets requires writes to be serialized, and handlers now run concurrently (below), so
+                # every send goes through this lock.
+                send_lock = asyncio.Lock()
+                inflight_tasks: set = set()
+                async def ws_send(obj):
+                    async with send_lock:
+                        await ws.send(json.dumps(obj))
+                def spawn(coro):
+                    # Dispatch a handler OFF the read loop so one long generate/train can't head-of-line-block
+                    # frame reception or heartbeats. Compute still funnels through the single-thread TORCH_POOL,
+                    # so MPS access stays serialized — only the awaiting is concurrent, keeping the loop live.
+                    task = asyncio.ensure_future(coro)
+                    inflight_tasks.add(task); task.add_done_callback(inflight_tasks.discard)
+
+                async def handle_assign(mm):
+                    t0 = time.perf_counter()
+                    try:
+                        req = json.loads(unseal(key, mm["sealedIn"]).decode())
+                        out = await loop.run_in_executor(TORCH_POOL, compute_shard, req)  # off the event loop
+                        sealed = seal(key, json.dumps({"out": f32_to_b64(out)}).encode())
+                        await ws_send({"t": "result", "shardId": mm["shardId"], "jobId": mm["jobId"], "ok": True,
+                                       "sealedOut": sealed, "sig": sign_result(mm["shardId"], sealed),
+                                       "ms": (time.perf_counter() - t0) * 1000, "backend": BACKEND})
+                    except Exception as e:
+                        await ws_send({"t": "result", "shardId": mm.get("shardId"), "jobId": mm.get("jobId"), "ok": False, "error": str(e)})
+
+                async def handle_relay(kind, mm):  # relayed RPCs: fine-tuning ('train') / resident serving + pipeline sharding ('model')
+                    reqId = mm.get("reqId"); reply = f"{kind}_reply"
+                    dispatch = train_dispatch if kind == "train" else model_dispatch
+                    try:
+                        payload = json.loads(unseal(key, mm["sealed"]).decode())
+                        res = await loop.run_in_executor(TORCH_POOL, dispatch, mm["op"], payload)
+                        sealed = seal(key, json.dumps(res).encode())
+                        await ws_send({"t": reply, "reqId": reqId, "ok": True, "sealed": sealed})
+                    except Exception as e:
+                        await ws_send({"t": reply, "reqId": reqId, "ok": False, "error": str(e)})
+
+                async def handle_cache(mm):
+                    try:
+                        w = json.loads(unseal(key, mm["sealed"]).decode())
+                        rows, cols = int(w["rows"]), int(w["cols"])
+                        if w.get("dtype") == "f16":
+                            ten = torch.from_numpy(np.frombuffer(b64d(w["data"]), dtype="<f2").copy()).reshape(rows, cols).to(DEV)
+                        else:
+                            ten = b64_to_t(w["data"]).reshape(rows, cols).to(DEV)
+                        resident[mm["id"]] = ten
+                        await ws_send({"t": "cached", "id": mm["id"], "ok": True})
+                    except Exception as e:
+                        await ws_send({"t": "cached", "id": mm.get("id"), "ok": False, "error": str(e)})
 
                 async def heartbeat():
                     while True:
                         await asyncio.sleep(4)
                         try:
-                            await ws.send(json.dumps({"t": "heartbeat", "id": NAME, "load1": 0, "cores": os.cpu_count() or 4,
-                                                      "util": 0.0, "duty": 0.0 if paused else ceil, "ceil": ceil,
-                                                      "paused": paused, "pausedReason": pause_reason, "schedule": "always"}))
+                            await ws_send({"t": "heartbeat", "id": NAME, "load1": 0, "cores": os.cpu_count() or 4,
+                                           "util": 0.0, "duty": 0.0 if paused else ceil, "ceil": ceil,
+                                           "paused": paused, "pausedReason": pause_reason, "schedule": "always"})
                         except Exception:
                             return
                 hb = asyncio.ensure_future(heartbeat())
                 try:
                     async for raw in ws:
-                        m = json.loads(raw); t = m.get("t")
-                        if t == "denied":
-                            print(f"[torch-worker] rejected: {m.get('reason')}"); return
-                        elif t == "welcome":
-                            key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6))
-                            # fresh session: the coordinator forgets our resident state on disconnect, so a
-                            # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
-                            resident.clear(); MODELS.clear(); SHARDS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
-                            print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
-                        elif t == "control":
-                            if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
-                            if "ceil" in m and m["ceil"] is not None: ceil = float(m["ceil"])
-                            print(f"[torch-worker] admin control → {'PAUSED' if paused else 'active'} · ceiling {int(ceil*100)}%")
-                        elif t == "uncache":
-                            resident.pop(m.get("id"), None)
-                        elif t == "cache":
-                            try:
-                                w = json.loads(unseal(key, m["sealed"]).decode())
-                                rows, cols = int(w["rows"]), int(w["cols"])
-                                if w.get("dtype") == "f16":
-                                    ten = torch.from_numpy(np.frombuffer(b64d(w["data"]), dtype="<f2").copy()).reshape(rows, cols).to(DEV)
-                                else:
-                                    ten = b64_to_t(w["data"]).reshape(rows, cols).to(DEV)
-                                resident[m["id"]] = ten
-                                await ws.send(json.dumps({"t": "cached", "id": m["id"], "ok": True}))
-                            except Exception as e:
-                                await ws.send(json.dumps({"t": "cached", "id": m["id"], "ok": False, "error": str(e)}))
-                        elif t == "assign":
-                            t0 = time.perf_counter()
-                            try:
-                                req = json.loads(unseal(key, m["sealedIn"]).decode())
-                                out = await loop.run_in_executor(TORCH_POOL, compute_shard, req)  # off the event loop
-                                sealed = seal(key, json.dumps({"out": f32_to_b64(out)}).encode())
-                                await ws.send(json.dumps({"t": "result", "shardId": m["shardId"], "jobId": m["jobId"], "ok": True,
-                                                          "sealedOut": sealed, "sig": sign_result(m["shardId"], sealed),
-                                                          "ms": (time.perf_counter() - t0) * 1000, "backend": BACKEND}))
-                            except Exception as e:
-                                await ws.send(json.dumps({"t": "result", "shardId": m["shardId"], "jobId": m["jobId"], "ok": False, "error": str(e)}))
-                        elif t in ("train", "model"):  # relayed RPCs: fine-tuning (op=load|step|adapter) / resident-model serving (op=load|forward) / pipeline sharding (op=shard_load|shard_forward|shard_unload)
-                            reqId = m.get("reqId"); reply = f"{t}_reply"
-                            dispatch = train_dispatch if t == "train" else model_dispatch
-                            try:
-                                payload = json.loads(unseal(key, m["sealed"]).decode())
-                                res = await loop.run_in_executor(TORCH_POOL, dispatch, m["op"], payload)
-                                sealed = seal(key, json.dumps(res).encode())
-                                await ws.send(json.dumps({"t": reply, "reqId": reqId, "ok": True, "sealed": sealed}))
-                            except Exception as e:
-                                await ws.send(json.dumps({"t": reply, "reqId": reqId, "ok": False, "error": str(e)}))
+                        # A single malformed/unexpected frame must NOT tear down the session (that would wipe
+                        # all resident models/weights) — parse + dispatch under a guard, log and skip on error.
+                        try:
+                            m = json.loads(raw); t = m.get("t")
+                            if t == "denied":
+                                reason = str(m.get("reason", ""))
+                                # Only a permanent rejection is fatal. A transient 'worker id already registered'
+                                # (e.g. after a network blip, before the coordinator reaped our old socket) must
+                                # retry the connect loop instead of exiting the worker permanently.
+                                if ("bad join token" in reason) or ("removed by admin" in reason):
+                                    print(f"[torch-worker] rejected (fatal): {reason}"); return
+                                print(f"[torch-worker] rejected: {reason} — retrying in 5s"); await asyncio.sleep(5); break
+                            elif t == "welcome":
+                                key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6))
+                                # fresh session: the coordinator forgets our resident state on disconnect, so a
+                                # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
+                                resident.clear(); MODELS.clear(); SHARDS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
+                                print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
+                            elif t == "control":
+                                if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
+                                if "ceil" in m and m["ceil"] is not None: ceil = float(m["ceil"])
+                                print(f"[torch-worker] admin control → {'PAUSED' if paused else 'active'} · ceiling {int(ceil*100)}%")
+                            elif t == "uncache":
+                                resident.pop(m.get("id"), None)
+                            elif t == "cache":
+                                spawn(handle_cache(m))
+                            elif t == "assign":
+                                spawn(handle_assign(m))
+                            elif t in ("train", "model"):
+                                spawn(handle_relay(t, m))
+                        except Exception as e:
+                            print(f"[torch-worker] skipped bad frame: {e}")
                 finally:
                     hb.cancel()
+                    for task in list(inflight_tasks): task.cancel()
         except Exception as e:
             print(f"[torch-worker] disconnected ({e}); retrying in 2s"); await asyncio.sleep(2)
 
