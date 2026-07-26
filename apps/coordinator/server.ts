@@ -1661,18 +1661,18 @@ button.g{background:#0e1420;color:var(--fg);border-color:var(--line);font-weight
 <input id=tok type=password placeholder="admin token">
 <input id=model value="gpt2" placeholder="HF model (gpt2 · Qwen/Qwen2.5-0.5B …)">
 <input id=worker placeholder="worker (optional, e.g. colab-cuda)" style="min-width:150px">
-<label class=mut title="the coordinator fetches the weights and streams them to the worker — the worker never contacts the HF hub; staged in RAM where /dev/shm exists (Linux/Colab), else a transient temp dir (deleted after load). The response shows ram|disk."><input id=pushfree type=checkbox checked> download-free</label>
+<label class=mut title="OFF (default, fast): the worker downloads the model itself — quick on a machine with good internet (e.g. a Colab GPU). ON: the coordinator streams the weights so the worker never touches the HF hub and keeps nothing on its disk — but it's SLOWER (sealed streaming, ~minutes on Colab)."><input id=pushfree type=checkbox> download-free</label>
 <button onclick=load()>Load</button>
 <span id=status class=mut></span>
 </div>
 <div id=chat class=chat></div>
 <div class=bar>
 <input id=prompt placeholder="message…  (Enter to send)" onkeydown="if(event.key==='Enter')send()">
-<button onclick=send() id=sendb>Send</button>
+<button onclick=send() id=sendb disabled title="Load a model first — Send enables when it's ready">Send</button>
 <label class=mut>max <input id=mnt type=number value=96 style="width:64px"></label>
 <label class=mut><input id=samp type=checkbox> sample</label>
 </div>
-<p class=mut>With <b>download-free</b> on, the coordinator fetches the weights and streams them to the worker — the worker never touches the HF hub. It's staged in RAM on a worker with <code>/dev/shm</code> (Linux/Colab → <b>zero SSD</b>), or a transient temp dir otherwise (macOS), and deleted after load; the status line shows <code>ram</code> or <code>disk</code>. Off, the worker downloads the model itself. Streaming a heavy model the first time can take a minute.</p>
+<p class=mut><b>Load</b> a model, wait for the status to say <b>✓ ready</b> (Send stays disabled until then), then chat. Leave <b>download-free</b> <b>off</b> for quick interactive chat on a Colab GPU (the worker downloads the model itself — fast). Turn it <b>on</b> only when you want the fleet to touch <em>nothing</em> on disk — the coordinator streams the sealed weights (no HF hub on the worker, staged in RAM), which is slower (~minutes on Colab). Pin a specific <b>worker</b> to place the model.</p>
 </div>
 <script>
 var K='moregpu_admin_token',tokEl=document.getElementById('tok');tokEl.value=localStorage.getItem(K)||'';
@@ -1680,13 +1680,13 @@ tokEl.onchange=function(){localStorage.setItem(K,tokEl.value.trim());};
 function H(){return {'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||tokEl.value.trim())};}
 var MID=null;
 function add(role,text){var d=document.getElementById('chat'),el=document.createElement('div');el.className='msg '+role;el.textContent=text;d.appendChild(el);d.scrollTop=d.scrollHeight;return el;}
-function ready(m,r,s){MID=r.id||m;s.textContent='✓ '+MID+' on '+(r.worker||'?')+(r.device?' · '+r.device:'')+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'');}
+function ready(m,r,s){MID=r.id||m;var sb=document.getElementById('sendb');sb.disabled=false;sb.title='';s.textContent='✓ ready — '+MID+' on '+(r.worker||'?')+(r.device?' · '+r.device:'')+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'')+' — type a message and Send';}
 function poll(m,s,t0){fetch('/model/status?id='+encodeURIComponent(m),{headers:H()}).then(function(r){return r.json();}).then(function(r){
   if(r.status==='ready'){ready(m,r,s);return;}
   if(r.status==='error'){s.textContent='✗ '+r.error;return;}
   s.textContent='streaming '+m+'… '+Math.round((Date.now()-t0)/1000)+'s (weights → worker)';setTimeout(function(){poll(m,s,t0);},2000);
  }).catch(function(){setTimeout(function(){poll(m,s,t0);},2500);});}
-function load(){localStorage.setItem(K,tokEl.value.trim());var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),pf=document.getElementById('pushfree').checked,s=document.getElementById('status');s.textContent=(pf?'streaming ':'loading ')+m+'…';
+function load(){localStorage.setItem(K,tokEl.value.trim());MID=null;var sb=document.getElementById('sendb');sb.disabled=true;sb.title='Loading… Send enables when the model is ready';var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),pf=document.getElementById('pushfree').checked,s=document.getElementById('status');s.textContent=(pf?'streaming ':'loading ')+m+'… (Send disabled until ready)';
  // async for download-free (a big push outlives a public tunnel's request timeout) — return fast, then poll status
  var b={model:m,id:m,push:pf};if(wk)b.worker=wk;if(pf)b.async=true;
  fetch('/model/load',{method:'POST',headers:H(),body:JSON.stringify(b)}).then(function(r){return r.json();}).then(function(r){
