@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one pool over a public tunnel): the torch worker's WebSocket keepalive is now WAN-tolerant (`ping_timeout`
   90s, env-overridable) so a high-latency tunnel no longer drops it; and the Python SDK retries transient
   gateway errors (502/503/504, connection resets). **Verified live:** GPT-2 served on the Colab T4 through the
-  pool at ~44 tok/s (over the tunnel), token-for-token exact match; a 2-node CUDA+MPS fleet; GPT-2 shard stages
-  loaded across CUDA↔MPS. Honest finding: fp16 ≈ fp32 for small-model single-stream decode on the T4 (the GEMMs
-  are memory-bound; tensor cores only help large fp16 GEMMs).
+  pool at ~44 tok/s (over the tunnel), token-for-token exact match; a 2-node CUDA+MPS fleet; **heterogeneous
+  DiLoCo** training across the Colab CUDA GPU + the Mac MPS GPU (loss 4.45 → 1.64 over 3 rounds, coordinator
+  averaging); GPT-2 shard stages loaded across CUDA↔MPS. Honest finding: fp16 ≈ fp32 for small-model
+  single-stream decode on the T4 (the GEMMs are memory-bound; tensor cores only help large fp16 GEMMs).
 - Honesty: the CUDA/PTX matrix row now notes the torch worker **does run on CUDA via PyTorch** on NVIDIA
   (real acceleration for serving/training/sharding) — what's absent is *custom* CUDA/PTX kernels,
   tensor-core/int8 GEMM, and graphics/codec paths.
