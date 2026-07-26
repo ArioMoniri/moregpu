@@ -202,12 +202,16 @@ class MoreGPU:
         return self._req("/train/diloco/adapter", "POST", {})
 
     # ---- resident-model serving (fast: the WHOLE forward runs on the worker, one round-trip per token) ----
-    def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None) -> dict:
+    def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None,
+                   push: bool = False) -> dict:
+        # push=True → download-free: the coordinator streams the weights to the worker (no hub, no SSD on the worker).
         body: dict[str, Any] = {"model": model, "fp16": fp16}
         if id:
             body["id"] = id
         if worker:
             body["worker"] = worker
+        if push:
+            body["push"] = True
         return self._req("/model/load", "POST", body)
 
     def model_forward(self, input_ids: Sequence[int], id: str | None = None,

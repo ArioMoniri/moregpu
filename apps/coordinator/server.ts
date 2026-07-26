@@ -381,6 +381,114 @@ async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, Re
 const trainRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'train', pendingTrain, op, payload);
 const modelRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'model', pendingModel, op, payload);
 
+// ── DOWNLOAD-FREE resident load: the COORDINATOR (admin box) fetches the weights from HF over HTTPS and
+// streams the raw file bytes to the worker; the worker stages them (in RAM when it has /dev/shm — Linux/Colab
+// — else a transient temp dir) and loads with the hub disabled, so it never downloads anything. This keeps
+// "all weights on the admin, fleet = pure GPU compute". It's a ONE-TIME transfer (unlike the per-token
+// pipeline pipe), so it tolerates a slow/flaky tunnel far better.
+const HF_BASE = Deno.env.get('MOREGPU_HF_BASE') ?? 'https://huggingface.co';
+const PUSH_CHUNK = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_CHUNK') ?? (8 << 20))); // 8 MiB raw / chunk
+// Safety rail against a runaway/oversized repo OOM-ing the coordinator or a donated worker (default 20 GiB,
+// env-tunable). The index.json is metadata (KB) so it gets a much tighter cap of its own.
+const PUSH_MAX_BYTES = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_MAX_BYTES') ?? (20 * (1 << 30))));
+const PUSH_INDEX_MAX = 64 << 20; // a safetensors index is normally KB; refuse a multi-GB one before .text()
+// model id must be a plain HF repo ref (owner/name or a canonical alias) — it goes straight into a URL.
+const HF_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
+// the finite set of hub files a causal-LM load may need; each is fetched, and a 404 is simply skipped.
+const HF_AUX_FILES = ['config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json',
+  'special_tokens_map.json', 'vocab.json', 'merges.txt', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja'];
+const pushInFlight = new Set<string>(); // `${workerId}:${id}` currently being pushed — blocks a concurrent same-id race
+
+async function hfFetch(model: string, file: string): Promise<Response | null> {
+  const headers: Record<string, string> = {};
+  const tok = Deno.env.get('HF_TOKEN'); if (tok) headers['authorization'] = `Bearer ${tok}`;
+  const r = await fetch(`${HF_BASE}/${model}/resolve/main/${encodeURIComponent(file)}?download=true`, { headers, redirect: 'follow' });
+  if (r.status === 404 || r.status === 403) { await r.body?.cancel(); return null; }
+  if (!r.ok) { await r.body?.cancel(); throw new Error(`HF ${file} → HTTP ${r.status}`); }
+  return r;
+}
+
+// Read a small metadata file into a string, but refuse (before buffering) if it declares more than `max` bytes.
+async function hfFetchText(model: string, file: string, max: number): Promise<string | null> {
+  const r = await hfFetch(model, file);
+  if (!r) return null;
+  const len = Number(r.headers.get('content-length') ?? 0);
+  if (len > max) { await r.body?.cancel(); throw new Error(`${file} is ${len} bytes (> ${max} cap) — refusing to buffer`); }
+  const buf = new Uint8Array(await r.arrayBuffer());
+  if (buf.length > max) throw new Error(`${file} exceeded ${max} bytes — refusing`);
+  return new TextDecoder().decode(buf);
+}
+
+async function streamFileToWorker(w: Worker, id: string, name: string, resp: Response, budget: { left: number }): Promise<number> {
+  const reader = resp.body!.getReader();
+  let pending = new Uint8Array(0), seq = 0, total = 0;
+  const send = async (data: Uint8Array, last: boolean) => {
+    const r = await modelRPC(w, 'push_chunk', { id, name, seq: seq++, data: b64e(data), last });
+    if (!r.ok) throw new Error(`push_chunk ${name}#${seq}: ${r.error}`);
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length; budget.left -= value.length;
+    if (budget.left < 0) { await reader.cancel(); throw new Error(`weight push exceeded ${PUSH_MAX_BYTES}-byte cap (raise MOREGPU_PUSH_MAX_BYTES) — aborted`); }
+    const merged = new Uint8Array(pending.length + value.length); merged.set(pending); merged.set(value, pending.length);
+    pending = merged;
+    while (pending.length >= PUSH_CHUNK) { await send(pending.slice(0, PUSH_CHUNK), false); pending = pending.slice(PUSH_CHUNK); }
+  }
+  await send(pending, true); // final chunk (may be empty) → guarantees the file is created even if 0 bytes
+  return total;
+}
+
+async function pushModelToWorker(w: Worker, model: string, id: string, fp16: boolean): Promise<Record<string, unknown>> {
+  if (!HF_REPO_RE.test(model)) throw new Error(`bad model ref "${model}" — expected an HF repo id like "gpt2" or "Qwen/Qwen2.5-0.5B"`);
+  const guard = `${w.id}:${id}`;
+  if (pushInFlight.has(guard)) throw new Error(`a download-free push for "${id}" is already in progress on ${w.id} — wait for it to finish`);
+  pushInFlight.add(guard);
+  try {
+    // resolve the weight files: a sharded checkpoint lists them in an index; otherwise it's a single safetensors.
+    // The index itself MUST also be staged — transformers discovers shards only through model.safetensors.index.json.
+    let weightFiles: string[];
+    const indexText = await hfFetchText(model, 'model.safetensors.index.json', PUSH_INDEX_MAX);
+    if (indexText !== null) {
+      const idx = JSON.parse(indexText) as { weight_map?: Record<string, string> };
+      weightFiles = [...new Set(Object.values(idx.weight_map ?? {}))];
+      if (weightFiles.length === 0) throw new Error(`${model}: empty safetensors index`);
+    } else {
+      weightFiles = ['model.safetensors'];
+    }
+    const begin = await modelRPC(w, 'push_begin', { id, model });
+    if (!begin.ok) throw new Error(`push_begin failed: ${begin.error}`);
+    const budget = { left: PUSH_MAX_BYTES };
+    try {
+      let bytes = 0, sentWeights = 0;
+      for (const f of HF_AUX_FILES) {            // config + tokenizer/generation files (skip any that 404)
+        const resp = await hfFetch(model, f);
+        if (resp) bytes += await streamFileToWorker(w, id, f, resp, budget);
+      }
+      if (indexText !== null) {                  // stage the shard index too, so from_pretrained can find the shards
+        const b = new TextEncoder().encode(indexText);
+        const r = await modelRPC(w, 'push_chunk', { id, name: 'model.safetensors.index.json', seq: 0, data: b64e(b), last: true });
+        if (!r.ok) throw new Error(`push_chunk index: ${r.error}`); bytes += b.length;
+      }
+      for (const f of weightFiles) {             // the actual weights (single or sharded safetensors)
+        const resp = await hfFetch(model, f);
+        if (!resp) throw new Error(`weight file ${f} missing on HF (no safetensors?) — this model can't be pushed download-free`);
+        bytes += await streamFileToWorker(w, id, f, resp, budget); sentWeights++;
+      }
+      if (sentWeights === 0) throw new Error(`${model}: no weight files found`);
+      log('info', `weight-push ${model} → ${w.id}: streamed ${(bytes / 1e6).toFixed(1)} MB (${weightFiles.length} shard(s)), assembling…`);
+      const end = await modelRPC(w, 'push_end', { id, model, fp16 });
+      if (!end.ok) throw new Error(`push_end failed: ${end.error}`);
+      return end.data ?? {};
+    } catch (e) {
+      await modelRPC(w, 'unload', { id }).catch(() => {}); // best-effort: drop any partial staging on the worker
+      throw e;
+    }
+  } finally {
+    pushInFlight.delete(guard);
+  }
+}
+
 // --- DiLoCo: the coordinator is the parameter server. It holds the GLOBAL adapter + an outer Nesterov
 // momentum buffer; each round it averages the workers' post-inner-step adapters, applies the outer step,
 // and broadcasts the new global. This is the genuine reduce path (matmul pooling only concatenates). ---
@@ -807,15 +915,25 @@ async function handler(req: Request): Promise<Response> {
   //   POST /model/load     { model, id?, fp16?, worker? }
   //   POST /model/forward  { id, input_ids:[...], return_logits?, topk? }  → { argmax, logits?, top? }
   if (req.method === 'POST' && url.pathname === '/model/load') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; fp16?: boolean; worker?: string };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; fp16?: boolean; worker?: string; push?: boolean };
     if (!body.model) return json({ error: 'need {model}' }, 400);
     const cands = torchWorkers();
     if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; resident-model serving needs one' }, 503);
     const w = body.worker ? cands.find((x) => x.id === body.worker) : cands[0];
     if (!w) return json({ error: `torch worker ${body.worker} not active` }, 404);
-    const r = await modelRPC(w, 'load', { model: body.model, id: body.id ?? body.model, fp16: !!body.fp16 });
+    const mid = body.id ?? body.model;
+    if (body.push) {
+      // download-free: coordinator fetches the weights and streams them to the worker (no hub access on the worker)
+      try {
+        const info = await pushModelToWorker(w, body.model, mid, !!body.fp16);
+        modelHome.set(String(info.id ?? mid), w.id);
+        log('info', `resident model ${info.id ?? mid} weight-pushed to ${w.id} · ${info.n_params} params · staging=${info.staging}`);
+        return json({ ok: true, worker: w.id, ...info });
+      } catch (e) { return json({ error: `weight push failed: ${e instanceof Error ? e.message : e}` }, 502); }
+    }
+    const r = await modelRPC(w, 'load', { model: body.model, id: mid, fp16: !!body.fp16 });
     if (!r.ok) return json({ error: r.error }, 502);
-    modelHome.set(String(r.data?.id ?? body.id ?? body.model), w.id);
+    modelHome.set(String(r.data?.id ?? mid), w.id);
     log('info', `resident model ${r.data?.id} loaded on ${w.id} · ${r.data?.n_params} params`);
     return json({ ok: true, worker: w.id, ...r.data });
   }
@@ -1191,6 +1309,7 @@ button.g{background:#0e1420;color:var(--fg);border-color:var(--line);font-weight
 <input id=tok type=password placeholder="admin token">
 <input id=model value="gpt2" placeholder="HF model (gpt2 · Qwen/Qwen2.5-0.5B …)">
 <input id=worker placeholder="worker (optional, e.g. colab-cuda)" style="min-width:150px">
+<label class=mut title="the coordinator fetches the weights and streams them to the worker — the worker never contacts the HF hub; staged in RAM where /dev/shm exists (Linux/Colab), else a transient temp dir (deleted after load). The response shows ram|disk."><input id=pushfree type=checkbox checked> download-free</label>
 <button onclick=load()>Load</button>
 <span id=status class=mut></span>
 </div>
@@ -1201,7 +1320,7 @@ button.g{background:#0e1420;color:var(--fg);border-color:var(--line);font-weight
 <label class=mut>max <input id=mnt type=number value=96 style="width:64px"></label>
 <label class=mut><input id=samp type=checkbox> sample</label>
 </div>
-<p class=mut>Weights load and run on the chosen worker's GPU — pin a Colab worker so nothing lands on your laptop. Loading a heavy model the first time can take a minute.</p>
+<p class=mut>With <b>download-free</b> on, the coordinator fetches the weights and streams them to the worker — the worker never touches the HF hub. It's staged in RAM on a worker with <code>/dev/shm</code> (Linux/Colab → <b>zero SSD</b>), or a transient temp dir otherwise (macOS), and deleted after load; the status line shows <code>ram</code> or <code>disk</code>. Off, the worker downloads the model itself. Streaming a heavy model the first time can take a minute.</p>
 </div>
 <script>
 var K='moregpu_admin_token',tokEl=document.getElementById('tok');tokEl.value=localStorage.getItem(K)||'';
@@ -1209,10 +1328,10 @@ tokEl.onchange=function(){localStorage.setItem(K,tokEl.value.trim());};
 function H(){return {'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||tokEl.value.trim())};}
 var MID=null;
 function add(role,text){var d=document.getElementById('chat'),el=document.createElement('div');el.className='msg '+role;el.textContent=text;d.appendChild(el);d.scrollTop=d.scrollHeight;return el;}
-function load(){localStorage.setItem(K,tokEl.value.trim());var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),s=document.getElementById('status');s.textContent='loading '+m+'…';
- var b={model:m,id:m};if(wk)b.worker=wk;
+function load(){localStorage.setItem(K,tokEl.value.trim());var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),pf=document.getElementById('pushfree').checked,s=document.getElementById('status');s.textContent=(pf?'streaming ':'loading ')+m+'…';
+ var b={model:m,id:m,push:pf};if(wk)b.worker=wk;
  fetch('/model/load',{method:'POST',headers:H(),body:JSON.stringify(b)}).then(function(r){return r.json();}).then(function(r){
-  if(r.error){s.textContent='✗ '+r.error;return;}MID=r.id||m;s.textContent='✓ '+MID+' on '+r.worker+' · '+r.device+' · '+((r.n_params||0)).toLocaleString()+' params';}).catch(function(e){s.textContent='✗ '+e;});}
+  if(r.error){s.textContent='✗ '+r.error;return;}MID=r.id||m;s.textContent='✓ '+MID+' on '+r.worker+' · '+r.device+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'');}).catch(function(e){s.textContent='✗ '+e;});}
 function send(){var p=document.getElementById('prompt'),text=p.value.trim();if(!text)return;if(!MID){alert('Load a model first (top bar).');return;}
  add('user',text);p.value='';var rep=add('bot','…'),sb=document.getElementById('sendb');sb.disabled=true;
  var body={id:MID,prompt:text,max_new_tokens:(+document.getElementById('mnt').value)||96,do_sample:document.getElementById('samp').checked};

@@ -226,13 +226,20 @@ class MoreGPU:
         return self._req("/train/diloco/adapter", "POST", {})
 
     # ---- resident-model serving (fast: the WHOLE forward runs on the worker, one round-trip per token) ----
-    def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None) -> dict:
-        """Pin a whole model on a torch worker (frozen, eval). Needs apps/worker/worker_torch.py."""
+    def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None,
+                   push: bool = False) -> dict:
+        """Pin a whole model on a torch worker (frozen, eval). Needs apps/worker/worker_torch.py.
+
+        push=True → DOWNLOAD-FREE: the coordinator fetches the weights from HF and streams them to the
+        worker, which never touches the hub and stages them in RAM (zero SSD). One-time transfer, so it
+        survives a slow/flaky tunnel far better than the per-token pipe."""
         body: dict[str, Any] = {"model": model, "fp16": fp16}
         if id:
             body["id"] = id
         if worker:
             body["worker"] = worker
+        if push:
+            body["push"] = True
         return self._req("/model/load", "POST", body)
 
     def model_forward(self, input_ids: Sequence[int], id: str | None = None,

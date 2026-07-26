@@ -330,6 +330,91 @@ def model_load(cfg: dict) -> dict:
             "dtype": "f16" if fp16_effective else "f32", "fp16_requested": fp16_requested,
             "fp16_effective": fp16_effective, "device": DEV}
 
+# ---------------------------------------------------------------------------
+# DOWNLOAD-FREE resident load ("weight push"): the WORKER never contacts the HF hub. The coordinator
+# (the admin box, where "all weights live") fetches config + safetensors + tokenizer over HTTPS ONCE and
+# streams the raw file bytes here in sealed chunks. We stage them in a RAM-backed dir (/dev/shm when
+# present → zero SSD) and load with from_pretrained(local_files_only=True) — HF's OWN loader, so
+# key-remapping / tied weights / sharded checkpoints / tokenizer all "just work" for any model family —
+# then delete the staging dir, leaving only the on-device model. The fleet stays a pure GPU compute
+# provider: no hub download, and no SSD write on a tmpfs-backed box. Unlike the per-token pipeline pipe,
+# this is a ONE-TIME transfer, so it survives a slow/flaky tunnel far better.
+# ---------------------------------------------------------------------------
+PUSH: dict = {}  # id -> {"dir": staging path, "bytes": total written, "ram": bool}
+# Safety rail: refuse to stage more than this many bytes into the (possibly RAM-backed) staging dir, so a
+# runaway/oversized push can't OOM this donated machine. Env-tunable; matches the coordinator's cap.
+PUSH_MAX_BYTES = int(os.environ.get("MOREGPU_PUSH_MAX_BYTES", str(20 * 1024 ** 3)))
+
+def _stage_root() -> str:
+    """Prefer a RAM-backed filesystem so streamed weights never touch SSD; fall back to the OS temp dir."""
+    import tempfile
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return tempfile.gettempdir()
+
+def _push_cleanup(mid) -> None:
+    import shutil
+    st = PUSH.pop(mid, None)
+    if st and os.path.isdir(st["dir"]):
+        shutil.rmtree(st["dir"], ignore_errors=True)
+
+def model_push_begin(payload: dict) -> dict:
+    import tempfile
+    mid = payload.get("id") or payload.get("model")
+    _push_cleanup(mid)  # drop any stale half-streamed staging for this id
+    root = _stage_root()
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in str(mid))[:40]
+    d = tempfile.mkdtemp(prefix=f"moregpu-{safe}-", dir=root)
+    PUSH[mid] = {"dir": d, "bytes": 0, "ram": root == "/dev/shm"}
+    return {"ok": True, "id": mid, "staging": "ram" if root == "/dev/shm" else "disk"}
+
+def model_push_chunk(payload: dict) -> dict:
+    mid = payload.get("id"); st = PUSH.get(mid)
+    if st is None:
+        raise RuntimeError("push not begun — call push_begin first")
+    name = os.path.basename(str(payload["name"]))  # sanitize: strip any path components (no traversal)
+    if not name or name in (".", ".."):
+        raise RuntimeError(f"bad staged file name {payload.get('name')!r}")
+    raw = base64.b64decode(payload["data"])
+    if st["bytes"] + len(raw) > PUSH_MAX_BYTES:  # rail against a runaway push OOM-ing this donated box
+        _push_cleanup(mid)
+        raise RuntimeError(f"push exceeds {PUSH_MAX_BYTES}-byte staging cap (raise MOREGPU_PUSH_MAX_BYTES) — aborted")
+    with open(os.path.join(st["dir"], name), "ab") as f:  # fresh mkdtemp dir → 'ab' == create; chunks arrive in order
+        f.write(raw)
+    st["bytes"] += len(raw)
+    return {"ok": True, "bytes": st["bytes"]}
+
+def model_push_end(payload: dict) -> dict:
+    """Assemble the model from the staged files (HF's loader, hub disabled), pin it on-device, cache its
+    tokenizer from the SAME staged files (so model_chat never has to reach the hub), then delete staging."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+    mid = payload.get("id"); st = PUSH.get(mid)
+    if st is None:
+        raise RuntimeError("push not begun — call push_begin first")
+    d = st["dir"]
+    fp16_requested = bool(payload.get("fp16")); fp16_effective = fp16_requested and DEV != "cpu"
+    try:
+        if mid not in MODELS and len(MODELS) >= MAX_RESIDENT_MODELS:
+            MODELS.pop(next(iter(MODELS)), None); _empty_cache()  # evict LRU BEFORE allocating (peak ≤ cap)
+        model = AutoModelForCausalLM.from_pretrained(
+            d, dtype=torch.float16 if fp16_effective else torch.float32, local_files_only=True).to(DEV).eval()
+        MODELS.pop(mid, None); MODELS[mid] = model  # (re)insert as most-recent
+        MODEL_NAMES[mid] = payload.get("model", mid)
+        _TOKS.pop(mid, None)
+        try:  # pre-load the tokenizer from the staged files; if none were shipped, forward/generate still work
+            _TOKS[mid] = AutoTokenizer.from_pretrained(d, local_files_only=True)
+        except Exception:
+            _TOKS[mid] = None  # model_chat raises a clear error; token-id paths are unaffected
+        c = AutoConfig.from_pretrained(d, local_files_only=True)
+        return {"ok": True, "id": mid, "device": DEV, "mode": "download-free",
+                "n_layer": getattr(c, "n_layer", getattr(c, "num_hidden_layers", None)),
+                "n_params": sum(p.numel() for p in model.parameters()),
+                "dtype": "f16" if fp16_effective else "f32", "fp16_requested": fp16_requested,
+                "fp16_effective": fp16_effective, "bytes": st["bytes"],
+                "staging": "ram" if st["ram"] else "disk", "tokenizer": _TOKS.get(mid) is not None}
+    finally:
+        _push_cleanup(mid)  # weights are resident on-device now — drop the staged copy (RAM or disk)
+
 def model_forward(payload: dict) -> dict:
     mid = payload.get("id")
     model = MODELS.get(mid)
@@ -536,6 +621,9 @@ def model_chat(payload: dict) -> dict:
     if mid not in _TOKS:
         _TOKS[mid] = AutoTokenizer.from_pretrained(MODEL_NAMES.get(mid, mid))
     tk = _TOKS[mid]
+    if tk is None:  # download-free push shipped no tokenizer files — don't reach the hub; steer to token-id API
+        raise RuntimeError("no tokenizer for this download-free model — use /model/generate with token ids, "
+                           "or re-push including the tokenizer files")
     prompt = str(payload.get("prompt", ""))[:8000]
     if getattr(tk, "chat_template", None):  # instruct models (e.g. Qwen-Instruct) → use their chat format
         text = tk.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
@@ -561,11 +649,14 @@ def model_chat(payload: dict) -> dict:
 
 def model_dispatch(op: str, payload: dict) -> dict:
     if op == "load": return model_load(payload)
+    if op == "push_begin": return model_push_begin(payload)
+    if op == "push_chunk": return model_push_chunk(payload)
+    if op == "push_end": return model_push_end(payload)
     if op == "forward": return model_forward(payload)
     if op == "generate": return model_generate(payload)
     if op == "chat": return model_chat(payload)
     if op == "arch": return model_arch(payload)
-    if op == "unload": MODELS.pop(payload.get("id"), None); MODEL_NAMES.pop(payload.get("id"), None); _TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
+    if op == "unload": _push_cleanup(payload.get("id")); MODELS.pop(payload.get("id"), None); MODEL_NAMES.pop(payload.get("id"), None); _TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     if op == "shard_load": return shard_load(payload)
     if op == "shard_forward": return shard_forward(payload)
     if op == "shard_unload": SHARDS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
@@ -665,6 +756,7 @@ async def run():
                                 key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6))
                                 # fresh session: the coordinator forgets our resident state on disconnect, so a
                                 # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
+                                for _pid in list(PUSH): _push_cleanup(_pid)  # drop any staged (un-finished) weight pushes
                                 resident.clear(); MODELS.clear(); SHARDS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":
