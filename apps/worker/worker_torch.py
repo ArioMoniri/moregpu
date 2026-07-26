@@ -114,6 +114,22 @@ def compute_shard(req: dict) -> torch.Tensor:
 # All torch work (kernels + training) runs on ONE background thread: keeps the event loop free for
 # heartbeats/other frames, and serializes MPS access (a single Metal context is not safe across threads).
 TORCH_POOL = ThreadPoolExecutor(max_workers=1)
+
+# Compute ops that count toward the node's DUTY (the admin slider's ceiling throttles these — a kernel shard,
+# a resident/pipeline forward, a training step). Transfer/control ops (push_*/ping/load/unload/arch) are never
+# throttled (throttling a weight stream would just make loading slower for no benefit).
+_PACED_OPS = {"forward", "generate", "chat", "shard_forward", "inner", "step"}
+def _paced(fn, args, ceil_val, pace_it=True):
+    """Run a compute op on the TORCH_POOL thread, then, if the duty ceiling < 100%, sleep so the thread is busy
+    at most `ceil_val` of the time — a real duty-cycle throttle. Since the pool is single-threaded, sleeping here
+    genuinely paces ALL of this node's compute (kernels + serving + sharding), so the admin slider now DOES
+    something: a lower ceiling → the node contributes more slowly, leaving the rest of its time to its owner."""
+    t0 = time.perf_counter(); r = fn(*args); dt = time.perf_counter() - t0
+    if pace_it and ceil_val < 0.999:
+        pace = min(10.0, dt * (1.0 / max(0.05, ceil_val) - 1.0))  # idle time to hold busy-fraction ≈ ceil (capped 10s)
+        if pace > 0.001:
+            time.sleep(pace)
+    return r
 MAX_RESIDENT_MODELS = int(os.environ.get("MOREGPU_MAX_RESIDENT_MODELS", "2"))  # bound VRAM: LRU-evict beyond this
 
 def _empty_cache():
@@ -716,7 +732,7 @@ async def run():
                     t0 = time.perf_counter()
                     try:
                         req = json.loads(unseal(key, mm["sealedIn"]).decode())
-                        out = await loop.run_in_executor(TORCH_POOL, compute_shard, req)  # off the event loop
+                        out = await loop.run_in_executor(TORCH_POOL, _paced, compute_shard, (req,), ceil)  # off the event loop, throttled to the duty ceiling
                         sealed = seal(key, json.dumps({"out": f32_to_b64(out)}).encode())
                         await ws_send({"t": "result", "shardId": mm["shardId"], "jobId": mm["jobId"], "ok": True,
                                        "sealedOut": sealed, "sig": sign_result(mm["shardId"], sealed),
@@ -729,7 +745,7 @@ async def run():
                     dispatch = train_dispatch if kind == "train" else model_dispatch
                     try:
                         payload = json.loads(unseal(key, mm["sealed"]).decode())
-                        res = await loop.run_in_executor(TORCH_POOL, dispatch, mm["op"], payload)
+                        res = await loop.run_in_executor(TORCH_POOL, _paced, dispatch, (mm["op"], payload), ceil, mm["op"] in _PACED_OPS)
                         sealed = seal(key, json.dumps(res).encode())
                         await ws_send({"t": reply, "reqId": reqId, "ok": True, "sealed": sealed})
                     except Exception as e:
