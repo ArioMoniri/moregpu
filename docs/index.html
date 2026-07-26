@@ -127,7 +127,7 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 <h2>Compute kernels</h2>
 <div class="card">
   <span class="k">matmul</span><span class="k">vector_add</span><span class="k">vector_mul</span>
-  <span class="k">saxpy</span><span class="k">relu</span><span class="k">scale</span>
+  <span class="k">saxpy</span><span class="k">relu</span><span class="k">gelu</span><span class="k">scale</span>
   <span class="k">softmax</span><span class="k">layernorm</span>
   <p class="mut" style="margin:12px 0 0">Enough to compose a real attention block and small MLPs (all fp32, verified). Extensible — add a WGSL kernel plus a CPU reference to support a new op. See <a href="https://github.com/ArioMoniri/moregpu/blob/main/docs/AI_USAGE.md">AI usage</a>.</p>
 </div>
@@ -140,15 +140,17 @@ Every pool mints its <b>own</b> secrets on first run and writes them to <code>.m
 <tr><td>Dense fp32 matmul / GEMM</td><td class="y">✅</td><td>Workgroup-tiled WGSL GEMM <b>on the GPU</b> (shared-memory tiling), verified. fp32 only, <b>no tensor cores</b> → correct but slower than cuBLAS.</td></tr>
 <tr><td>Elementwise + activations</td><td class="y">✅</td><td>add / mul / scale / saxpy / relu / <b>gelu</b> — WGSL kernels that run <b>on the GPU</b> on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU.</td></tr>
 <tr><td>Softmax / LayerNorm</td><td class="y">✅</td><td>Row-wise WGSL reductions <b>on the GPU</b> on a GPU worker (CPU otherwise), match a CPU reference to ~1e-8.</td></tr>
-<tr><td>Scaled dot-product attention (1 head)</td><td class="p">🧩</td><td><code>matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)</code> — verified. Not flash-attention; no KV cache.</td></tr>
+<tr><td>Scaled dot-product attention (1 head)</td><td class="p">🧩</td><td><code>matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)</code> — verified. Not flash-attention, but the GPT-2 demo adds a client-side KV cache.</td></tr>
 <tr><td>Transformer block / small MLP inference</td><td class="p">🧩</td><td>Compose LN → matmuls → attention → FFN from the SDK; split a model across workers with weight residency.</td></tr>
-<tr><td>Small LLM (real GPT-2 124M)</td><td class="pa">🟡</td><td><b>A real GPT-2 runs on the pool</b> (<code>examples/llm_infer.py</code>) and matches Hugging Face token-for-token. Slow — activations round-trip per layer (~seconds/token).</td></tr>
+<tr><td>Small LLM (real GPT-2 124M)</td><td class="pa">🟡→✅</td><td><b>A real GPT-2 runs on the pool</b> (<code>examples/llm_infer.py</code>) matching Hugging Face token-for-token, now with a client-side <b>KV cache</b>. On the native torch worker the resident-model path serves at up to <b>~66 tok/s</b> warm on an unloaded machine (~6–23 tok/s under load), exact match (<code>examples/llm_serve.py</code>).</td></tr>
+<tr><td>Fast small-LLM serving (low latency)</td><td class="pa">🟡</td><td>The new <b>native torch worker</b> (<code>apps/worker/worker_torch.py</code>, Apple MPS / CUDA) holds a model resident on-device and runs the whole forward per call — one round-trip per token, exact match. Opt-in native tier, not the zero-install WGSL worker.</td></tr>
+<tr><td>Training / fine-tuning (LoRA)</td><td class="pa">🟡</td><td><b>LoRA fine-tuning</b> on the torch worker — single-worker (<code>examples/lora_finetune.py</code>) and <b>distributed across N workers via DiLoCo</b> (<code>examples/lora_distributed.py</code>): each worker trains its own shard, the coordinator averages adapters + an outer Nesterov step. Both verified out-of-band, bit-for-bit vs a seeded reference. Synchronous DiLoCo; async + secure aggregation are next.</td></tr>
+<tr><td>Modern architectures (RMSNorm/RoPE/SwiGLU/GQA)</td><td class="pa">🟡</td><td><b>Qwen3-0.6B runs on the pool</b> matching Hugging Face token-for-token (<code>examples/generic_infer.py</code>). Forward-only, ~minutes/token — a portability proof, not a speed win.</td></tr>
 <tr><td>Large / out-of-core matmul</td><td class="pa">🟡</td><td>Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink.</td></tr>
-<tr><td>Big / fast LLM inference (7B+, low latency)</td><td class="n">❌</td><td>fp32/fp16 weights, no int8/tensor cores, no KV cache, activations cross the network — needs a native fp16/CUDA worker (roadmap).</td></tr>
-<tr><td>Training (autograd / backprop)</td><td class="n">❌</td><td>No autograd or optimizer kernels. Not a training platform.</td></tr>
+<tr><td>Big-model inference across machines (pipeline sharding)</td><td class="pa">🟡</td><td><b>Pipeline-parallel sharding</b> (<code>examples/llm_shard.py</code>): split a model's transformer layers into contiguous stages, one per torch worker, piping only <b>activations</b> (never weights) — the low-bandwidth path. Demoed with GPT-2 split 6+6 across 2 workers, exact match to transformers; each worker holds only its stage. GPT-2-family only so far; no int8/tensor cores.</td></tr>
 <tr><td>CUDA/PTX · Stable Diffusion · NVENC · tensor cores</td><td class="n">❌</td><td>WGSL backend, compute-only, fp32 — these paths don't exist.</td></tr>
 </table>
-<p class="mut" style="margin:8px 0 0">It runs the small, correct primitive set it ships on your real GPU with verified results, and lets you <b>compose</b> them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.</p>
+<p class="mut" style="margin:8px 0 0">It runs the small, correct primitive set it ships on your real GPU with verified results, and lets you <b>compose</b> them into attention, transformer blocks, and small classifiers. An opt-in native torch worker adds device-resident model serving (fast GPT-2, exact match) and LoRA fine-tuning — single-worker and distributed (DiLoCo). It is still not a drop-in for big-model (7B+) inference, tensor-core speed, CUDA kernels, or graphics.</p>
 </div>
 
 <h2>Admin dashboard</h2>

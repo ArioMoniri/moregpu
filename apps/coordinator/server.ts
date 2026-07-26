@@ -216,6 +216,11 @@ function wireWorker(ws: WebSocket) {
     } else if (m.t === 'cached') {
       if (!registered) return;
       const cb = pendingCache.get(String(m.id)); if (cb) { pendingCache.delete(String(m.id)); cb({ ok: !!m.ok, error: m.error as string | undefined }); }
+    } else if (m.t === 'train_reply' || m.t === 'model_reply') {
+      if (!registered) return;
+      const pm = m.t === 'train_reply' ? pendingTrain : pendingModel;
+      const e = pm.get(String(m.reqId));
+      if (e && e.workerId === id) { pm.delete(String(m.reqId)); e.cb({ ok: !!m.ok, sealed: m.sealed as { iv: string; ct: string } | undefined, error: m.error as string | undefined }); } // reject a reply for another worker's RPC
     } else if (m.t === 'result') {
       if (!registered) return;
       const p = pending.get(String(m.shardId));
@@ -237,8 +242,16 @@ function wireWorker(ws: WebSocket) {
     workers.delete(id);
     // reject any shard still in flight on this worker so the job fails fast instead of hanging the queue
     for (const [sid, p] of pending) if (p.workerId === id) { pending.delete(sid); p.reject(new Error(`worker ${id} disconnected mid-shard`)); }
+    // same for in-flight train/model relay RPCs (else the awaiting HTTP handler hangs until the 120s timeout)
+    for (const [rid, e] of pendingTrain) if (e.workerId === id) { pendingTrain.delete(rid); e.cb({ ok: false, error: `worker ${id} disconnected mid-rpc` }); }
+    for (const [rid, e] of pendingModel) if (e.workerId === id) { pendingModel.delete(rid); e.cb({ ok: false, error: `worker ${id} disconnected mid-rpc` }); }
     // drop weights that lived on this worker — they must be re-uploaded (the coordinator forgets its home)
     for (const [wid, home] of weightHome) if (home.worker === id) { weightHome.delete(wid); weightStore.delete(wid); }
+    // forget any resident model / training session that lived here
+    if (trainingHome === id) trainingHome = null;
+    for (const [mid, wid] of modelHome) if (wid === id) modelHome.delete(mid);
+    // a pipeline stage that lived here breaks the whole pipe → drop any shard plan that used this worker
+    for (const [sid, plan] of shardPlans) if (plan.stages.some((s) => s.worker === id)) shardPlans.delete(sid);
     log('info', `worker left: ${id} · fleet=${workers.size}`);
   };
   ws.onerror = () => log('warn', `socket error${id ? ' from ' + id : ''}`);
@@ -318,6 +331,54 @@ interface JobRec { id: string; status: JobStatus; kernel: string; size: number; 
 interface JobInput { a?: Float32Array; b?: Float32Array; scalar?: number; M?: number; N?: number; K?: number; bRef?: string; }
 const residentCount = (wid: string) => [...weightHome.values()].filter((h) => h.worker === wid).length;
 const pendingCache = new Map<string, (r: { ok: boolean; error?: string }) => void>(); // /weights waits for the worker's ack
+// On-pool fine-tuning is relayed to ONE native (torch) worker that runs the whole train step locally.
+// The coordinator seals/accounts the RPC like a shard but can't verify a stochastic loss (it has no
+// torch) — correctness is checked out-of-band against a seeded reference (see examples/lora_finetune.py).
+// Relayed RPCs to a native (torch) worker: on-pool fine-tuning ('train') and resident-model serving
+// ('model'). The coordinator seals/accounts them like a shard but can't verify the result (it has no
+// torch) — training is checked out-of-band vs a seeded reference; serving is checked vs transformers
+// exact-match by the client (examples/llm_serve.py).
+type RelayReply = { ok: boolean; sealed?: { iv: string; ct: string }; error?: string };
+type RelayPending = { workerId: string; cb: (r: RelayReply) => void };
+const pendingTrain = new Map<string, RelayPending>();
+const pendingModel = new Map<string, RelayPending>();
+let relaySeq = 0;
+let trainingHome: string | null = null; // worker id hosting the single (non-DiLoCo) training session
+const modelHome = new Map<string, string>(); // resident model id → worker id
+// Pipeline-parallel sharding (GPT-2 family): a model's transformer layers are split into contiguous
+// STAGES, one per worker — each worker holds ONLY its stage resident. The plan records, per shard id,
+// the ordered stages (which worker owns which layer range + which is first/last); /model/shard_forward
+// pipes the hidden state stage→stage (only [seq×hidden] activations cross the wire, never the weights).
+interface ShardStage { worker: string; start: number; end: number; first: boolean; last: boolean }
+const shardPlans = new Map<string, { model: string; stages: ShardStage[] }>();
+const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 120_000);
+/** Native torch workers can fine-tune (autograd) and hold a whole model resident; WebGPU workers cannot. */
+const torchWorkers = () => activeFleet().filter((w) => w.label.includes('torch'));
+async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, RelayPending>, op: string, payload: unknown): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string }> {
+  const reqId = `${kind}-${++relaySeq}`;
+  const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify(payload)));
+  // Bind the reply to THIS worker's id, so another worker can't resolve someone else's RPC (see train_reply handler).
+  const ack = new Promise<RelayReply>((res) => { const t = setTimeout(() => { pend.delete(reqId); res({ ok: false, error: `${kind} rpc timeout` }); }, RELAY_TIMEOUT_MS); pend.set(reqId, { workerId: w.id, cb: (r) => { clearTimeout(t); res(r); } }); });
+  try { w.ws.send(JSON.stringify({ t: kind, reqId, op, sealed })); } catch (e) { return { ok: false, error: `send failed: ${e}` }; }
+  const r = await ack;
+  if (!r.ok) return { ok: false, error: r.error };
+  if (!r.sealed) return { ok: true, data: {} };
+  try { return { ok: true, data: JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealed))) as Record<string, unknown> }; } catch (e) { return { ok: false, error: `bad ${kind} reply: ${e}` }; }
+}
+const trainRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'train', pendingTrain, op, payload);
+const modelRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'model', pendingModel, op, payload);
+
+// --- DiLoCo: the coordinator is the parameter server. It holds the GLOBAL adapter + an outer Nesterov
+// momentum buffer; each round it averages the workers' post-inner-step adapters, applies the outer step,
+// and broadcasts the new global. This is the genuine reduce path (matmul pooling only concatenates). ---
+interface Diloco { workers: string[]; model: string; global: Map<string, Float32Array>; momentum: Map<string, Float32Array>; shape: Map<string, number[]>; round: number; busy: boolean; }
+let diloco: Diloco | null = null;
+function tensorsFromReply(data: Record<string, unknown>): Map<string, Float32Array> {
+  const m = new Map<string, Float32Array>();
+  const t = (data.tensors ?? {}) as Record<string, { data: string }>;
+  for (const [n, v] of Object.entries(t)) m.set(n, b64ToF32(v.data));
+  return m;
+}
 const jobs = new Map<string, JobRec>();
 const jobInputs = new Map<string, JobInput>();
 const jobSigned = new Map<string, { signed: number; total: number }>(); // Ed25519 verification tally per job
@@ -534,7 +595,7 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === '/health') return json({ ok: true, fleet: workers.size, queue: queue.length });
   if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/device', '/gpu', '/workers', 'POST /workers/:id/control', 'POST /submit (?async=1)', '/jobs', '/jobs/:id', '/logs', '/metrics'], workerSchedule: 'MOREGPU_SCHEDULE=always|idle-only|HH:MM-HH:MM', auth: 'admin endpoints require Authorization: Bearer <admin token>' });
   // admin-gated
-  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || (req.method === 'POST' && url.pathname === '/submit')) {
+  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || url.pathname.startsWith('/train/') || url.pathname.startsWith('/model/') || (req.method === 'POST' && url.pathname === '/submit')) {
     if (!authOk(req)) return json({ error: 'unauthorized — send Authorization: Bearer <admin token>' }, 401);
   }
   if (url.pathname === '/gpu') return json(virtualGpu());
@@ -597,6 +658,234 @@ async function handler(req: Request): Promise<Response> {
       return json({ ok: true, id: body.id, worker: home.id, rows: body.rows, cols: body.cols, dtype });
     }
     return json([...weightHome.entries()].map(([id, h]) => ({ id, worker: h.worker, rows: h.rows, cols: h.cols })));
+  }
+  // On-pool fine-tuning (single native torch worker). load → repeated step → adapter pull.
+  //   POST /train/load  { model, rank?, alpha?, lr?, seed?, targets?, worker? }
+  //   POST /train/step  { input_ids:[...], labels?:[...], lr? }  → { loss, step }
+  //   POST /train/adapter                                        → { step, tensors:{name:{data,shape}} }
+  if (req.method === 'POST' && url.pathname === '/train/load') {
+    const body = await req.json().catch(() => ({})) as { model?: string; worker?: string; rank?: number; alpha?: number; lr?: number; seed?: number; targets?: string[]; force?: boolean };
+    if (!body.model) return json({ error: 'need {model}' }, 400);
+    // refuse to clobber a live single-worker session unless {force:true} (would silently reset its adapter/optimizer/step)
+    if (trainingHome && workers.has(trainingHome) && !body.force) return json({ error: `a training session is already live on ${trainingHome} — pass {force:true} to replace it`, worker: trainingHome }, 409);
+    const cands = torchWorkers();
+    if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; the WebGPU workers cannot train (no autograd)' }, 503);
+    const w = body.worker ? cands.find((x) => x.id === body.worker) : cands[0];
+    if (!w) return json({ error: `torch worker ${body.worker} not active` }, 404);
+    const r = await trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets });
+    if (!r.ok) return json({ error: r.error }, 502);
+    trainingHome = w.id;
+    log('info', `train session loaded ${body.model} on ${w.id} · trainable=${r.data?.trainable_params}`);
+    return json({ ok: true, worker: w.id, ...r.data });
+  }
+  if (req.method === 'POST' && (url.pathname === '/train/step' || url.pathname === '/train/adapter')) {
+    if (!trainingHome) return json({ error: 'no training session — POST /train/load first' }, 409);
+    const w = workers.get(trainingHome);
+    if (!w) { trainingHome = null; return json({ error: 'training worker disconnected — reload the session' }, 503); }
+    if (url.pathname === '/train/adapter') {
+      const r = await trainRPC(w, 'adapter', {});
+      return r.ok ? json({ ok: true, ...r.data }) : json({ error: r.error }, 502);
+    }
+    const body = await req.json().catch(() => ({})) as { input_ids?: number[]; labels?: number[]; lr?: number };
+    if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
+    const okInts = (a?: number[]) => !a || (a.length <= 100_000 && a.every((x) => Number.isInteger(x) && x >= 0));
+    if (!okInts(body.input_ids) || !okInts(body.labels)) return json({ error: 'input_ids/labels must be non-negative ints, ≤100000' }, 400);
+    const r = await trainRPC(w, 'step', { input_ids: body.input_ids, labels: body.labels, lr: body.lr });
+    if (!r.ok) return json({ error: r.error }, 502);
+    return json({ ok: true, ...r.data });
+  }
+  // DiLoCo distributed LoRA: load the same seeded adapter on N workers, then run rounds (each worker does
+  // H local steps on its shard; the coordinator averages + outer-Nesterov-steps + broadcasts the global).
+  if (req.method === 'POST' && url.pathname === '/train/diloco/load') {
+    const body = await req.json().catch(() => ({})) as { model?: string; rank?: number; alpha?: number; lr?: number; seed?: number; targets?: string[]; workers?: string[] };
+    if (!body.model) return json({ error: 'need {model}' }, 400);
+    const cands = torchWorkers();
+    const group = (Array.isArray(body.workers) && body.workers.length) ? cands.filter((w) => body.workers!.includes(w.id)) : cands;
+    if (group.length === 0) return json({ error: 'no native (torch) workers connected for DiLoCo' }, 503);
+    const loads = await Promise.all(group.map((w) => trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets, no_dropout: true })));
+    const okWorkers = group.filter((_, i) => loads[i].ok);
+    if (okWorkers.length === 0) return json({ error: `train_load failed on all workers: ${loads[0]?.error}` }, 502);
+    const init = await trainRPC(okWorkers[0], 'adapter', {});
+    if (!init.ok) return json({ error: `adapter pull failed: ${init.error}` }, 502);
+    const global = tensorsFromReply(init.data!);
+    const shape = new Map<string, number[]>();
+    for (const [n, v] of Object.entries((init.data!.tensors ?? {}) as Record<string, { shape: number[] }>)) shape.set(n, v.shape);
+    const momentum = new Map<string, Float32Array>();
+    for (const [n, a] of global) momentum.set(n, new Float32Array(a.length));
+    diloco = { workers: okWorkers.map((w) => w.id), model: body.model, global, momentum, shape, round: 0, busy: false };
+    const trainable = [...global.values()].reduce((s, a) => s + a.length, 0);
+    log('info', `DiLoCo group loaded ${body.model} on ${diloco.workers.length} workers · adapter params=${trainable}`);
+    return json({ ok: true, workers: diloco.workers, model: body.model, adapter_params: trainable });
+  }
+  if (req.method === 'POST' && url.pathname === '/train/diloco/round') {
+    if (!diloco) return json({ error: 'no DiLoCo group — POST /train/diloco/load first' }, 409);
+    if (diloco.busy) return json({ error: 'a DiLoCo round is already in progress — rounds are serialized' }, 409);
+    const body = await req.json().catch(() => ({})) as { inner_steps?: number; lr?: number; outer_lr?: number; outer_momentum?: number; batches?: Record<string, number[][]> };
+    const H = Math.max(1, Math.min(Number(body.inner_steps ?? 4), 1000));
+    const lr = Number(body.lr ?? 1e-3), outerLr = Number(body.outer_lr ?? 0.7), mom = Number(body.outer_momentum ?? 0.9);
+    const batches = (body.batches ?? {}) as Record<string, number[][]>;
+    const live = diloco.workers.map((id) => workers.get(id)).filter((w): w is Worker => !!w);
+    if (live.length === 0) { diloco = null; return json({ error: 'all DiLoCo workers disconnected' }, 503); }
+    diloco.busy = true;
+    try {
+    const results = await Promise.all(live.map((w) => trainRPC(w, 'inner', { steps: H, lr, batches: batches[w.id] ?? batches['*'] ?? [] })));
+    const good = live.map((w, i) => ({ w, r: results[i] })).filter((x) => x.r.ok && x.r.data?.tensors);
+    if (good.length === 0) return json({ error: `inner step failed: ${results[0]?.error}` }, 502);
+    // average the workers' post-inner-step adapters
+    const avg = new Map<string, Float32Array>();
+    for (const n of diloco.global.keys()) {
+      const acc = new Float32Array(diloco.global.get(n)!.length); let cnt = 0;
+      for (const { r } of good) { const a = tensorsFromReply(r.data!).get(n); if (a && a.length === acc.length) { for (let i = 0; i < acc.length; i++) acc[i] += a[i]; cnt++; } }
+      if (cnt > 0) for (let i = 0; i < acc.length; i++) acc[i] /= cnt;
+      avg.set(n, acc);
+    }
+    // outer Nesterov step on the pseudo-gradient Δ = global − avg
+    for (const n of diloco.global.keys()) {
+      const g = diloco.global.get(n)!, v = diloco.momentum.get(n)!, a = avg.get(n)!;
+      for (let i = 0; i < g.length; i++) { const d = g[i] - a[i]; v[i] = mom * v[i] + d; g[i] = g[i] - outerLr * (d + mom * v[i]); }
+    }
+    // broadcast the new global to every worker
+    const tensors: Record<string, { data: string; shape: number[] }> = {};
+    for (const [n, a] of diloco.global) tensors[n] = { data: f32ToB64(a), shape: diloco.shape.get(n)! };
+    await Promise.all(live.map((w) => trainRPC(w, 'set_adapter', { tensors })));
+    diloco.round++;
+    const worker_losses = good.map(({ w, r }) => ({ worker: w.id, losses: r.data!.losses as number[] }));
+    const avg_last_loss = worker_losses.reduce((s, x) => s + (x.losses[x.losses.length - 1] ?? 0), 0) / worker_losses.length;
+    log('info', `DiLoCo round ${diloco.round}: ${good.length} workers · avg last loss ${avg_last_loss.toFixed(4)}`);
+    return json({ ok: true, round: diloco.round, workers: good.length, avg_last_loss, worker_losses });
+    } finally { if (diloco) diloco.busy = false; }
+  }
+  if (req.method === 'POST' && url.pathname === '/train/diloco/adapter') {
+    if (!diloco) return json({ error: 'no DiLoCo group' }, 409);
+    const tensors: Record<string, { data: string; shape: number[] }> = {};
+    for (const [n, a] of diloco.global) tensors[n] = { data: f32ToB64(a), shape: diloco.shape.get(n)! };
+    return json({ ok: true, round: diloco.round, workers: diloco.workers, tensors });
+  }
+  // Resident-model serving: hold a whole model on a torch worker and run the ENTIRE forward per call —
+  // ONE round-trip per token instead of the ~500 the fine-grained kernel path needs. THIS is fast serving.
+  //   POST /model/load     { model, id?, fp16?, worker? }
+  //   POST /model/forward  { id, input_ids:[...], return_logits?, topk? }  → { argmax, logits?, top? }
+  if (req.method === 'POST' && url.pathname === '/model/load') {
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; fp16?: boolean; worker?: string };
+    if (!body.model) return json({ error: 'need {model}' }, 400);
+    const cands = torchWorkers();
+    if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; resident-model serving needs one' }, 503);
+    const w = body.worker ? cands.find((x) => x.id === body.worker) : cands[0];
+    if (!w) return json({ error: `torch worker ${body.worker} not active` }, 404);
+    const r = await modelRPC(w, 'load', { model: body.model, id: body.id ?? body.model, fp16: !!body.fp16 });
+    if (!r.ok) return json({ error: r.error }, 502);
+    modelHome.set(String(r.data?.id ?? body.id ?? body.model), w.id);
+    log('info', `resident model ${r.data?.id} loaded on ${w.id} · ${r.data?.n_params} params`);
+    return json({ ok: true, worker: w.id, ...r.data });
+  }
+  if (req.method === 'POST' && (url.pathname === '/model/forward' || url.pathname === '/model/generate')) {
+    const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean; topk?: number; max_new_tokens?: number };
+    if (!body.id && modelHome.size > 1) return json({ error: `${modelHome.size} models resident — specify {id} (one of ${[...modelHome.keys()].join(', ')})` }, 400);
+    const mid = body.id ?? [...modelHome.keys()][0];
+    if (!mid || !modelHome.has(mid)) return json({ error: 'no resident model — POST /model/load first' }, 409);
+    if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
+    if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints, ≤100000' }, 400);
+    const w = workers.get(modelHome.get(mid)!);
+    if (!w) { modelHome.delete(mid); return json({ error: 'model worker disconnected — reload it' }, 503); }
+    if (url.pathname === '/model/generate') {
+      const n = Math.max(1, Math.min(Number(body.max_new_tokens ?? 16), 1024));
+      const r = await modelRPC(w, 'generate', { id: mid, input_ids: body.input_ids, max_new_tokens: n });
+      return r.ok ? json({ ok: true, ...r.data }) : json({ error: r.error }, 502);
+    }
+    const r = await modelRPC(w, 'forward', { id: mid, input_ids: body.input_ids, return_logits: !!body.return_logits, topk: body.topk });
+    return r.ok ? json({ ok: true, ...r.data }) : json({ error: r.error }, 502);
+  }
+  if (req.method === 'POST' && url.pathname === '/model/unload') {
+    const body = await req.json().catch(() => ({})) as { id?: string };
+    const mid = body.id ?? [...modelHome.keys()][0];
+    if (!mid || !modelHome.has(mid)) return json({ error: 'no such resident model' }, 404);
+    const w = workers.get(modelHome.get(mid)!);
+    modelHome.delete(mid);
+    if (w) await modelRPC(w, 'unload', { id: mid });
+    log('info', `resident model ${mid} unloaded`);
+    return json({ ok: true, id: mid });
+  }
+  // Pipeline-parallel sharding (GPT-2 family only). Split the layer range into contiguous stages across
+  // the torch workers, load each stage on its worker, and record the plan.
+  //   POST /model/shard          { model, id?, layers?, workers? }              → { id, stages:[{worker,start,end,first,last,params_held}] }
+  //   POST /model/shard_forward  { id?, input_ids:[...], return_logits? }       → { argmax, logits? }  (pipes hidden state stage→stage)
+  //   POST /model/shard_unload   { id? }                                        → unload every stage + drop the plan
+  if (req.method === 'POST' && url.pathname === '/model/shard') {
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[] };
+    if (!body.model) return json({ error: 'need {model} (GPT-2 family only — gpt2, gpt2-medium, …)' }, 400);
+    // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
+    const cands = (Array.isArray(body.workers) && body.workers.length)
+      ? body.workers.map((wid) => torchWorkers().find((w) => w.id === wid)).filter((w): w is Worker => !!w)
+      : torchWorkers();
+    if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; pipeline sharding needs ≥1 (≥2 for a real split)' }, 503);
+    const sid = body.id ?? body.model;
+    if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
+    shardPlans.set(sid, { model: body.model, stages: [] }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
+    const fail = (msg: string, code: number) => { shardPlans.delete(sid); return json({ error: msg, id: sid }, code); };
+    // Resolve the model's REAL layer count (config-only, no weights) so gpt2-medium/large/xl shard correctly —
+    // never a hard-coded 12 that would silently run only the first 12 blocks and return wrong logits.
+    const arch = await modelRPC(cands[0], 'arch', { model: body.model });
+    const nLayer = (arch.ok && Number(arch.data?.n_layer) > 0) ? Math.floor(Number(arch.data!.n_layer)) : Math.max(1, Math.floor(Number(body.layers ?? 12)));
+    const nStages = Math.min(cands.length, nLayer);
+    // split [0, nLayer) into nStages contiguous ranges, as even as possible (first `extra` stages get one more)
+    const per = Math.floor(nLayer / nStages), extra = nLayer % nStages;
+    const stages: ShardStage[] = [];
+    let cursor = 0;
+    for (let i = 0; i < nStages; i++) {
+      const size = per + (i < extra ? 1 : 0);
+      stages.push({ worker: cands[i].id, start: cursor, end: cursor + size, first: i === 0, last: i === nStages - 1 });
+      cursor += size;
+    }
+    // load each stage; if any fails, unload the ones already loaded so we never leave a half-loaded pipe
+    const info: (ShardStage & { params_held?: number })[] = [];
+    for (const st of stages) {
+      const w = workers.get(st.worker);
+      if (!w) { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }); } return fail(`stage worker ${st.worker} vanished`, 503); }
+      const r = await modelRPC(w, 'shard_load', { model: body.model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last });
+      if (!r.ok) {
+        for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }); }
+        return fail(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}): ${r.error}`, 502);
+      }
+      info.push({ ...st, params_held: r.data?.params_held as number | undefined });
+    }
+    shardPlans.set(sid, { model: body.model, stages }); // finalize the reservation with the real plan
+    log('info', `sharded ${body.model} (${nLayer} layers) → ${nStages} stages: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
+    return json({ ok: true, id: sid, model: body.model, layers: nLayer, stages: info });
+  }
+  if (req.method === 'POST' && url.pathname === '/model/shard_forward') {
+    const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean };
+    const sid = body.id ?? [...shardPlans.keys()][0];
+    if (!sid || !shardPlans.has(sid)) return json({ error: 'no sharded model — POST /model/shard first' }, 409);
+    if (shardPlans.get(sid)!.stages.length === 0) return json({ error: `shard ${sid} is still loading`, id: sid }, 409);
+    if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
+    if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints, ≤100000' }, 400);
+    const plan = shardPlans.get(sid)!;
+    for (const st of plan.stages) if (!workers.has(st.worker)) { shardPlans.delete(sid); return json({ error: `stage worker ${st.worker} disconnected — re-shard with POST /model/shard`, id: sid }, 503); }
+    // ORCHESTRATE THE PIPE: stage 0 embeds input_ids → hidden; each next stage runs its blocks on that hidden;
+    // the last stage returns {argmax, logits?}. Sequential awaits down the stages (only activations on the wire).
+    let carry: Record<string, unknown> = {};
+    for (let i = 0; i < plan.stages.length; i++) {
+      const st = plan.stages[i];
+      const w = workers.get(st.worker)!;
+      const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
+      if (st.first) payload.input_ids = body.input_ids;
+      else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
+      if (st.last && body.return_logits) payload.return_logits = true;
+      const r = await modelRPC(w, 'shard_forward', payload);
+      if (!r.ok) return json({ error: `shard_forward failed on ${st.worker} (stage ${i}, layers ${st.start}-${st.end}): ${r.error}` }, 502);
+      carry = r.data!;
+    }
+    return json({ ok: true, id: sid, ...carry });
+  }
+  if (req.method === 'POST' && url.pathname === '/model/shard_unload') {
+    const body = await req.json().catch(() => ({})) as { id?: string };
+    const sid = body.id ?? [...shardPlans.keys()][0];
+    if (!sid || !shardPlans.has(sid)) return json({ error: 'no such sharded model' }, 404);
+    const plan = shardPlans.get(sid)!;
+    shardPlans.delete(sid);
+    for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }); }
+    log('info', `sharded model ${sid} unloaded (${plan.stages.length} stages)`);
+    return json({ ok: true, id: sid, stages: plan.stages.length });
   }
   if (url.pathname === '/logs') return json(LOG.slice(-200).reverse());
   if (url.pathname === '/metrics') return new Response(prometheus(), { headers: { 'content-type': 'text/plain; version=0.0.4' } });

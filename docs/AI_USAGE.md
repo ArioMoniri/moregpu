@@ -13,12 +13,18 @@ You can submit in two modes:
 - **Benchmark mode** — you send only `{kernel, size}`; the pool generates random data and returns timing
   and verification, for load-testing and demos.
 
-> **Honesty first.** MoreGPU provides a fixed set of **linear-algebra / elementwise building-block
-> kernels** and pools them across machines. It does **not** run a whole trained model, does **not** do
-> autograd/backprop, and does **not** use tensor cores or any specialised GEMM path — `matmul` is a plain
-> (naive, non-tiled) WGSL shader on general-purpose GPU compute. `matmul` runs on the worker's GPU; the
-> memory-bound elementwise and row-wise kernels run on the worker's CPU. Applications get value by
-> **composing** these primitives. See [Scope](#in-scope-vs-out-of-scope).
+> **Honesty first.** The **portable (WebGPU/WGSL) path** provides a fixed set of **linear-algebra /
+> elementwise building-block kernels** and pools them across machines. On that path MoreGPU does **not**
+> run a whole trained model as a black box, does **not** do autograd/backprop, and does **not** use tensor
+> cores or int8 — `matmul` is a workgroup-tiled (shared-memory) WGSL shader on general-purpose GPU compute,
+> fp32/fp16 only. `matmul` runs on the worker's GPU; the memory-bound elementwise and row-wise kernels run
+> on the worker's CPU. Applications get value by **composing** these primitives.
+>
+> A separate, **opt-in native torch worker** ([`apps/worker/worker_torch.py`](../apps/worker/worker_torch.py))
+> is where whole-model residency and **autograd** live: it holds a model on-device and runs the entire
+> forward per call (fast serving) or a full LoRA train step locally (single-worker fine-tuning). It is
+> admin-installed on trusted hardware — not the zero-install WGSL worker — and speaks the same sealed
+> protocol. See [Scope](#in-scope-vs-out-of-scope).
 
 ---
 
@@ -31,6 +37,7 @@ You can submit in two modes:
 | `vector_mul`  | `out[i] = a[i] * b[i]`       | `a`, `b`                         |
 | `saxpy`       | `out[i] = α·a[i] + b[i]`     | `a`, `b`, `scalar`               |
 | `relu`        | `out[i] = max(0, a[i])`      | `a`                              |
+| `gelu`        | `out[i] = gelu(a[i])` (tanh) | `a`                              |
 | `scale`       | `out[i] = α·a[i]`            | `a`, `scalar`                    |
 | `softmax`     | row-wise softmax             | `a`, `N` (= columns per row)     |
 | `layernorm`   | row-wise LayerNorm (ε 1e-5)  | `a`, `N` (= columns per row)     |
@@ -184,7 +191,16 @@ All admin endpoints require `Authorization: Bearer <admin token>`.
 batch elementwise (`vector_add/mul`, `saxpy`, `relu`, `scale`), and anything you can express by composing
 them (linear layers, activations, Monte-Carlo-style batch math). Large FP32 batch work on idle machines.
 
-**Out of scope** — running a whole trained model as a black box, autograd/backprop and optimizer state,
-tensor-core / cuBLAS-class GEMM performance, low-latency single-token serving, and any op not in the
-kernel set (until you add it). MoreGPU gives you fast, pooled, verified primitives — the model is your
-application's to compose.
+**On the portable WGSL path, out of scope** — running a whole trained model as a black box,
+autograd/backprop and optimizer state, tensor-core / cuBLAS-class GEMM performance, low-latency
+single-token serving, and any op not in the kernel set (until you add it). The WGSL path gives you fast,
+pooled, verified primitives — the model is your application's to compose.
+
+**The opt-in native torch worker** lifts some of these on trusted hardware: whole-model residency +
+device-resident forward (fast small-model serving, exact match), and **LoRA fine-tuning** via torch
+autograd — single-worker *and* **distributed across many workers via DiLoCo** (each worker trains its own
+shard for H local steps; the coordinator averages the adapters + an outer Nesterov step — a genuine reduce
+path). Still out of scope: 7B+ single-model inference, **async DiLoCo** and **cross-tenant secure
+aggregation**, tensor cores/int8, and CUDA/PTX kernels — all roadmap. Training on the native tier is
+verified out-of-band (a seeded reference), since the coordinator's CPU exact-match check can't validate a
+stochastic loss.

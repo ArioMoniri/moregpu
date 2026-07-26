@@ -146,6 +146,127 @@ class MoreGPU:
             raise RuntimeError(f"resident matmul not done: {job.get('status')} {job.get('error')}")
         return _b64_f32(job["output"]) if job.get("output") else []
 
+    # ---- on-pool fine-tuning (single native torch worker: whole train step runs locally on the worker) ----
+    def train_load(self, model: str, rank: int = 8, alpha: float = 16, lr: float = 1e-3,
+                   seed: int = 0, targets: Sequence[str] | None = None, worker: str | None = None) -> dict:
+        """Pin `model` on a torch worker, freeze it, attach a LoRA adapter (the only trainable tensor)."""
+        body: dict[str, Any] = {"model": model, "rank": rank, "alpha": alpha, "lr": lr, "seed": seed}
+        if targets:
+            body["targets"] = list(targets)
+        if worker:
+            body["worker"] = worker
+        return self._req("/train/load", "POST", body)
+
+    def train_step(self, input_ids: Sequence[int], labels: Sequence[int] | None = None, lr: float | None = None) -> dict:
+        """Run ONE fwd+CE+backward+optimizer.step on the worker; returns {loss, step}. Grads stay on the worker."""
+        body: dict[str, Any] = {"input_ids": list(input_ids)}
+        if labels is not None:
+            body["labels"] = list(labels)
+        if lr is not None:
+            body["lr"] = lr
+        return self._req("/train/step", "POST", body)
+
+    def train_adapter(self) -> dict:
+        """Pull the small trained LoRA adapter back (name → {data:b64 f32, shape})."""
+        return self._req("/train/adapter", "POST", {})
+
+    # ---- DiLoCo: distributed LoRA across many torch workers (coordinator = parameter server) ----
+    def diloco_load(self, model: str, rank: int = 8, alpha: float = 16, lr: float = 1e-3,
+                    seed: int = 0, targets: Sequence[str] | None = None, workers: Sequence[str] | None = None) -> dict:
+        body: dict[str, Any] = {"model": model, "rank": rank, "alpha": alpha, "lr": lr, "seed": seed}
+        if targets:
+            body["targets"] = list(targets)
+        if workers:
+            body["workers"] = list(workers)
+        return self._req("/train/diloco/load", "POST", body)
+
+    def diloco_round(self, batches: dict, inner_steps: int = 4, lr: float = 1e-3,
+                     outer_lr: float = 0.7, outer_momentum: float = 0.9) -> dict:
+        return self._req("/train/diloco/round", "POST",
+                         {"batches": batches, "inner_steps": inner_steps, "lr": lr, "outer_lr": outer_lr, "outer_momentum": outer_momentum})
+
+    def diloco_adapter(self) -> dict:
+        return self._req("/train/diloco/adapter", "POST", {})
+
+    # ---- resident-model serving (fast: the WHOLE forward runs on the worker, one round-trip per token) ----
+    def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None) -> dict:
+        body: dict[str, Any] = {"model": model, "fp16": fp16}
+        if id:
+            body["id"] = id
+        if worker:
+            body["worker"] = worker
+        return self._req("/model/load", "POST", body)
+
+    def model_forward(self, input_ids: Sequence[int], id: str | None = None,
+                      return_logits: bool = False, topk: int | None = None) -> dict:
+        body: dict[str, Any] = {"input_ids": list(input_ids)}
+        if id:
+            body["id"] = id
+        if return_logits:
+            body["return_logits"] = True
+        if topk:
+            body["topk"] = topk
+        return self._req("/model/forward", "POST", body)
+
+    def generate(self, input_ids: Sequence[int], max_new_tokens: int = 16, id: str | None = None) -> list[int]:
+        """Greedy generation via the resident model — the WHOLE decode runs on the worker (HF's internal
+        KV cache) in ONE round-trip. Returns the new token ids."""
+        body: dict[str, Any] = {"input_ids": list(input_ids), "max_new_tokens": max_new_tokens}
+        if id:
+            body["id"] = id
+        return self._req("/model/generate", "POST", body).get("tokens", [])
+
+    def model_unload(self, id: str | None = None) -> dict:
+        """Free a resident model from the worker's device (VRAM)."""
+        body: dict[str, Any] = {}
+        if id:
+            body["id"] = id
+        return self._req("/model/unload", "POST", body)
+
+    # ---- pipeline-parallel sharding (GPT-2 family only): split the layers into contiguous STAGES,
+    # one per torch worker; each worker holds ONLY its stage. Needs apps/worker/worker_torch.py (≥2 for a real split). ----
+    def shard_load(self, model: str, layers: int | None = None, workers: Sequence[str] | None = None,
+                   id: str | None = None) -> dict:
+        """Split `model`'s transformer layers into contiguous stages across the torch workers (or the listed
+        `workers`) and load each stage on its worker. `layers` = layer count (default 12 for gpt2). GPT-2 only.
+        Returns {id, stages:[{worker, start, end, first, last, params_held}]} — shows the memory really is split."""
+        body: dict[str, Any] = {"model": model}
+        if layers is not None:
+            body["layers"] = layers
+        if workers:
+            body["workers"] = list(workers)
+        if id:
+            body["id"] = id
+        return self._req("/model/shard", "POST", body)
+
+    def shard_forward(self, input_ids: Sequence[int], id: str | None = None, return_logits: bool = False) -> dict:
+        """Run ONE full forward across the pipeline: the coordinator pipes the hidden state stage→stage
+        (only [seq×hidden] activations on the wire, never weights). Returns {argmax, logits?}."""
+        body: dict[str, Any] = {"input_ids": list(input_ids)}
+        if id:
+            body["id"] = id
+        if return_logits:
+            body["return_logits"] = True
+        return self._req("/model/shard_forward", "POST", body)
+
+    def shard_generate(self, input_ids: Sequence[int], max_new_tokens: int, id: str | None = None) -> list[int]:
+        """Greedy generation across the sharded pipeline: loop shard_forward, appending the argmax each step.
+        Returns the new token ids (exact-matches transformers' greedy for GPT-2)."""
+        seq = list(input_ids)
+        new: list[int] = []
+        for _ in range(max_new_tokens):
+            nxt = int(self.shard_forward(seq, id=id)["argmax"])
+            seq.append(nxt)
+            new.append(nxt)
+        return new
+
+    def shard_unload(self, id: str | None = None) -> dict:
+        """Unload every stage of a sharded model and drop the plan."""
+        body: dict[str, Any] = {}
+        if id:
+            body["id"] = id
+        return self._req("/model/shard_unload", "POST", body)
+
 
 if __name__ == "__main__":
     import os

@@ -23,22 +23,34 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Dense fp32 matmul / GEMM | ✅ | **Workgroup-tiled WGSL GEMM on the GPU** (shared-memory tiling), verified. fp32 only, **no tensor cores** → correct but slower than cuBLAS. |
 | Elementwise + activations (add/mul/scale/saxpy/relu/**gelu**) | ✅ | First-class WGSL kernels — run **on the GPU** on a GPU worker (CPU otherwise). Memory-bound, so the GPU mainly relieves the CPU rather than adding raw speed. |
 | Softmax / LayerNorm | ✅ | Row-wise WGSL reductions (one workgroup per row) **on the GPU** on a GPU worker; CPU otherwise. Match a CPU reference to ~1e-8. |
-| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention; no KV cache. |
+| Scaled dot-product attention (one head) | 🧩 | `matmul(Q,Kᵀ)→scale→softmax→matmul(·,V)` — **verified** to 2e-3 vs a float64 reference ([`verify_workloads.py`](examples/verify_workloads.py) check #7). One-call `pool.attention(Q,K,V,seq,d)` SDK helper. Not flash-attention, but the GPT-2 demo now adds an incremental **KV cache** (below). |
 | Transformer block / small MLP inference | 🧩 | Compose LN→matmuls→attention→FFN — runnable in [`tiny_llm.py`](examples/tiny_llm.py). |
-| Split a model across workers/GPUs (pipeline) | 🧩 | **Weight residency**: `pool.upload_weight()` pins a layer's weights on a worker (sent once); `pool.matmul_resident()` runs where they live. Demo: [`pipeline_parallel.py`](examples/pipeline_parallel.py). **fp16 weights** supported (`dtype='f16'`, half the memory); no KV-cache yet. |
+| Split a model across workers/GPUs (pipeline) | 🧩 | **Weight residency**: `pool.upload_weight()` pins a layer's weights on a worker (sent once); `pool.matmul_resident()` runs where they live. Demo: [`pipeline_parallel.py`](examples/pipeline_parallel.py). **fp16 weights** supported (`dtype='f16'`, half the memory). |
 | Reductions (sum/mean/dot/norm) | 🧩 | Via GEMM tricks (`dot = (1×K)·(K×1)`, etc.); `pool.sum/mean/dot/norm` SDK helpers. Convenience, not throughput — each runs on one worker/one thread. |
 | Large / out-of-core matmul | 🟡 | Sharded across workers + pooled — bounded by WGSL cores + WAN, not NVLink. |
 | Monte-Carlo / RNG-heavy sims | 🟡 | You supply random inputs (host-side RNG); the pool does the arithmetic. |
-| Small LLM inference (e.g. GPT-2 124M) | 🟡 | **A real GPT-2 runs on the pool** — [`examples/llm_infer.py`](examples/llm_infer.py) loads the checkpoint, pins the 12 layers resident, runs the full forward pass, and matches Hugging Face **exactly** (identical greedy generation). Uses the real tokenizer. Slow: activations round-trip per layer (~seconds/token on localhost). |
-| Big / fast LLM inference (7B+, low latency) | ❌ | Impractical here: fp32 (no fp16/int8/tensor cores), no KV cache, and every layer's activations cross the network — ~seconds/token, worse over a WAN. Needs a native fp16/CUDA worker (roadmap). |
-| Training (autograd / backprop / optimizer) | ❌ | No autograd or gradient/optimizer kernels. Not a training platform. |
+| Small LLM inference (e.g. GPT-2 124M) | 🟡→✅ | **A real GPT-2 runs on the pool** — [`examples/llm_infer.py`](examples/llm_infer.py) pins the 12 layers resident, runs the full forward, and matches Hugging Face **exactly** (fp32 or fp16), now with a **client-side KV cache** (incremental decode, ~4× faster per token on the WGSL path, still exact). For real speed, the new **native torch worker** holds the model resident on-device and serves at up to **~66 tok/s** warm on an unloaded machine (~6–23 tok/s under load) with the same **exact match** — [`examples/llm_serve.py`](examples/llm_serve.py). |
+| Fast small-LLM serving (low latency) | 🟡 | The new **native torch worker** ([`apps/worker/worker_torch.py`](apps/worker/worker_torch.py), Apple MPS / CUDA) holds a whole model resident on-device and runs the **entire forward per call** — one round-trip per token instead of ~500 — so GPT-2 serves at up to **~66 tok/s** warm/unloaded (~6–23 tok/s under load) with a token-for-token **exact match** to transformers ([`llm_serve.py`](examples/llm_serve.py)). It's an **opt-in native tier** (admin-installed, not the zero-install WGSL worker). |
+| Big-model inference across machines (pipeline sharding) | 🟡 | **Pipeline-parallel sharding** ([`llm_shard.py`](examples/llm_shard.py)): split a model's transformer layers into contiguous stages, one per torch worker, piping only **activations** (`~[seq×hidden]`, never weights) — the low-bandwidth path (Petals / Mesh-LLM style). Demoed with GPT-2 split **6+6 blocks across 2 workers**, token-for-token **exact match** to transformers; each worker holds **only its stage**. GPT-2-family only so far; a real 7B would use more/bigger workers. Still no int8/tensor cores. |
+| Training / fine-tuning (LoRA) | 🟡 | **LoRA fine-tuning on the torch worker** — single-worker ([`lora_finetune.py`](examples/lora_finetune.py)) *and* **distributed across N workers via DiLoCo** ([`lora_distributed.py`](examples/lora_distributed.py)): each worker trains its own shard for H local steps, the **coordinator averages the adapters + applies an outer Nesterov step** (a real reduce path), broadcasts the global. Both verified **bit-for-bit against a seeded reference**. Synchronous DiLoCo; async + secure-aggregation are the next step. Needs the torch worker, not the WGSL path. |
+| Modern architectures (RMSNorm · RoPE · SwiGLU · GQA) | 🟡 | **Qwen3-0.6B runs on the pool** matching Hugging Face token-for-token ([`generic_infer.py`](examples/generic_infer.py)) — proof the pool isn't GPT-2-specific. Forward-only, round-trip-bound (~minutes/token); a portability proof, not a speed win. |
 | Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
 | CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
 
-**In one line:** every kernel it ships — tiled matmul, elementwise/activations, softmax and layernorm — runs **on your real GPU** (WGSL → Metal/Vulkan/D3D12) on a GPU worker, with verified fp32 results, and you **compose** them into attention, transformer blocks, and small classifiers. It is not a drop-in for training, big-model inference, tensor-core speed, CUDA kernels, or graphics.
+**In one line:** every kernel it ships — tiled matmul, elementwise/activations, softmax and layernorm — runs **on your real GPU** (WGSL → Metal/Vulkan/D3D12) on a GPU worker, with verified fp32 results, and you **compose** them into attention, transformer blocks, and small classifiers. An **opt-in native torch worker** adds device-resident model serving (fast GPT-2, exact match) and LoRA fine-tuning — single-worker and distributed (DiLoCo). It is still not a drop-in for big-model (7B+) inference, tensor-core speed, CUDA kernels, or graphics.
 
 > [!NOTE]
-> **Can it run LLMs?** Yes — a *small* one. `examples/llm_infer.py` runs a real **GPT-2** on the pool and matches Hugging Face token-for-token (in fp32 **or fp16** weights — `MOREGPU_FP16=1`, half the memory, identical output). It's **slow** (activations round-trip over the network per layer — seconds/token), so big/low-latency models stay impractical. The backend is **WebGPU (WGSL)** — portable across NVIDIA/AMD/Apple/Intel, with fp16 weights (shader-f16, f32 accumulate) but **no tensor cores, no int8, no CUDA/PTX, no autograd**. Real serving speed + big models would need a **separate native fp16/CUDA worker type** (roadmap, not built). It's a correct, verified primitive set you can compose into real models at small scale — not a fast CUDA serving stack it isn't.
+> **Can it run LLMs?** Yes — small ones, **two ways**:
+> - **Portable path (any GPU):** [`examples/llm_infer.py`](examples/llm_infer.py) runs a real **GPT-2** on the zero-install WebGPU (WGSL) workers and matches Hugging Face token-for-token (fp32 **or fp16** weights), now with a **client-side KV cache** (~4× faster per token). It's still round-trip-bound (~seconds/token) — a correctness proof, not a serving stack. Backend is portable across NVIDIA/AMD/Apple/Intel but stays fp32/fp16 with **no tensor cores, no int8, no CUDA/PTX, no autograd**.
+> - **Native path (new, opt-in):** a **torch worker** ([`apps/worker/worker_torch.py`](apps/worker/worker_torch.py), Apple MPS / CUDA) holds the model resident and runs the whole forward on-device — GPT-2 serves at up to **~66 tok/s** warm on an unloaded machine (~6–23 tok/s under load) with an exact match ([`llm_serve.py`](examples/llm_serve.py)), and it can **LoRA fine-tune** on-pool ([`lora_finetune.py`](examples/lora_finetune.py), verified bit-for-bit vs a seeded reference). This is where **autograd + device-resident serving** live.
+>
+> The torch worker is a **separate, admin-installed native tier** — not the zero-install WGSL worker — and it speaks the *same* sealed protocol, so it joins the *same* pool. Distributed training (**DiLoCo across many workers**) works today; **async DiLoCo, cross-tenant secure aggregation, and big 7B+ single-model inference remain roadmap.**
+
+<p align="center">
+  <img src="docs/assets/serve-terminal.svg" alt="Serving GPT-2 on the pool via the resident-model path — exact match to transformers, up to ~66 tok/s warm/unloaded" width="49%">
+  <img src="docs/assets/train-terminal.svg" alt="LoRA fine-tuning GPT-2 on the pool — loss falls, verified bit-for-bit against a seeded reference" width="49%">
+</p>
+<p align="center"><sub>Live captures. Serving throughput is the <b>warm/unloaded best case</b> (~66 tok/s); under load it's ~6–23 tok/s. Training loss + the seeded-reference match are exact.</sub></p>
 
 > [!NOTE]
 > **What runs on the GPU:** on a GPU worker, **all** kernels execute on-device (WGSL → Metal/Vulkan/D3D12) — tiled matmul, elementwise/activations, and softmax/layernorm reductions. A CPU-only worker runs the identical kernels on the CPU. Either way the coordinator cross-checks the pooled result against a CPU reference, so every path returns the same verified fp32 output.
@@ -259,8 +271,51 @@ checked against a CPU reference:
 
 ```sh
 MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
-  python3 examples/verify_workloads.py     # → 7 passed, 0 failed (all match to ~1e-8)
+  python3 examples/verify_workloads.py     # → 11 passed, 0 failed (all match to ~1e-8)
 ```
+
+</details>
+
+<details>
+<summary><b>▶ Native tier — fast LLM serving + on-pool LoRA fine-tuning (torch worker)</b></summary>
+
+The **native torch worker** is an opt-in, admin-installed peer of the WebGPU worker (same sealed protocol,
+same join token). It computes with PyTorch on the best local device (CUDA → Apple MPS → CPU), which unlocks
+device-resident serving and — via autograd — on-pool fine-tuning.
+
+```sh
+pip install torch transformers cryptography websockets     # the torch worker's deps
+
+# join the pool as a native worker (uses the same join token as any worker)
+MOREGPU_SERVER=ws://localhost:8787/ws MOREGPU_TOKEN=<join-token> \
+  python3 apps/worker/worker_torch.py
+
+# then, with an admin token — serve a real GPT-2, FAST (one round-trip per token, exact match)
+MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
+  python3 examples/llm_serve.py            # → ✅ EXACT MATCH to transformers · ~tens of tok/s
+
+# fine-tune GPT-2 on the pool with LoRA — the whole train step runs on the worker
+MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
+  python3 examples/lora_finetune.py        # → loss falls; verified bit-for-bit vs a seeded reference
+
+# DISTRIBUTED training — DiLoCo across N torch workers (start 2+ workers, then):
+MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
+  python3 examples/lora_distributed.py     # each worker trains its own shard; coordinator averages + outer step
+
+# run a second, modern architecture (Qwen3-0.6B: RMSNorm/RoPE/SwiGLU/GQA) — matches HF token-for-token
+MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
+  python3 examples/generic_infer.py "The capital of France is"
+
+# split a model ACROSS machines (pipeline sharding) — start 2+ workers, each holds only its layers:
+MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
+  python3 examples/llm_shard.py            # GPT-2 split 6+6 across 2 workers; exact match, activations-only on the wire
+```
+
+**Honest scope:** the torch worker makes small models fast, LoRA fine-tunes (single-worker *and*
+distributed via DiLoCo), and pipeline-shards a model across workers (GPT-2-family, exact match). Not built:
+**async DiLoCo**, **cross-tenant secure aggregation**, non-GPT-2 sharding, and int8/tensor-core speed.
+Training is verified out-of-band (a seeded reference), not by the coordinator's exact-match check, since a
+stochastic loss can't be CPU-verified.
 
 </details>
 
@@ -271,7 +326,7 @@ Drive the pool from an application with the client SDK, or the CLI.
 ```sh
 pip install moregpu-client                        # Python SDK — on PyPI
 brew install --cask ArioMoniri/moregpu/moregpu    # `moregpu` CLI (installs Deno)
-npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.3.0.tgz   # TS/JS SDK
+npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.6.0.tgz   # TS/JS SDK
 ```
 
 > [!NOTE]
@@ -294,6 +349,11 @@ from moregpu import MoreGPU                                        # the install
 pool = MoreGPU("http://ADMIN:8787", "<admin-token>")
 pool.matmul([1,2,3, 4,5,6], [7,8, 9,10, 11,12], M=2, N=2, K=3)   # → [58, 64, 139, 154]
 pool.run("relu", [-1, 2, -3, 4])                                  # any kernel on your own data
+
+# --- native tier (needs a torch worker in the pool) ---
+pool.model_load("gpt2")                                           # pin a model resident on a torch worker
+pool.generate(prompt_ids, max_new_tokens=20)                      # fast greedy decode (1 round-trip/token)
+pool.train_load("gpt2", rank=8); pool.train_step(input_ids)       # LoRA fine-tune; returns {loss, step}
 ```
 
 > Prefer zero-install? Copy the single-file [`examples/moregpu_client.py`](examples/moregpu_client.py) and use `from moregpu_client import MoreGPU` instead — same API, no `pip`.

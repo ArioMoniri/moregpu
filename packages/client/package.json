@@ -1,16 +1,40 @@
 {
   "name": "@moregpu/client",
-  "version": "0.5.0",
-  "description": "Client SDK for the MoreGPU pool — submit tensor/compute jobs, batch them, and read fleet contribution. Works in Deno, Node, and browsers.",
+  "version": "0.6.0",
+  "description": "Client SDK for the MoreGPU pool \u2014 submit tensor/compute jobs, batch them, and read fleet contribution. Works in Deno, Node, and browsers.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "files": ["dist", "README.md"],
-  "keywords": ["gpu", "webgpu", "distributed-computing", "compute-pool", "moregpu"],
-  "repository": { "type": "git", "url": "https://github.com/ArioMoniri/moregpu.git", "directory": "packages/client" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "gpu",
+    "webgpu",
+    "distributed-computing",
+    "compute-pool",
+    "moregpu"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArioMoniri/moregpu.git",
+    "directory": "packages/client"
+  },
   "homepage": "https://github.com/ArioMoniri/moregpu",
   "license": "Apache-2.0",
-  "publishConfig": { "access": "public" },
-  "scripts": { "build": "tsc -b", "test": "vitest run", "prepublishOnly": "tsc -b" }
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "prepublishOnly": "tsc -b"
+  }
 }

@@ -43,3 +43,33 @@ jobs:
 
       - name: Type-check apps
         run: deno check apps/worker/worker.ts apps/coordinator/server.ts
+
+  native:
+    name: Native torch worker (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install worker deps (CPU torch — no models downloaded)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install cryptography websockets numpy
+
+      - name: Compile-check native code
+        run: python -m py_compile apps/worker/worker_torch.py examples/*.py clients/python/moregpu/__init__.py
+
+      - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
+        run: bash scripts/smoke_torch.sh

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="282" viewBox="0 0 880 282" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13">
+<rect x="0" y="0" width="880" height="282" rx="12" fill="#1e2030"/>
+<rect x="0" y="0" width="880" height="34" rx="12" fill="#282a3a"/><rect x="0" y="22" width="880" height="12" fill="#282a3a"/>
+<circle cx="20" cy="17" r="6" fill="#ed6a5e"/>
+<circle cx="40" cy="17" r="6" fill="#f4bf50"/>
+<circle cx="60" cy="17" r="6" fill="#61c554"/>
+<text x="440.0" y="21" fill="#7a88cf" text-anchor="middle" font-size="12">moregpu — serve GPT-2 on the pool (resident-model path)</text>
+<text x="18" y="64" fill="#a6da95" xml:space="preserve">$ python3 examples/llm_serve.py    # serve GPT-2 on the pool via the resident-model path</text>
+<text x="18" y="84" fill="#c6a0f6" xml:space="preserve">== serve gpt2 on the pool ==  prompt=&#x27;The future of distributed computing is&#x27;  gen=30</text>
+<text x="18" y="104" fill="#c8d3f5" xml:space="preserve">resident on mac-studio-m3 · 124,439,808 params · 12 layers · mps</text>
+<text x="18" y="124" fill="#c8d3f5" xml:space="preserve"></text>
+<text x="18" y="144" fill="#8bd5ca" xml:space="preserve">pool  : &#x27;The future of distributed computing is in the hands of the people.\n\nThe future of distributed computing is in the hands of the people.\n\nThe future of distributed computing is&#x27;</text>
+<text x="18" y="164" fill="#eed49f" xml:space="preserve">        30 tokens, 1 round-trip/token · first token 17 ms (warm-up), steady-state 15 ms/token = 66 tok/s</text>
+<text x="18" y="184" fill="#8bd5ca" xml:space="preserve">ref   : &#x27;The future of distributed computing is in the hands of the people.\n\nThe future of distributed computing is in the hands of the people.\n\nThe future of distributed computing is&#x27;</text>
+<text x="18" y="204" fill="#c8d3f5" xml:space="preserve"></text>
+<text x="18" y="224" fill="#a6da95" xml:space="preserve">✅ EXACT MATCH to transformers greedy  (pool [287, 262, 2832, 286, 262, 661, 13, 198]… vs ref [287, 262, 2832, 286, 262, 661, 13, 198]…)</text>
+<text x="18" y="244" fill="#8bd5ca" xml:space="preserve">honest note: llm_infer.py runs the same model via ~85 round-trips/token with its KV cache (~500 without); this resident path is the fast one (1 round-trip/token).</text>
+</svg>

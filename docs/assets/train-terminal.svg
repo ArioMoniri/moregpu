@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="482" viewBox="0 0 880 482" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13">
+<rect x="0" y="0" width="880" height="482" rx="12" fill="#1e2030"/>
+<rect x="0" y="0" width="880" height="34" rx="12" fill="#282a3a"/><rect x="0" y="22" width="880" height="12" fill="#282a3a"/>
+<circle cx="20" cy="17" r="6" fill="#ed6a5e"/>
+<circle cx="40" cy="17" r="6" fill="#f4bf50"/>
+<circle cx="60" cy="17" r="6" fill="#61c554"/>
+<text x="440.0" y="21" fill="#7a88cf" text-anchor="middle" font-size="12">moregpu — LoRA fine-tune GPT-2 on the pool</text>
+<text x="18" y="64" fill="#a6da95" xml:space="preserve">$ python3 examples/lora_finetune.py    # LoRA fine-tune GPT-2 on the pool</text>
+<text x="18" y="84" fill="#c6a0f6" xml:space="preserve">== LoRA fine-tune gpt2 on the pool ==  targets=[&#x27;c_attn&#x27;] rank=8 steps=30 window=32</text>
+<text x="18" y="104" fill="#c8d3f5" xml:space="preserve">loaded on mac-studio-m3 · trainable params=294,912 · device=mps</text>
+<text x="18" y="124" fill="#eed49f" xml:space="preserve">  step   1  loss 5.7984</text>
+<text x="18" y="144" fill="#eed49f" xml:space="preserve">  step   2  loss 5.8612</text>
+<text x="18" y="164" fill="#eed49f" xml:space="preserve">  step   3  loss 5.2004</text>
+<text x="18" y="184" fill="#eed49f" xml:space="preserve">  step   5  loss 5.2499</text>
+<text x="18" y="204" fill="#eed49f" xml:space="preserve">  step  10  loss 4.3457</text>
+<text x="18" y="224" fill="#eed49f" xml:space="preserve">  step  15  loss 3.6407</text>
+<text x="18" y="244" fill="#eed49f" xml:space="preserve">  step  20  loss 2.9968</text>
+<text x="18" y="264" fill="#eed49f" xml:space="preserve">  step  25  loss 2.4703</text>
+<text x="18" y="284" fill="#eed49f" xml:space="preserve">  step  30  loss 1.8080</text>
+<text x="18" y="304" fill="#c8d3f5" xml:space="preserve"></text>
+<text x="18" y="324" fill="#c6a0f6" xml:space="preserve">== verify ==</text>
+<text x="18" y="344" fill="#eed49f" xml:space="preserve">  context: base model (eval) loss on batch 0 = 5.4644</text>
+<text x="18" y="364" fill="#a6da95" xml:space="preserve">  learning: 5.7984 → 1.8080  (Δ=3.9904)  OK</text>
+<text x="18" y="384" fill="#eed49f" xml:space="preserve">  correctness: pool curve vs seeded in-process reference — max|Δ| = 0.000e+00  OK  (ref final 1.8080, pool 1.8080)</text>
+<text x="18" y="404" fill="#a6da95" xml:space="preserve">  adapter: 24 tensors pulled back · max|w|=5.844e-01  OK</text>
+<text x="18" y="424" fill="#c8d3f5" xml:space="preserve"></text>
+<text x="18" y="444" fill="#a6da95" xml:space="preserve">✅ REAL training on the pool, verified against a seeded reference</text>
+</svg>

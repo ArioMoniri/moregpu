@@ -84,7 +84,14 @@ def main() -> int:
         o = pool.matmul(a.reshape(-1).tolist(), b.reshape(-1).tolist(), m, n, k)
         return np.asarray(o, np.float32).reshape(m, n)
 
-    def forward(ids):
+    def sm(x):  # host-side 1-row stable softmax (decode micro-attention)
+        e = np.exp(x - x.max(1, keepdims=True)); return e / e.sum(1, keepdims=True)
+
+    # client-side KV cache: per-layer K/V (post-c_attn, incl. bias), grown one row per decode step
+    Kc: list = [None] * L
+    Vc: list = [None] * L
+
+    def prefill(ids):  # full masked forward on the L-token prompt; also populates the KV cache
         seq = len(ids)
         x = wte[ids] + wpe[np.arange(seq)]                       # [seq, D]
         causal = np.triu(np.ones((seq, seq), np.float32), 1) * -1e9
@@ -92,6 +99,7 @@ def main() -> int:
             w1, b1, w2, b2 = lnw[i]
             qkv = p_res(p_ln(x) * w1 + b1, f"l{i}.attn") + bA[i]      # [seq, 3D]
             q, k, v = qkv[:, :D], qkv[:, D:2 * D], qkv[:, 2 * D:]
+            Kc[i], Vc[i] = k.copy(), v.copy()                        # stash K/V for incremental decode
             ctx = np.zeros((seq, D), np.float32)
             for hh in range(H):
                 s = hh * hd
@@ -101,11 +109,32 @@ def main() -> int:
             h = p_res(p_ln(x) * w2 + b2, f"l{i}.fc") + bF[i]         # MLP
             x = x + (p_res(p_gelu(h), f"l{i}.proj") + bO[i])         # MLP residual
         x = p_ln(x) * lnf_w + lnf_b
-        return (x[-1] @ wte.T), len(wte)                          # host-side vocab projection
+        return (x[-1] @ wte.T), seq                              # logits, pos (host-side vocab projection)
+
+    def decode_step(id_t, pos):  # ONE token at absolute position `pos`; O(1) attn via the cache
+        xr = wte[[id_t]] + wpe[[pos]]                            # [1, D] — ABSOLUTE pos, not wpe[0]
+        for i in range(L):
+            w1, b1, w2, b2 = lnw[i]
+            qkv = p_res(p_ln(xr) * w1 + b1, f"l{i}.attn") + bA[i]    # [1, 3D] — LN(M=1) + resident GEMM
+            qn, kn, vn = qkv[:, :D], qkv[:, D:2 * D], qkv[:, 2 * D:]
+            Kc[i] = np.vstack([Kc[i], kn]); Vc[i] = np.vstack([Vc[i], vn])   # append new K/V FIRST → [pos+1, D]
+            ctx = np.zeros((1, D), np.float32)
+            for hh in range(H):
+                s = hh * hd
+                sc = (qn[:, s:s + hd] @ Kc[i][:, s:s + hd].T) / math.sqrt(hd)  # [1, pos+1] — host, no mask
+                ctx[:, s:s + hd] = sm(sc) @ Vc[i][:, s:s + hd]       # host micro-attention → [1, hd]
+            xr = xr + (p_res(ctx, f"l{i}.aproj") + bP[i])           # attn residual
+            h = p_res(p_ln(xr) * w2 + b2, f"l{i}.fc") + bF[i]        # MLP
+            xr = xr + (p_res(p_gelu(h), f"l{i}.proj") + bO[i])      # MLP residual
+        xr = p_ln(xr) * lnf_w + lnf_b
+        return (xr[0] @ wte.T), pos + 1                          # logits, next pos
 
     ids = tok.encode(PROMPT)
     print(f"\n   prompt: {PROMPT!r}  → {len(ids)} tokens")
-    logits, V = forward(ids)
+    logits, _ = prefill(ids)
+    if os.environ.get("MOREGPU_KVCHECK"):  # cache sanity: full prefill == prefill(-1)+decode(last)
+        lo, _ = prefill(ids); lp, pv = prefill(ids[:-1]); ld, _ = decode_step(ids[-1], pv)
+        print(f"   kv-check max|Δ| (full prefill vs cache+decode) = {np.abs(lo - ld).max():.2e}")
     ref = model(torch.tensor([ids])).logits[0, -1].detach().numpy()
     tp = np.argsort(-logits)[:5]; tr = np.argsort(-ref)[:5]
     print(f"   next-token top-5 (pool): {[tok.decode([t]) for t in tp]}")
@@ -115,8 +144,11 @@ def main() -> int:
     if GEN:
         print(f"\n   greedy-generating {GEN} tokens on the pool …")
         gen = list(ids)
-        for _ in range(GEN):
-            lg, _ = forward(gen); gen.append(int(np.argmax(lg)))
+        lg, pos = prefill(ids)                                   # one masked pass, cache primed
+        for step in range(GEN):
+            gen.append(int(np.argmax(lg)))                       # emit token
+            if step + 1 < GEN:
+                lg, pos = decode_step(gen[-1], pos)             # incremental: 1 row, cached K/V
         ref_gen = model.generate(torch.tensor([ids]), max_new_tokens=GEN, do_sample=False)[0].tolist()
         print(f"   pool : {tok.decode(gen)!r}")
         print(f"   ref  : {tok.decode(ref_gen)!r}")
