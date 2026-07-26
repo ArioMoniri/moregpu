@@ -307,6 +307,8 @@ def train_dispatch(op: str, payload: dict) -> dict:
 # (or just the argmax) travel back.
 # ---------------------------------------------------------------------------
 MODELS: dict = {}  # model_id -> torch model (eval, frozen)
+MODEL_NAMES: dict = {}  # model_id -> HF name (for the tokenizer in model_chat)
+_TOKS: dict = {}  # model_id -> tokenizer (cached, for text↔text chat)
 
 def model_load(cfg: dict) -> dict:
     from transformers import AutoModelForCausalLM, AutoConfig
@@ -321,6 +323,7 @@ def model_load(cfg: dict) -> dict:
         MODELS.pop(next(iter(MODELS)), None); _empty_cache()
     model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float16 if fp16_effective else torch.float32).to(DEV).eval()
     MODELS.pop(mid, None); MODELS[mid] = model  # (re)insert as most-recent
+    MODEL_NAMES[mid] = cfg["model"]; _TOKS.pop(mid, None)  # remember the HF name for the tokenizer (model_chat)
     c = AutoConfig.from_pretrained(cfg["model"])
     return {"ok": True, "id": mid, "n_layer": getattr(c, "n_layer", getattr(c, "num_hidden_layers", None)),
             "n_params": sum(p.numel() for p in model.parameters()),
@@ -523,12 +526,46 @@ def model_arch(cfg: dict) -> dict:
     return {"ok": True, "n_layer": int(getattr(c, "n_layer", getattr(c, "num_hidden_layers", 0))),
             "n_positions": int(getattr(c, "n_positions", getattr(c, "max_position_embeddings", 0)))}
 
+def model_chat(payload: dict) -> dict:
+    """Text in → text out. Tokenizes on the worker (it has the model's tokenizer), so a plain browser chat
+    page can talk to a served model without a JS tokenizer. Applies the model's chat template when present."""
+    mid = payload.get("id"); model = MODELS.get(mid)
+    if model is None:
+        raise RuntimeError(f"model {mid} not loaded — call /model/load first")
+    from transformers import AutoTokenizer
+    if mid not in _TOKS:
+        _TOKS[mid] = AutoTokenizer.from_pretrained(MODEL_NAMES.get(mid, mid))
+    tk = _TOKS[mid]
+    prompt = str(payload.get("prompt", ""))[:8000]
+    if getattr(tk, "chat_template", None):  # instruct models (e.g. Qwen-Instruct) → use their chat format
+        text = tk.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+    else:
+        text = prompt
+    enc = tk(text, return_tensors="pt").to(DEV)
+    seq = enc["input_ids"].shape[1]
+    n = max(1, min(int(payload.get("max_new_tokens", 96)), 1024))
+    _check_ctx(model, seq, n)
+    MODELS[mid] = MODELS.pop(mid)
+    kw = {"max_new_tokens": n, "pad_token_id": tk.eos_token_id}
+    if payload.get("do_sample"):
+        kw.update(do_sample=True, temperature=float(payload.get("temperature", 0.7)), top_p=float(payload.get("top_p", 0.9)))
+    else:
+        kw["do_sample"] = False
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        out = model.generate(**enc, **kw)
+    if DEV == "cuda": torch.cuda.synchronize()
+    elif DEV == "mps": torch.mps.synchronize()
+    reply = tk.decode(out[0, seq:], skip_special_tokens=True)
+    return {"ok": True, "text": reply, "n": int(out.shape[1] - seq), "ms": (time.perf_counter() - t0) * 1000}
+
 def model_dispatch(op: str, payload: dict) -> dict:
     if op == "load": return model_load(payload)
     if op == "forward": return model_forward(payload)
     if op == "generate": return model_generate(payload)
+    if op == "chat": return model_chat(payload)
     if op == "arch": return model_arch(payload)
-    if op == "unload": MODELS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
+    if op == "unload": MODELS.pop(payload.get("id"), None); MODEL_NAMES.pop(payload.get("id"), None); _TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     if op == "shard_load": return shard_load(payload)
     if op == "shard_forward": return shard_forward(payload)
     if op == "shard_unload": SHARDS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}

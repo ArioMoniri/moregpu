@@ -359,7 +359,9 @@ const modelHome = new Map<string, string>(); // resident model id → worker id
 // pipes the hidden state stage→stage (only [seq×hidden] activations cross the wire, never the weights).
 interface ShardStage { worker: string; start: number; end: number; first: boolean; last: boolean }
 const shardPlans = new Map<string, { model: string; stages: ShardStage[] }>();
-const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 120_000);
+// Generous by default: model_load/train_load download & instantiate a model on the worker, which for a
+// heavy model or a slow link can far exceed 2min. Fine-tuning + big-model inference need this headroom.
+const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 600_000);
 /** Native torch workers can fine-tune (autograd) and hold a whole model resident; WebGPU workers cannot. */
 const torchWorkers = () => activeFleet().filter((w) => w.label.includes('torch'));
 async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, RelayPending>, op: string, payload: unknown): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string }> {
@@ -834,6 +836,17 @@ async function handler(req: Request): Promise<Response> {
     const r = await modelRPC(w, 'forward', { id: mid, input_ids: body.input_ids, return_logits: !!body.return_logits, topk: body.topk });
     return r.ok ? json({ ok: true, ...r.data }) : json({ error: r.error }, 502);
   }
+  // Text in → text out (the worker tokenizes with the model's own tokenizer). Powers the /chat page.
+  if (req.method === 'POST' && url.pathname === '/model/chat') {
+    const body = await req.json().catch(() => ({})) as { id?: string; prompt?: string; max_new_tokens?: number; do_sample?: boolean; temperature?: number };
+    const mid = body.id ?? [...modelHome.keys()][0];
+    if (!mid || !modelHome.has(mid)) return json({ error: 'no resident model — POST /model/load first', models: [...modelHome.keys()] }, 409);
+    if (typeof body.prompt !== 'string' || !body.prompt.trim()) return json({ error: 'need {prompt}' }, 400);
+    const w = workers.get(modelHome.get(mid)!);
+    if (!w) { modelHome.delete(mid); return json({ error: 'model worker disconnected — reload it' }, 503); }
+    const r = await modelRPC(w, 'chat', { id: mid, prompt: body.prompt.slice(0, 8000), max_new_tokens: Math.max(1, Math.min(Number(body.max_new_tokens ?? 96), 1024)), do_sample: !!body.do_sample, temperature: body.temperature });
+    return r.ok ? json({ ok: true, worker: w.id, ...r.data }) : json({ error: r.error }, 502);
+  }
   if (req.method === 'POST' && url.pathname === '/model/unload') {
     const body = await req.json().catch(() => ({})) as { id?: string };
     const mid = body.id ?? [...modelHome.keys()][0];
@@ -958,6 +971,7 @@ async function handler(req: Request): Promise<Response> {
   }
   if (url.pathname === '/jobs') return json([...jobs.values()].slice(-50).reverse().map(({ output: _o, ...r }) => ({ ...r, hasOutput: !!_o })));
   if (url.pathname.startsWith('/jobs/')) { const r = jobs.get(url.pathname.slice(6)); return r ? json(r) : json({ error: 'not found' }, 404); }
+  if (url.pathname === '/chat') return new Response(CHAT_HTML, { headers: { 'content-type': 'text/html' } });
   return new Response(dashboard(), { headers: { 'content-type': 'text/html' } });
 }
 
@@ -1037,6 +1051,7 @@ button.ghost{background:#1a2133;color:#c7d2fe}
 button.mini{padding:4px 8px;font-size:11px;border-radius:7px;background:#26304a;color:#c7d2fe;margin:0 2px}
 button.mini.danger{background:#3a1d24;color:#fca5a5}
 .dutyin{width:50px;padding:4px 6px;font-size:11px}
+.dutyslider{width:96px;vertical-align:middle;accent-color:#818cf8;cursor:pointer}.dutyval{display:inline-block;width:34px;font-size:11px;color:var(--mut);text-align:right}
 td.ctl{white-space:nowrap}
 .logo{font-size:9px;line-height:1.05;margin:0 0 10px;font-family:ui-monospace,Menlo,monospace;overflow:auto;white-space:pre;background:linear-gradient(90deg,#5f5fff,#875fff,#af5fff,#d75fff,#ff5faf,#ff5f5f);-webkit-background-clip:text;background-clip:text;color:transparent}
 pre{background:#0e1420;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;max-height:260px;font-size:12px;margin:0}
@@ -1085,7 +1100,7 @@ function ctl(id,body,silent){return fetch('/workers/'+encodeURIComponent(id)+'/c
 function pauseAll(p){Promise.all((FLEET||[]).map(function(x){return ctl(x.id,{action:p?'pause':'resume'},true);})).then(refresh);}
 function renderFleet(){
  var el=document.getElementById('fleet');if(!el)return;
- var ae=document.activeElement;if(ae&&ae.classList&&ae.classList.contains('dutyin'))return; // don't clobber a duty field mid-edit
+ var ae=document.activeElement;if(ae&&ae.classList&&(ae.classList.contains('dutyin')||ae.classList.contains('dutyslider')))return; // don't clobber a duty field/slider mid-edit
  var q=(document.getElementById('fsearch').value||'').toLowerCase();
  var list=(FLEET||[]).filter(function(x){return !q||((x.nick||'')+' '+x.id+' '+x.backend+' '+(x.os||'')+' '+(x.label||'')).toLowerCase().indexOf(q)>=0;});
  list.sort(function(a,b){return (b.share||0)-(a.share||0);});
@@ -1101,8 +1116,8 @@ function renderFleet(){
    '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':(x.pausedReason==='errors'?'<span class=lvl-error>auto-paused</span>':'<span class=lvl-warn>paused</span>')):(x.busy?'working':'idle'))+'</td>'+
    '<td class=ctl>'+
      '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'" title="'+(paused?'resume':'pause')+'">'+(paused?'▶':'⏸')+'</button>'+
-     '<input class=dutyin value='+((x.ceil!=null?x.ceil:(x.poolDuty||0.6)).toFixed(2))+' title="duty ceiling 0.05–1">'+
-     '<button class=mini data-act=setduty data-id="'+esc(x.id)+'">set</button>'+
+     '<input type=range class=dutyslider min=0.05 max=1 step=0.05 value='+(x.ceil!=null?x.ceil:(x.poolDuty||0.6))+' data-id="'+esc(x.id)+'" title="usage ceiling — drag to change live">'+
+     '<span class=dutyval>'+Math.round((x.ceil!=null?x.ceil:(x.poolDuty||0.6))*100)+'%</span>'+
      '<button class="mini danger" data-act=remove data-id="'+esc(x.id)+'">✕</button>'+
    '</td></tr>';}).join(''):'<tr><td class=mut colspan=10>connect a worker…</td></tr>';
 }
@@ -1141,8 +1156,66 @@ document.getElementById('fleet').addEventListener('click',function(ev){
  var b=ev.target.closest&&ev.target.closest('button[data-act]');if(!b)return;
  var id=b.getAttribute('data-id'),act=b.getAttribute('data-act');
  if(act==='remove'){if(!confirm('Remove worker '+id+'?'))return;ctl(id,{action:'remove'});}
- else if(act==='setduty'){var inp=b.closest('tr').querySelector('input.dutyin');var v=parseFloat(inp&&inp.value);if(!isNaN(v))ctl(id,{ceil:v});}
  else ctl(id,{action:act});
 });
+// usage slider: live label while dragging, apply the ceiling on release (no full refresh, so it stays smooth)
+document.getElementById('fleet').addEventListener('input',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('dutyslider'))return;var v=s.parentNode.querySelector('.dutyval');if(v)v.textContent=Math.round(s.value*100)+'%';});
+document.getElementById('fleet').addEventListener('change',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('dutyslider'))return;ctl(s.getAttribute('data-id'),{ceil:parseFloat(s.value)},true);});
 refresh();setInterval(refresh,2500);
+</script>`;
+
+// ---- /chat : a minimal chatbot page to test a served model (text↔text via the worker's tokenizer) ----
+const CHAT_HTML = `<!doctype html><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><title>MoreGPU · chat</title>
+<style>
+:root{--bg:#0b0f17;--card:#111827;--line:#1f2937;--fg:#e5e7eb;--mut:#8792a8;--acc:#818cf8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:820px;margin:0 auto;padding:20px}
+.logo{font:9px/1.05 ui-monospace,Menlo,monospace;white-space:pre;background:linear-gradient(90deg,#5f5fff,#875fff,#af5fff,#d75fff,#ff5faf,#ff5f5f);-webkit-background-clip:text;background-clip:text;color:transparent;margin:0 0 6px}
+h1{font-size:18px;margin:0 0 12px}a{color:#a5b4fc}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0}
+input,button{font:inherit;background:#0e1420;color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:8px 11px}
+input[type=password],#model{min-width:150px}#prompt{flex:1;min-width:220px}
+button{background:var(--acc);border-color:var(--acc);color:#0b1020;font-weight:600;cursor:pointer}
+button.g{background:#0e1420;color:var(--fg);border-color:var(--line);font-weight:500}
+.mut{color:var(--mut);font-size:13px}
+.chat{min-height:260px;max-height:56vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px;margin:10px 0}
+.msg{padding:9px 12px;border-radius:12px;max-width:88%;white-space:pre-wrap;word-wrap:break-word}
+.msg.user{align-self:flex-end;background:#312e81;border:1px solid #4338ca}
+.msg.bot{align-self:flex-start;background:#0e1420;border:1px solid var(--line)}
+</style>
+<div class=wrap>
+<pre class=logo>███╗   ███╗ ██████╗ ██████╗ ███████╗ ██████╗ ██████╗ ██╗   ██╗
+██║ ╚═╝ ██║╚██████╔╝██║  ██║███████╗╚██████╔╝██║     ╚██████╔╝</pre>
+<h1>MoreGPU · chat <span class=mut>— test a model served on your pool · <a href="/">admin panel</a></span></h1>
+<div class=bar>
+<input id=tok type=password placeholder="admin token">
+<input id=model value="gpt2" placeholder="HF model (gpt2 · Qwen/Qwen2.5-0.5B …)">
+<input id=worker placeholder="worker (optional, e.g. colab-cuda)" style="min-width:150px">
+<button onclick=load()>Load</button>
+<span id=status class=mut></span>
+</div>
+<div id=chat class=chat></div>
+<div class=bar>
+<input id=prompt placeholder="message…  (Enter to send)" onkeydown="if(event.key==='Enter')send()">
+<button onclick=send() id=sendb>Send</button>
+<label class=mut>max <input id=mnt type=number value=96 style="width:64px"></label>
+<label class=mut><input id=samp type=checkbox> sample</label>
+</div>
+<p class=mut>Weights load and run on the chosen worker's GPU — pin a Colab worker so nothing lands on your laptop. Loading a heavy model the first time can take a minute.</p>
+</div>
+<script>
+var K='moregpu_admin_token',tokEl=document.getElementById('tok');tokEl.value=localStorage.getItem(K)||'';
+tokEl.onchange=function(){localStorage.setItem(K,tokEl.value.trim());};
+function H(){return {'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||tokEl.value.trim())};}
+var MID=null;
+function add(role,text){var d=document.getElementById('chat'),el=document.createElement('div');el.className='msg '+role;el.textContent=text;d.appendChild(el);d.scrollTop=d.scrollHeight;return el;}
+function load(){localStorage.setItem(K,tokEl.value.trim());var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),s=document.getElementById('status');s.textContent='loading '+m+'…';
+ var b={model:m,id:m};if(wk)b.worker=wk;
+ fetch('/model/load',{method:'POST',headers:H(),body:JSON.stringify(b)}).then(function(r){return r.json();}).then(function(r){
+  if(r.error){s.textContent='✗ '+r.error;return;}MID=r.id||m;s.textContent='✓ '+MID+' on '+r.worker+' · '+r.device+' · '+((r.n_params||0)).toLocaleString()+' params';}).catch(function(e){s.textContent='✗ '+e;});}
+function send(){var p=document.getElementById('prompt'),text=p.value.trim();if(!text)return;if(!MID){alert('Load a model first (top bar).');return;}
+ add('user',text);p.value='';var rep=add('bot','…'),sb=document.getElementById('sendb');sb.disabled=true;
+ var body={id:MID,prompt:text,max_new_tokens:(+document.getElementById('mnt').value)||96,do_sample:document.getElementById('samp').checked};
+ fetch('/model/chat',{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(r){
+  rep.textContent=r.error?('✗ '+r.error):((r.text||'(empty)')+(r.ms?'   ·  '+(r.ms/1000).toFixed(1)+'s on '+r.worker:''));sb.disabled=false;}).catch(function(e){rep.textContent='✗ '+e;sb.disabled=false;});}
 </script>`;
