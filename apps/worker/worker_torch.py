@@ -658,6 +658,7 @@ def model_chat(payload: dict) -> dict:
     return {"ok": True, "text": reply, "n": int(out.shape[1] - seq), "ms": (time.perf_counter() - t0) * 1000}
 
 def model_dispatch(op: str, payload: dict) -> dict:
+    if op == "ping": return {"ok": True, "pong": True, "n": len(payload.get("blob", ""))}  # echo → coordinator times RTT (empty blob) or throughput (large blob)
     if op == "load": return model_load(payload)
     if op == "push_begin": return model_push_begin(payload)
     if op == "push_chunk": return model_push_chunk(payload)

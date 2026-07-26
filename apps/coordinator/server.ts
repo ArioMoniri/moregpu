@@ -824,10 +824,48 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === '/health') return json({ ok: true, fleet: workers.size, queue: queue.length });
   if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/device', '/gpu', '/workers', 'POST /workers/:id/control', 'POST /submit (?async=1)', '/jobs', '/jobs/:id', '/logs', '/metrics'], workerSchedule: 'MOREGPU_SCHEDULE=always|idle-only|HH:MM-HH:MM', auth: 'admin endpoints require Authorization: Bearer <admin token>' });
   // admin-gated
-  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || url.pathname.startsWith('/train/') || url.pathname.startsWith('/model/') || (req.method === 'POST' && url.pathname === '/submit')) {
+  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights', '/net'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || url.pathname.startsWith('/train/') || url.pathname.startsWith('/model/') || (req.method === 'POST' && url.pathname === '/submit')) {
     if (!authOk(req)) return json({ error: 'unauthorized — send Authorization: Bearer <admin token>' }, 401);
   }
   if (url.pathname === '/gpu') return json(virtualGpu());
+  // Fleet network self-test: MoreGPU's viable workloads depend entirely on round-trip latency. Sub-ms (a LAN of
+  // idle desktops) makes pipeline/expert sharding of big models viable; 100s of ms (a public tunnel) means only
+  // single-node serving + coarse DiLoCo make sense. Measure each torch worker's RTT (min of a few timed pings)
+  // and give an HONEST, latency-aware recommendation — no guessing whether your fleet can host a big model.
+  if (url.pathname === '/net') {
+    const cands = torchWorkers();
+    const BW_BYTES = 2 << 20; // ~2 MiB probe → base64 blob echoed once to estimate upload throughput
+    const bwBuf = new Uint8Array(BW_BYTES); // getRandomValues caps at 64 KiB/call → fill in chunks (entropy avoids any deflate skew)
+    for (let o = 0; o < BW_BYTES; o += 65536) crypto.getRandomValues(bwBuf.subarray(o, Math.min(o + 65536, BW_BYTES)));
+    const blob = b64e(bwBuf);
+    const rows = await Promise.all(cands.map(async (w) => {
+      let rtt = Infinity;
+      for (let i = 0; i < 4; i++) { const t0 = performance.now(); const r = await modelRPC(w, 'ping', {}); if (r.ok) rtt = Math.min(rtt, performance.now() - t0); }
+      let mbps: number | null = null;
+      const t1 = performance.now(); const br = await modelRPC(w, 'ping', { blob });
+      if (br.ok) { const secs = Math.max(1e-3, (performance.now() - t1 - (Number.isFinite(rtt) ? rtt : 0)) / 1000); mbps = +((BW_BYTES / 1e6) / secs).toFixed(1); }
+      return { id: w.id, backend: w.label, rtt_ms: Number.isFinite(rtt) ? +rtt.toFixed(2) : null, up_mbps: mbps };
+    }));
+    const rtts = rows.map((r) => r.rtt_ms).filter((x): x is number => x != null).sort((a, b) => a - b);
+    const median = rtts.length ? rtts[Math.floor(rtts.length / 2)] : null;
+    const bws = rows.map((r) => r.up_mbps).filter((x): x is number => x != null).sort((a, b) => a - b);
+    const medBw = bws.length ? bws[Math.floor(bws.length / 2)] : null;
+    // Two independent limits: LATENCY (round-trips) gates single-request sharded DECODE; BANDWIDTH gates weight
+    // transfer + throughput. A fat internet pipe does NOT lower RTT — so distinguish honestly.
+    const latencyBound = median == null ? [] :
+      median < 2 ? ['single-request tensor / expert parallelism (2·layers syncs/token) — needs a LAN, and you have one']
+      : median < 20 ? ['single-request pipeline-sharded decode (a few hops/token) — workable; per-token tensor/expert parallelism is marginal']
+      : ['single-request sharded decode is latency-bound at this RTT — it will be slow per token no matter your bandwidth (round-trips can\'t be bought with Mbps)'];
+    const alwaysWorks = ['single-node resident serving (whole model on one node — any RTT)',
+      'DiLoCo LoRA fine-tuning (syncs rarely + small adapters — latency-tolerant, fine over the internet if bandwidth allows)',
+      'download-free model loading (bandwidth-bound — "if the internet allows" applies here: fast pipe ⇒ fast load)',
+      'throughput serving for many users (batching hides per-request latency — a WAN with good bandwidth still gives high aggregate tok/s)'];
+    const note = median == null ? 'no torch workers to probe' :
+      median < 2 ? 'LAN-class RTT — the full menu is viable here, including single-request sharded/expert-parallel hosting of big models.' :
+      median < 20 ? 'fast link — single-request pipeline sharding is viable; the internet-tolerant workloads all work.' :
+      'WAN-class RTT — over the internet, use the latency-TOLERANT workloads (single-node serving, DiLoCo fine-tuning, download-free loading, throughput-batched serving). Single-request sharded DECODE stays slow: that is round-trip latency, which more bandwidth cannot fix.';
+    return json({ ok: true, workers: rows, median_rtt_ms: median, median_up_mbps: medBw, latency_tolerant_anywhere: alwaysWorks, latency_bound_needs_low_rtt: latencyBound, note });
+  }
   if (url.pathname === '/device') return json(deviceDescriptor());
   if (url.pathname === '/workers') {
     const totalOps = [...workers.values()].reduce((s, w) => s + w.ops, 0) || 1; // share of compute OPERATIONS (consistent unit)
@@ -979,9 +1017,17 @@ async function handler(req: Request): Promise<Response> {
     diloco.busy = true;
     try {
     const results = await Promise.all(live.map((w) => trainRPC(w, 'inner', { steps: H, lr, batches: batches[w.id] ?? batches['*'] ?? [] })));
-    const good = live.map((w, i) => ({ w, r: results[i] })).filter((x) => x.r.ok && x.r.data?.tensors);
-    if (good.length === 0) return json({ error: `inner step failed: ${results[0]?.error}` }, 502);
-    // average the workers' post-inner-step adapters
+    const okWorkers = live.map((w, i) => ({ w, r: results[i] })).filter((x) => x.r.ok && x.r.data?.tensors);
+    // Reject a worker whose adapter carries ANY non-finite value (a diverged/exploded local step, or a poisoned
+    // node) BEFORE it enters the average — one NaN/Inf would corrupt the whole global adapter for every worker.
+    const nonFinite: string[] = [];
+    const good = okWorkers.filter(({ w, r }) => {
+      for (const arr of tensorsFromReply(r.data!).values()) for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) { nonFinite.push(w.id); return false; }
+      return true;
+    });
+    if (nonFinite.length) log('warn', `DiLoCo: dropped ${nonFinite.join(', ')} from the average — non-finite adapter (diverged/poisoned)`);
+    if (good.length === 0) return json({ error: `inner step produced no usable adapter${nonFinite.length ? ` (all non-finite: ${nonFinite.join(', ')})` : `: ${results[0]?.error}`}` }, 502);
+    // average the surviving workers' post-inner-step adapters
     const avg = new Map<string, Float32Array>();
     for (const n of diloco.global.keys()) {
       const acc = new Float32Array(diloco.global.get(n)!.length); let cnt = 0;
@@ -1011,7 +1057,7 @@ async function handler(req: Request): Promise<Response> {
     const worker_losses = good.map(({ w, r }) => ({ worker: w.id, losses: r.data!.losses as number[] }));
     const avg_last_loss = worker_losses.reduce((s, x) => s + (x.losses[x.losses.length - 1] ?? 0), 0) / worker_losses.length;
     log('info', `DiLoCo round ${diloco.round}: ${good.length} workers · avg last loss ${avg_last_loss.toFixed(4)}${dropped.length ? ` · dropped ${dropped.length}` : ''}`);
-    return json({ ok: true, round: diloco.round, workers: good.length, avg_last_loss, worker_losses, dropped: dropped.length ? dropped : undefined });
+    return json({ ok: true, round: diloco.round, workers: good.length, avg_last_loss, worker_losses, dropped: dropped.length ? dropped : undefined, dropped_nonfinite: nonFinite.length ? nonFinite : undefined });
     } finally { if (diloco) diloco.busy = false; }
   }
   if (req.method === 'POST' && url.pathname === '/train/diloco/adapter') {

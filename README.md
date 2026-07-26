@@ -48,6 +48,22 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 >
 > The torch worker is a **separate, admin-installed native tier** — not the zero-install WGSL worker — and it speaks the *same* sealed protocol, so it joins the *same* pool. Distributed training (**DiLoCo across many workers**) works today; **async DiLoCo, cross-tenant secure aggregation, and big 7B+ single-model inference remain roadmap.**
 
+### 🌐 Network reality — where MoreGPU shines (and where physics says no)
+
+What you can do with a pool depends almost entirely on **round-trip latency (RTT)**, and two very different limits apply — don't conflate them:
+
+- **Latency** (round-trips) gates *single-request* sharded/parallel **decode**. Each decoded token needs several network round-trips (a few for pipeline sharding, `2·layers` for tensor parallelism). More bandwidth **cannot** buy this down — it's the speed of light plus relay hops.
+- **Bandwidth** gates *weight transfer* and *aggregate throughput*.
+
+| Your fleet | RTT | What's genuinely viable |
+|---|---|---|
+| **LAN of idle machines** (institutional desktops, a lab, one datacenter) | ~0.1–1 ms | **The full menu** — including hosting a model *too big for one node* by sharding it across many (a token crosses several sub-ms hops). This is MoreGPU's sweet spot. |
+| **Open internet / public tunnel** | ~50–700 ms | The **latency-tolerant** workloads: single-node resident serving, **DiLoCo fine-tuning** (syncs rarely, tiny adapters), **download-free model loading** (bandwidth-bound — "if the internet allows" applies *here*), and **throughput serving for many users** (batching hides per-request latency). Single-request *sharded decode* stays slow — that's latency, not bandwidth. |
+
+**Measure your own fleet:** `GET /net` (admin) pings every node and reports each one's RTT + effective transfer throughput, then tells you honestly which workloads that network supports — no guessing whether your machines can host a big model.
+
+**Toward hosting Kimi-class models on idle desktops** (the honest roadmap): dense-model **download-free pipeline sharding** works today (`POST /model/shard {push:true}`, verified byte-for-byte). A ~1T-param **MoE** like Kimi K2 is actually the *easier* target to distribute — only ~32B params fire per token, so **expert parallelism** (place experts on different nodes, route each token to just the ~8 holding its active experts) moves far less than a dense 1T model would. That path — expert placement/routing, sharded-safetensors sources, int4 quant, and surviving node churn — is a **months-long build, not shipped**; it's the direction, not a claim.
+
 <p align="center">
   <img src="docs/assets/serve-terminal.svg" alt="Serving GPT-2 on the pool via the resident-model path — exact match to transformers, up to ~66 tok/s warm/unloaded" width="49%">
   <img src="docs/assets/train-terminal.svg" alt="LoRA fine-tuning GPT-2 on the pool — loss falls, verified bit-for-bit against a seeded reference" width="49%">
