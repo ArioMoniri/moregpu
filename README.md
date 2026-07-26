@@ -36,7 +36,7 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Training / fine-tuning (LoRA) | 🟡 | **LoRA fine-tuning on the torch worker** — single-worker ([`lora_finetune.py`](examples/lora_finetune.py)) *and* **distributed across N workers via DiLoCo** ([`lora_distributed.py`](examples/lora_distributed.py)): each worker trains its own shard for H local steps, the **coordinator averages the adapters + applies an outer Nesterov step** (a real reduce path), broadcasts the global. Single-worker is verified **bit-for-bit** against a seeded reference; distributed DiLoCo matches a seeded reference to **fp tolerance** (losses ~2e-5, adapter ~1e-3). Synchronous DiLoCo; async + secure-aggregation are the next step. Needs the torch worker, not the WGSL path. |
 | Modern architectures (RMSNorm · RoPE · SwiGLU · GQA) | 🟡 | **Qwen3-0.6B runs on the pool** matching Hugging Face token-for-token ([`generic_infer.py`](examples/generic_infer.py)) — proof the pool isn't GPT-2-specific. Forward-only, round-trip-bound (~minutes/token); a portability proof, not a speed win. |
 | Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
-| CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
+| Custom CUDA/PTX kernels · tensor-core / int8 GEMM · Stable Diffusion · OptiX · NVENC | ❌ | The portable WGSL path is compute-only fp32/fp16 — none of these. The opt-in **torch worker does run on CUDA via PyTorch** on NVIDIA (real CUDA acceleration for serving/training/sharding), but MoreGPU writes **no custom CUDA/PTX kernels**, uses no tensor-core/int8 GEMM, and has no graphics/codec paths. |
 
 **In one line:** every kernel it ships — tiled matmul, elementwise/activations, softmax and layernorm — runs **on your real GPU** (WGSL → Metal/Vulkan/D3D12) on a GPU worker, with verified fp32 results, and you **compose** them into attention, transformer blocks, and small classifiers. An **opt-in native torch worker** adds device-resident model serving (fast GPT-2, exact match) and LoRA fine-tuning — single-worker and distributed (DiLoCo). It is still not a drop-in for big-model (7B+) inference, tensor-core speed, CUDA kernels, or graphics.
 
@@ -334,10 +334,11 @@ Drive the pool from an application with the client SDK, or the CLI.
 pip install moregpu-client                        # Python SDK — on PyPI
 brew install --cask ArioMoniri/moregpu/moregpu    # `moregpu` CLI (installs Deno)
 npm install https://github.com/ArioMoniri/moregpu/releases/latest/download/moregpu-client-0.6.0.tgz   # TS/JS SDK
+docker run -p 8787:8787 -v moregpu:/data ghcr.io/ariomoniri/moregpu:latest   # coordinator container (GitHub Packages)
 ```
 
 > [!NOTE]
-> `moregpu-client` is [live on PyPI](https://pypi.org/project/moregpu-client/). The JS SDK isn't on npmjs yet (install from the release tarball above, or `npm login` and publish per [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing)).
+> **Published packages:** [`moregpu-client`](https://pypi.org/project/moregpu-client/) on PyPI · the coordinator image [`ghcr.io/ariomoniri/moregpu`](https://github.com/ArioMoniri/moregpu/pkgs/container/moregpu) on GitHub Packages · the [`moregpu`](https://github.com/ArioMoniri/homebrew-moregpu) Homebrew cask. The JS SDK isn't on npmjs yet (install from the release tarball above, or `npm login` and publish per [CONTRIBUTING.md](CONTRIBUTING.md#releasing--publishing)).
 
 **JavaScript / TypeScript** ([`@moregpu/client`](packages/client), runs in Deno / Node / browsers):
 
