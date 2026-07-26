@@ -419,6 +419,10 @@ const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 600_
 /** Native torch workers can fine-tune (autograd) and hold a whole model resident; WebGPU workers cannot. */
 const torchWorkers = () => activeFleet().filter((w) => w.label.includes('torch'));
 async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, RelayPending>, op: string, payload: unknown): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string }> {
+  // Bail fast if the socket is already closed: a chunk sent AFTER onclose ran (e.g. the next push in a multi-chunk
+  // stream, once onclose rejected the in-flight one) would otherwise sit in `pend` for the full RELAY_TIMEOUT_MS —
+  // onclose won't fire again to reject it. Surfacing the disconnect immediately is what lets a stage retry promptly.
+  if (w.ws.readyState !== WebSocket.OPEN) return { ok: false, error: `worker ${w.id} disconnected` };
   const reqId = `${kind}-${++relaySeq}`;
   const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify(payload)));
   // Bind the reply to THIS worker's id, so another worker can't resolve someone else's RPC (see train_reply handler).
@@ -466,6 +470,12 @@ const PUSH_CHUNK = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_CHUNK') ?
 // env-tunable). The index.json is metadata (KB) so it gets a much tighter cap of its own.
 const PUSH_MAX_BYTES = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_MAX_BYTES') ?? (20 * (1 << 30))));
 const PUSH_INDEX_MAX = 64 << 20; // a safetensors index is normally KB; refuse a multi-GB one before .text()
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// Churn tolerance for a download-free shard: a stage worker that drops mid-stream (slow/flaky tunnel, Colab blip)
+// reconnects under the same id via the keepalive, so we WAIT for it and re-stream just that stage instead of
+// nuking a 10-minute load. Bounded by tries-per-stage and a per-reconnect wait (both under the overall deadline).
+const SHARD_STAGE_TRIES = Math.max(1, Number(Deno.env.get('MOREGPU_SHARD_STAGE_TRIES') ?? 6));
+const SHARD_RECONNECT_WAIT_MS = Math.max(0, Number(Deno.env.get('MOREGPU_SHARD_RECONNECT_WAIT_MS') ?? 180_000));
 // model id must be a plain HF repo ref (owner/name or a canonical alias) — it goes straight into a URL.
 const HF_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
 // the finite set of hub files a causal-LM load may need; each is fetched, and a 404 is simply skipped.
@@ -1278,30 +1288,47 @@ async function handler(req: Request): Promise<Response> {
     const runLoad = async (): Promise<(ShardStage & { params_held?: number; bytes?: number })[]> => {
       const info: (ShardStage & { params_held?: number; bytes?: number })[] = [];
       const unloadAll = async () => { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }).catch(() => {}); } };
-      for (const st of stages) {
-        const w = workers.get(st.worker);
-        if (!w) { await unloadAll(); throw new Error(`stage worker ${st.worker} vanished`); }
-        let r: { ok: boolean; data?: Record<string, unknown>; error?: string }; let stageBytes = 0;
-        if (push) {
-          try {
-            const begin = await modelRPC(w, 'push_begin', { id: sid, model }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
-            const budget = { left: PUSH_MAX_BYTES };
-            const cb = new TextEncoder().encode(configText!);
-            const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
-            if (st.first) { // stream the tokenizer to the FIRST stage so a browser can chat this sharded model
-              for (const f of ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja', 'generation_config.json']) {
-                const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
-              }
+      // Stream ONE stage's slice to a worker. A fresh push_begin wipes the worker's staging for this id, so every
+      // attempt starts clean (no half-file resume needed). Any transport/disconnect error becomes {ok:false}.
+      const loadStage = async (st: ShardStage, w: Worker): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> => {
+        if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last }); return { ...r, bytes: 0 }; }
+        try {
+          const begin = await modelRPC(w, 'push_begin', { id: sid, model }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+          const budget = { left: PUSH_MAX_BYTES };
+          const cb = new TextEncoder().encode(configText!);
+          const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+          if (st.first) { // stream the tokenizer to the FIRST stage so a browser can chat this sharded model
+            for (const f of ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja', 'generation_config.json']) {
+              const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
             }
-            const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
-            stageBytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
-            r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
-          } catch (e) { r = { ok: false, error: e instanceof Error ? e.message : String(e) }; }
-        } else {
-          r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last });
+          }
+          const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
+          const bytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
+          const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
+          return { ...r, bytes };
+        } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }
+      };
+      // Wait (bounded) for a churned-out stage worker to reconnect under the SAME id — the keepalive reconnect means
+      // a transient tunnel/Colab blip no longer nukes a long load; we just re-stream that one stage.
+      const waitForWorker = async (id: string): Promise<Worker | undefined> => {
+        const until = Date.now() + SHARD_RECONNECT_WAIT_MS; let w = workers.get(id);
+        while (!w && Date.now() < until && !shardLoads.get(sid)?.aborted) { await sleep(1500); w = workers.get(id); }
+        return w;
+      };
+      for (const st of stages) {
+        let r: { ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number } | null = null;
+        for (let attempt = 1; ; attempt++) {
+          if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); }
+          const w = workers.get(st.worker) ?? await waitForWorker(st.worker);
+          if (!w) { await unloadAll(); throw new Error(`stage worker ${st.worker} never (re)connected within ${SHARD_RECONNECT_WAIT_MS}ms (layers ${st.start}-${st.end})`); }
+          r = await loadStage(st, w);
+          if (r.ok) break;
+          const cw = workers.get(st.worker); if (cw) await modelRPC(cw, 'shard_unload', { id: sid }).catch(() => {}); // drop partial staging before retry
+          if (attempt >= SHARD_STAGE_TRIES) { await unloadAll(); throw new Error(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}) after ${attempt} tries: ${r.error}`); }
+          log('warn', `shard ${sid} stage ${st.worker} (layers ${st.start}-${st.end}) attempt ${attempt}/${SHARD_STAGE_TRIES} failed (${r.error}) — waiting for reconnect, then re-streaming`);
+          await sleep(1500);
         }
-        if (!r.ok) { await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); await unloadAll(); throw new Error(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}): ${r.error}`); }
-        info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: stageBytes || undefined });
+        info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: r.bytes || undefined });
         const ls = shardLoads.get(sid); if (ls) ls.stagesDone = info.length; // progress for the poller
         if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); } // deadline fired → don't resurrect
       }
@@ -1334,8 +1361,10 @@ async function handler(req: Request): Promise<Response> {
       return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages_total: nStages, status: 'loading', poll: `/model/shard_status?id=${encodeURIComponent(sid)}` });
     }
     try {
+      const started = Date.now();
+      shardLoads.set(sid, { status: 'loading', model, started, stagesDone: 0, stagesTotal: nStages }); // fresh state — never inherit a prior load's `aborted`
       const info = await runLoad();
-      shardLoads.set(sid, { status: 'ready', model, started: Date.now(), stagesDone: nStages, stagesTotal: nStages, info });
+      shardLoads.set(sid, { status: 'ready', model, started, stagesDone: nStages, stagesTotal: nStages, info });
       return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages: info });
     } catch (e) { return fail(e instanceof Error ? e.message : String(e), 502); }
   }
