@@ -858,17 +858,21 @@ async function handler(req: Request): Promise<Response> {
   // and give an HONEST, latency-aware recommendation — no guessing whether your fleet can host a big model.
   if (url.pathname === '/net') {
     const cands = torchWorkers();
-    const BW_BYTES = 2 << 20; // ~2 MiB probe → base64 blob echoed once to estimate upload throughput
+    const BW_BYTES = 512 << 10; // 512 KiB probe — enough to gauge throughput, small enough not to stall a slow link
     const bwBuf = new Uint8Array(BW_BYTES); // getRandomValues caps at 64 KiB/call → fill in chunks (entropy avoids any deflate skew)
     for (let o = 0; o < BW_BYTES; o += 65536) crypto.getRandomValues(bwBuf.subarray(o, Math.min(o + 65536, BW_BYTES)));
     const blob = b64e(bwBuf);
+    const BW_CAP_MS = 10_000; // one slow/dead node must never hang the self-test → cap each probe and report what we got
+    const cap = <T>(p: Promise<{ ok: boolean } & T>, ms: number) => Promise.race([p, new Promise<{ ok: false }>((res) => setTimeout(() => res({ ok: false }), ms))]);
     const rows = await Promise.all(cands.map(async (w) => {
       let rtt = Infinity;
-      for (let i = 0; i < 4; i++) { const t0 = performance.now(); const r = await modelRPC(w, 'ping', {}); if (r.ok) rtt = Math.min(rtt, performance.now() - t0); }
+      for (let i = 0; i < 4; i++) { const t0 = performance.now(); const r = await cap(modelRPC(w, 'ping', {}), 4000); if (r.ok) rtt = Math.min(rtt, performance.now() - t0); else break; }
       let mbps: number | null = null;
-      const t1 = performance.now(); const br = await modelRPC(w, 'ping', { blob });
+      const t1 = performance.now(); const br = await cap(modelRPC(w, 'ping', { blob }), BW_CAP_MS);
       if (br.ok) { const secs = Math.max(1e-3, (performance.now() - t1 - (Number.isFinite(rtt) ? rtt : 0)) / 1000); mbps = +((BW_BYTES / 1e6) / secs).toFixed(1); }
-      return { id: w.id, backend: w.label, rtt_ms: Number.isFinite(rtt) ? +rtt.toFixed(2) : null, up_mbps: mbps };
+      // if the probe didn't finish in the cap, the link is slower than 512KB/10s ≈ 0.4 Mbps → report that honestly
+      const slowNote = (mbps == null && Number.isFinite(rtt)) ? `< ${((BW_BYTES * 8 / 1e6) / (BW_CAP_MS / 1000)).toFixed(1)} Mbps (probe capped at ${BW_CAP_MS / 1000}s)` : undefined;
+      return { id: w.id, backend: w.label, rtt_ms: Number.isFinite(rtt) ? +rtt.toFixed(2) : null, up_mbps: mbps, up_note: slowNote };
     }));
     const rtts = rows.map((r) => r.rtt_ms).filter((x): x is number => x != null).sort((a, b) => a - b);
     const median = rtts.length ? rtts[Math.floor(rtts.length / 2)] : null;
@@ -1496,6 +1500,9 @@ a{color:#a5b4fc}.sp{margin-top:16px}.k{display:inline-block;background:#1a2133;c
 <div class="card sp"><h3>Fleet — live contribution &amp; control</h3>
   <div class=row><input id=fsearch placeholder="filter by name / type / OS" style="flex:1;min-width:200px" oninput=renderFleet()><button class=ghost onclick=pauseAll(true)>Pause all</button><button class=ghost onclick=pauseAll(false)>Resume all</button><span id=fcount class=mut></span></div>
   <div style="overflow:auto"><table><thead><tr><th>worker</th><th>type</th><th title="share of compute OPERATIONS (kernel shards + serving calls + training rounds — one consistent unit; not tokens-vs-elements)">activity</th><th title="ops/interval: kernel shards + LLM serving calls + training rounds">trend</th><th>shards</th><th title="kernel output-elements (matmul/etc.)">units</th><th title="LLM tokens generated on this node">tokens</th><th>user load</th><th>pool duty</th><th>state</th><th>control</th></tr></thead><tbody id=fleet><tr><td class=mut colspan=11>connect a worker…</td></tr></tbody></table></div></div>
+<div class="card sp"><h3>Network self-test <span class=mut>— what your fleet's link can actually do</span></h3>
+  <div class=row><button onclick=netTest() id=netbtn class=g>Run self-test</button> <span id=netnote class=mut></span></div>
+  <div id=nettable class=mut style="margin-top:8px">Latency gates single-request sharded decode (needs a LAN); bandwidth gates weight transfer + throughput. Run it to see which workloads THIS fleet supports.</div></div>
 <div class="card sp"><h3>Per-kernel jobs</h3><div id=kernels class=mut>—</div></div>
 <div class="card sp"><h3>Errors &amp; debug log</h3><pre id=logs>—</pre></div>
 </div>
@@ -1510,6 +1517,19 @@ function fmt(n){n=n||0;return n>=1e9?(n/1e9).toFixed(1)+'G':n>=1e6?(n/1e6).toFix
 let FLEET=[];
 function ctl(id,body,silent){return fetch('/workers/'+encodeURIComponent(id)+'/control',{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(){if(!silent)refresh();}).catch(function(){});}
 function pauseAll(p){Promise.all((FLEET||[]).map(function(x){return ctl(x.id,{action:p?'pause':'resume'},true);})).then(refresh);}
+function netTest(){var b=document.getElementById('netbtn');b.disabled=true;b.textContent='probing…';document.getElementById('netnote').textContent='';
+ fetch('/net',{headers:H()}).then(function(r){return r.json();}).then(function(d){
+  b.disabled=false;b.textContent='Run self-test';
+  if(d.error){document.getElementById('netnote').textContent='✗ '+d.error;return;}
+  document.getElementById('netnote').textContent='median RTT '+(d.median_rtt_ms==null?'–':d.median_rtt_ms+' ms')+(d.median_up_mbps!=null?' · '+d.median_up_mbps+' Mbps up':'');
+  var rows=(d.workers||[]).map(function(w){return '<tr><td>'+esc(w.id)+'</td><td>'+(w.rtt_ms==null?'–':w.rtt_ms+' ms')+'</td><td>'+(w.up_mbps==null?esc(w.up_note||'–'):w.up_mbps+' Mbps')+'</td></tr>';}).join('');
+  var li=function(a){return (a||[]).map(function(x){return '<li>'+esc(x)+'</li>';}).join('');};
+  document.getElementById('nettable').innerHTML=
+    '<table><thead><tr><th>worker</th><th>RTT</th><th>up</th></tr></thead><tbody>'+rows+'</tbody></table>'+
+    '<div style="margin-top:8px;color:var(--fg)">'+esc(d.note||'')+'</div>'+
+    '<div style="margin-top:6px"><b>✓ works anywhere (latency-tolerant):</b><ul>'+li(d.latency_tolerant_anywhere)+'</ul>'+
+    '<b>needs low RTT (single-request sharded decode):</b><ul>'+li(d.latency_bound_needs_low_rtt)+'</ul></div>';
+ }).catch(function(e){b.disabled=false;b.textContent='Run self-test';document.getElementById('netnote').textContent='✗ '+e;});}
 function renderFleet(){
  var el=document.getElementById('fleet');if(!el)return;
  var ae=document.activeElement;if(ae&&ae.classList&&(ae.classList.contains('dutyin')||ae.classList.contains('dutyslider')))return; // don't clobber a duty field/slider mid-edit

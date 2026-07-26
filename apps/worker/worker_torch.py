@@ -505,6 +505,14 @@ def shard_load(cfg: dict) -> dict:
         st = PUSH.get(sid)
         if st is None:
             raise RuntimeError("shard weights not staged — push_begin/push_chunk must precede a push shard_load")
+        # Loading a PARTIAL checkpoint (only this stage's tensors) makes transformers log a scary "checkpoint
+        # seems corrupted / keys MISSING" report — but that's BY DESIGN (the other stages' weights live on other
+        # nodes; the missing ones here are random-init then dropped when we slice to our blocks). Quiet it so it
+        # doesn't look like a failure; a genuine load error still raises.
+        try:
+            from transformers.utils import logging as _tflog; _tflog.set_verbosity_error()
+        except Exception:
+            pass
         model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
     else:
         # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
