@@ -496,11 +496,19 @@ def shard_load(cfg: dict) -> dict:
     from transformers import AutoModelForCausalLM
     sid = cfg["id"]; start, end = int(cfg["start"]), int(cfg["end"])
     first, last = bool(cfg.get("first")), bool(cfg.get("last"))
-    # TODO(review): this still materializes the FULL model on-device before slicing to this stage's blocks,
-    # which defeats the "too big for one machine" story (and can OOM). low_cpu_mem_usage=True keeps the CPU
-    # staging buffer small; the full fix is per-layer loading (meta device + device_map, or a pre-split
-    # checkpoint) so a stage never instantiates the whole model's weights.
-    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
+    if cfg.get("push"):
+        # DOWNLOAD-FREE: the coordinator streamed this stage's config + a per-stage safetensors (only the
+        # tensors this stage needs) into PUSH[sid]'s dir. Build the arch from config and load ONLY the present
+        # (this-stage) weights — missing layers random-init but get dropped below when we slice to our blocks —
+        # so the worker never touches the HF hub. (No low_cpu_mem_usage: with a partial checkpoint the missing
+        # tensors must be real-initialized on CPU, not left on meta, or .to(DEV) can't move them.)
+        st = PUSH.get(sid)
+        if st is None:
+            raise RuntimeError("shard weights not staged — push_begin/push_chunk must precede a push shard_load")
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
+    else:
+        # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
     arch = _shard_arch(model)
     mc = model.config
     shard: dict = {"arch": arch, "first": first, "last": last, "start": start, "end": end,
@@ -542,8 +550,10 @@ def shard_load(cfg: dict) -> dict:
     del base, model
     _empty_cache()
     SHARDS[sid] = shard
+    if cfg.get("push"):
+        _push_cleanup(sid)  # stage weights are now sliced into SHARDS — drop the staged partial safetensors
     return {"ok": True, "id": sid, "layers": [start, end], "first": first, "last": last,
-            "n_layer": shard["n_layer"], "arch": arch, "params_held": params_held}
+            "n_layer": shard["n_layer"], "arch": arch, "params_held": params_held, "mode": "download-free" if cfg.get("push") else "download"}
 
 def shard_forward(payload: dict) -> dict:
     """Run ONE stage's blocks. If first: embed input_ids → hidden; else: reshape the piped-in hidden.
@@ -659,7 +669,7 @@ def model_dispatch(op: str, payload: dict) -> dict:
     if op == "unload": _push_cleanup(payload.get("id")); MODELS.pop(payload.get("id"), None); MODEL_NAMES.pop(payload.get("id"), None); _TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     if op == "shard_load": return shard_load(payload)
     if op == "shard_forward": return shard_forward(payload)
-    if op == "shard_unload": SHARDS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
+    if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     raise ValueError(f"unknown model op {op}")
 
 async def run():

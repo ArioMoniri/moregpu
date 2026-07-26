@@ -243,10 +243,10 @@ class MoreGPU:
     # ---- pipeline-parallel sharding (GPT-2 family only): split the layers into contiguous STAGES,
     # one per torch worker; each worker holds ONLY its stage. Needs apps/worker/worker_torch.py (≥2 for a real split). ----
     def shard_load(self, model: str, layers: int | None = None, workers: Sequence[str] | None = None,
-                   id: str | None = None) -> dict:
-        """Split `model`'s transformer layers into contiguous stages across the torch workers (or the listed
-        `workers`) and load each stage on its worker. `layers` = layer count (default 12 for gpt2). GPT-2 only.
-        Returns {id, stages:[{worker, start, end, first, last, params_held}]} — shows the memory really is split."""
+                   id: str | None = None, push: bool = False) -> dict:
+        """Split `model`'s transformer layers into contiguous stages across the torch workers. GPT-2 / Llama-family.
+        push=True → download-free: the coordinator streams each worker only its stage's weights (no fleet download).
+        Returns {id, mode, stages:[{worker, start, end, first, last, params_held, bytes}]}."""
         body: dict[str, Any] = {"model": model}
         if layers is not None:
             body["layers"] = layers
@@ -254,6 +254,8 @@ class MoreGPU:
             body["workers"] = list(workers)
         if id:
             body["id"] = id
+        if push:
+            body["push"] = True
         return self._req("/model/shard", "POST", body)
 
     def shard_forward(self, input_ids: Sequence[int], id: str | None = None, return_logits: bool = False) -> dict:

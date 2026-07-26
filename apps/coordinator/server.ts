@@ -528,6 +528,73 @@ async function pushModelToWorker(w: Worker, model: string, id: string, fp16: boo
   }
 }
 
+// ── DOWNLOAD-FREE PIPELINE SHARDING: the coordinator fetches the model ONCE and streams each worker only the
+// tensors for ITS stage (its contiguous layer slice + embeddings on the first stage + final norm/head on the
+// last), rebuilt as a small per-stage safetensors. The fleet never touches the HF hub. A layer tensor is any
+// weight whose name contains ".h.<i>." (GPT-2) or ".layers.<i>." (Llama-family); everything else is non-layer
+// (embeddings / final norm / lm_head) and goes to the end stages only.
+type STHeader = Record<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>;
+const LAYER_RE = /(?:^|\.)(?:h|layers)\.(\d+)\./;
+
+async function hfFetchRange(model: string, file: string, start: number, end: number): Promise<Uint8Array> {
+  const headers: Record<string, string> = { range: `bytes=${start}-${end}` };
+  const tok = Deno.env.get('HF_TOKEN'); if (tok) headers['authorization'] = `Bearer ${tok}`;
+  const r = await fetch(`${HF_BASE}/${model}/resolve/main/${encodeURIComponent(file)}?download=true`, { headers, redirect: 'follow' });
+  if (!r.ok && r.status !== 206) { await r.body?.cancel(); throw new Error(`HF range ${file} [${start}-${end}] → HTTP ${r.status}`); }
+  let buf = new Uint8Array(await r.arrayBuffer());
+  if (r.status === 200 && buf.length > end - start + 1) buf = buf.slice(start, end + 1); // server ignored Range → slice locally
+  return buf;
+}
+
+async function hfSafetensorsHeader(model: string, file: string): Promise<{ header: STHeader; headerLen: number }> {
+  const lenBuf = await hfFetchRange(model, file, 0, 7);
+  if (lenBuf.length < 8) throw new Error(`${file}: could not read safetensors header length`);
+  const headerLen = Number(new DataView(lenBuf.buffer, lenBuf.byteOffset, 8).getBigUint64(0, true));
+  if (!(headerLen > 0 && headerLen < (256 << 20))) throw new Error(`${file}: implausible safetensors header length ${headerLen}`);
+  const hb = await hfFetchRange(model, file, 8, 8 + headerLen - 1);
+  const parsed = JSON.parse(new TextDecoder().decode(hb)) as Record<string, unknown>;
+  delete parsed['__metadata__'];
+  return { header: parsed as STHeader, headerLen };
+}
+
+function stageTensors(header: STHeader, start: number, end: number, first: boolean, last: boolean): string[] {
+  const names: string[] = [];
+  for (const name of Object.keys(header)) {
+    const m = LAYER_RE.exec(name);
+    if (m) { const i = Number(m[1]); if (i >= start && i < end) names.push(name); }   // this stage's decoder blocks
+    else if (first || last) names.push(name);                                          // embeddings / final norm / head
+  }
+  return names;
+}
+
+// Build a valid per-stage safetensors (recomputed contiguous offsets) and stream it as "model.safetensors".
+async function streamStageSafetensors(w: Worker, id: string, model: string, file: string, header: STHeader, srcHeaderLen: number, names: string[], budget: { left: number }): Promise<number> {
+  const newHeader: STHeader = {}; const parts: { srcStart: number; len: number }[] = []; let off = 0;
+  const dataStart = 8 + srcHeaderLen;
+  for (const name of names) {
+    const t = header[name]; const len = t.data_offsets[1] - t.data_offsets[0];
+    newHeader[name] = { dtype: t.dtype, shape: t.shape, data_offsets: [off, off + len] };
+    parts.push({ srcStart: dataStart + t.data_offsets[0], len }); off += len;
+  }
+  let hstr = JSON.stringify(newHeader);
+  while ((8 + new TextEncoder().encode(hstr).length) % 8 !== 0) hstr += ' '; // safetensors: header padded so data is 8-byte aligned
+  const hbytes = new TextEncoder().encode(hstr);
+  const prefix = new Uint8Array(8); new DataView(prefix.buffer).setBigUint64(0, BigInt(hbytes.length), true);
+  // chunked push of: [8-byte len][header][each tensor's bytes, in order] → appended into the worker's model.safetensors
+  let pending = new Uint8Array(0), seq = 0, total = 0;
+  const push = async (data: Uint8Array, last: boolean) => { const r = await modelRPC(w, 'push_chunk', { id, name: 'model.safetensors', seq: seq++, data: b64e(data), last }); if (!r.ok) throw new Error(`push_chunk safetensors: ${r.error}`); };
+  const feed = async (b: Uint8Array) => {
+    total += b.length; budget.left -= b.length;
+    if (budget.left < 0) throw new Error(`shard push exceeded ${PUSH_MAX_BYTES}-byte cap (raise MOREGPU_PUSH_MAX_BYTES)`);
+    const merged = new Uint8Array(pending.length + b.length); merged.set(pending); merged.set(b, pending.length); pending = merged;
+    while (pending.length >= PUSH_CHUNK) { await push(pending.slice(0, PUSH_CHUNK), false); pending = pending.slice(PUSH_CHUNK); }
+  };
+  await feed(prefix); await feed(hbytes);
+  for (const p of parts) await feed(await hfFetchRange(model, file, p.srcStart, p.srcStart + p.len - 1)); // Range-fetch just this tensor
+  await push(pending, true);
+  return total;
+}
+
 // --- DiLoCo: the coordinator is the parameter server. It holds the GLOBAL adapter + an outer Nesterov
 // momentum buffer; each round it averages the workers' post-inner-step adapters, applies the outer step,
 // and broadcasts the new global. This is the genuine reduce path (matmul pooling only concatenates). ---
@@ -1051,8 +1118,9 @@ async function handler(req: Request): Promise<Response> {
   //   POST /model/shard_forward  { id?, input_ids:[...], return_logits? }       → { argmax, logits? }  (pipes hidden state stage→stage)
   //   POST /model/shard_unload   { id? }                                        → unload every stage + drop the plan
   if (req.method === 'POST' && url.pathname === '/model/shard') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[] };
-    if (!body.model) return json({ error: 'need {model} (GPT-2 family only — gpt2, gpt2-medium, …)' }, 400);
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean };
+    if (!body.model) return json({ error: 'need {model} (GPT-2 / Llama-family)' }, 400);
+    if (body.push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free shard` }, 400);
     // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
     const cands = (Array.isArray(body.workers) && body.workers.length)
       ? body.workers.map((wid) => torchWorkers().find((w) => w.id === wid)).filter((w): w is Worker => !!w)
@@ -1062,16 +1130,26 @@ async function handler(req: Request): Promise<Response> {
     if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
     shardPlans.set(sid, { model: body.model, stages: [] }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
     const fail = (msg: string, code: number) => { shardPlans.delete(sid); return json({ error: msg, id: sid }, code); };
-    // Resolve the model's REAL layer count (config-only, no weights) so gpt2-medium/large/xl shard correctly —
-    // never a hard-coded 12 that would silently run only the first 12 blocks and return wrong logits.
-    const arch = await modelRPC(cands[0], 'arch', { model: body.model });
-    // Never silently guess 12 layers: a wrong count drops blocks (or over-provisions stages) and returns
-    // wrong logits. Use the real count if the pre-flight succeeded; else honour a caller-supplied `layers`;
-    // else REJECT so the caller learns the arch is unknown instead of getting a broken pipe.
-    let nLayer: number;
-    if (arch.ok && Number(arch.data?.n_layer) > 0) nLayer = Math.floor(Number(arch.data!.n_layer));
-    else if (Number(body.layers) > 0) nLayer = Math.max(1, Math.floor(Number(body.layers)));
-    else return fail(`could not determine layer count for ${body.model} (arch pre-flight failed: ${arch.error ?? 'no n_layer'}) — pass {layers:N} to shard explicitly`, 502);
+    // DOWNLOAD-FREE: fetch config + the safetensors header ON THE COORDINATOR (no worker download), so the
+    // fleet gets only its per-stage slice. Also gives the real layer count without a worker-side model_load.
+    let configText: string | null = null, stHeader: STHeader | null = null, stHeaderLen = 0, nLayer = 0;
+    if (body.push) {
+      try {
+        configText = await hfFetchText(body.model, 'config.json', PUSH_INDEX_MAX);
+        if (!configText) return fail(`${body.model}: no config.json on HF`, 502);
+        const cfg = JSON.parse(configText) as Record<string, unknown>;
+        nLayer = Math.floor(Number(cfg.num_hidden_layers ?? cfg.n_layer ?? 0));
+        if (await hfFetchText(body.model, 'model.safetensors.index.json', 4096).catch(() => null))
+          return fail(`${body.model} ships SHARDED safetensors — download-free sharding needs a single-file model.safetensors (v1)`, 400);
+        const h = await hfSafetensorsHeader(body.model, 'model.safetensors'); stHeader = h.header; stHeaderLen = h.headerLen;
+      } catch (e) { return fail(`download-free shard preflight failed: ${e instanceof Error ? e.message : e}`, 502); }
+    } else {
+      // Resolve the model's REAL layer count (config-only, no weights) so gpt2-medium/large/xl shard correctly.
+      const arch = await modelRPC(cands[0], 'arch', { model: body.model });
+      if (arch.ok && Number(arch.data?.n_layer) > 0) nLayer = Math.floor(Number(arch.data!.n_layer));
+    }
+    if (!(nLayer > 0)) nLayer = Number(body.layers) > 0 ? Math.max(1, Math.floor(Number(body.layers))) : 0;
+    if (!(nLayer > 0)) return fail(`could not determine layer count for ${body.model} — pass {layers:N} to shard explicitly`, 502);
     const nStages = Math.min(cands.length, nLayer);
     // split [0, nLayer) into nStages contiguous ranges, as even as possible (first `extra` stages get one more)
     const per = Math.floor(nLayer / nStages), extra = nLayer % nStages;
@@ -1083,20 +1161,34 @@ async function handler(req: Request): Promise<Response> {
       cursor += size;
     }
     // load each stage; if any fails, unload the ones already loaded so we never leave a half-loaded pipe
-    const info: (ShardStage & { params_held?: number })[] = [];
+    const info: (ShardStage & { params_held?: number; bytes?: number })[] = [];
     for (const st of stages) {
       const w = workers.get(st.worker);
       if (!w) { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }); } return fail(`stage worker ${st.worker} vanished`, 503); }
-      const r = await modelRPC(w, 'shard_load', { model: body.model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last });
+      let r: { ok: boolean; data?: Record<string, unknown>; error?: string }; let stageBytes = 0;
+      if (body.push) {
+        try {
+          const begin = await modelRPC(w, 'push_begin', { id: sid, model: body.model }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+          const budget = { left: PUSH_MAX_BYTES };
+          const cb = new TextEncoder().encode(configText!);
+          const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+          const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
+          stageBytes = await streamStageSafetensors(w, sid, body.model, 'model.safetensors', stHeader!, stHeaderLen, names, budget);
+          r = await modelRPC(w, 'shard_load', { model: body.model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
+        } catch (e) { r = { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+      } else {
+        r = await modelRPC(w, 'shard_load', { model: body.model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last });
+      }
       if (!r.ok) {
         for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }); }
+        if (body.push) await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); // drop this stage's partial staging
         return fail(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}): ${r.error}`, 502);
       }
-      info.push({ ...st, params_held: r.data?.params_held as number | undefined });
+      info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: stageBytes || undefined });
     }
     shardPlans.set(sid, { model: body.model, stages }); // finalize the reservation with the real plan
-    log('info', `sharded ${body.model} (${nLayer} layers) → ${nStages} stages: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
-    return json({ ok: true, id: sid, model: body.model, layers: nLayer, stages: info });
+    log('info', `sharded ${body.model} (${nLayer} layers) → ${nStages} stages${body.push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
+    return json({ ok: true, id: sid, model: body.model, layers: nLayer, mode: body.push ? 'download-free' : 'download', stages: info });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard_forward') {
     const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean };
