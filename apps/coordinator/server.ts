@@ -353,6 +353,11 @@ let trainingHome: string | null = null; // worker id hosting the single (non-DiL
 // (a later /model/forward then errors "not loaded"). Fix: have the worker report evicted ids on load
 // replies so the coordinator can drop the stale bookkeeping, or mirror the worker's cap in lockstep.
 const modelHome = new Map<string, string>(); // resident model id → worker id
+// Async model loads: a download-free push can take longer than a public tunnel will hold one HTTP request
+// open (trycloudflare 502s a long request), so /model/load?async streams in the BACKGROUND and the caller
+// polls GET /model/status. This is also the answer to "heavy models over a slow link" — the request is short.
+type LoadState = { status: 'loading' | 'ready' | 'error'; worker: string; model: string; started: number; info?: Record<string, unknown>; error?: string };
+const modelLoads = new Map<string, LoadState>(); // model id → last load's progress/outcome
 // Pipeline-parallel sharding (GPT-2 family): a model's transformer layers are split into contiguous
 // STAGES, one per worker — each worker holds ONLY its stage resident. The plan records, per shard id,
 // the ordered stages (which worker owns which layer range + which is first/last); /model/shard_forward
@@ -915,7 +920,7 @@ async function handler(req: Request): Promise<Response> {
   //   POST /model/load     { model, id?, fp16?, worker? }
   //   POST /model/forward  { id, input_ids:[...], return_logits?, topk? }  → { argmax, logits?, top? }
   if (req.method === 'POST' && url.pathname === '/model/load') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; fp16?: boolean; worker?: string; push?: boolean };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; fp16?: boolean; worker?: string; push?: boolean; async?: boolean };
     if (!body.model) return json({ error: 'need {model}' }, 400);
     const cands = torchWorkers();
     if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; resident-model serving needs one' }, 503);
@@ -924,9 +929,19 @@ async function handler(req: Request): Promise<Response> {
     const mid = body.id ?? body.model;
     if (body.push) {
       // download-free: coordinator fetches the weights and streams them to the worker (no hub access on the worker)
+      if (body.async) {
+        // return immediately (short request → survives a public tunnel); stream in the background, poll /model/status.
+        if (modelLoads.get(mid)?.status === 'loading') return json({ error: `a load for "${mid}" is already in progress`, status: 'loading' }, 409);
+        modelLoads.set(mid, { status: 'loading', worker: w.id, model: body.model!, started: Date.now() });
+        pushModelToWorker(w, body.model!, mid, !!body.fp16)
+          .then((info) => { modelHome.set(String(info.id ?? mid), w.id); modelLoads.set(mid, { status: 'ready', worker: w.id, model: body.model!, started: modelLoads.get(mid)!.started, info }); log('info', `resident model ${mid} weight-pushed to ${w.id} · ${info.n_params} params · staging=${info.staging}`); })
+          .catch((e) => { modelLoads.set(mid, { status: 'error', worker: w.id, model: body.model!, started: modelLoads.get(mid)!.started, error: e instanceof Error ? e.message : String(e) }); log('warn', `weight-push ${mid} → ${w.id} failed: ${e instanceof Error ? e.message : e}`); });
+        return json({ ok: true, worker: w.id, id: mid, status: 'loading', poll: `/model/status?id=${encodeURIComponent(mid)}` });
+      }
       try {
         const info = await pushModelToWorker(w, body.model, mid, !!body.fp16);
         modelHome.set(String(info.id ?? mid), w.id);
+        modelLoads.set(mid, { status: 'ready', worker: w.id, model: body.model!, started: Date.now(), info });
         log('info', `resident model ${info.id ?? mid} weight-pushed to ${w.id} · ${info.n_params} params · staging=${info.staging}`);
         return json({ ok: true, worker: w.id, ...info });
       } catch (e) { return json({ error: `weight push failed: ${e instanceof Error ? e.message : e}` }, 502); }
@@ -936,6 +951,15 @@ async function handler(req: Request): Promise<Response> {
     modelHome.set(String(r.data?.id ?? mid), w.id);
     log('info', `resident model ${r.data?.id} loaded on ${w.id} · ${r.data?.n_params} params`);
     return json({ ok: true, worker: w.id, ...r.data });
+  }
+  // Poll an async download-free load: GET /model/status?id=<model id> → { status: loading|ready|error, … }
+  if (req.method === 'GET' && url.pathname === '/model/status') {
+    const id = url.searchParams.get('id') ?? [...modelLoads.keys()].pop();
+    if (!id) return json({ status: 'unknown', models: [...modelHome.keys()] });
+    if (modelHome.has(id)) { const s = modelLoads.get(id); return json({ status: 'ready', id, worker: modelHome.get(id), ...(s?.info ?? {}) }); }
+    const s = modelLoads.get(id);
+    if (!s) return json({ status: 'unknown', id });
+    return json({ status: s.status, id, worker: s.worker, elapsed_ms: Date.now() - s.started, ...(s.error ? { error: s.error } : {}), ...(s.info ?? {}) });
   }
   if (req.method === 'POST' && (url.pathname === '/model/forward' || url.pathname === '/model/generate')) {
     const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean; topk?: number; max_new_tokens?: number };
@@ -1328,10 +1352,19 @@ tokEl.onchange=function(){localStorage.setItem(K,tokEl.value.trim());};
 function H(){return {'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||tokEl.value.trim())};}
 var MID=null;
 function add(role,text){var d=document.getElementById('chat'),el=document.createElement('div');el.className='msg '+role;el.textContent=text;d.appendChild(el);d.scrollTop=d.scrollHeight;return el;}
+function ready(m,r,s){MID=r.id||m;s.textContent='✓ '+MID+' on '+(r.worker||'?')+(r.device?' · '+r.device:'')+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'');}
+function poll(m,s,t0){fetch('/model/status?id='+encodeURIComponent(m),{headers:H()}).then(function(r){return r.json();}).then(function(r){
+  if(r.status==='ready'){ready(m,r,s);return;}
+  if(r.status==='error'){s.textContent='✗ '+r.error;return;}
+  s.textContent='streaming '+m+'… '+Math.round((Date.now()-t0)/1000)+'s (weights → worker)';setTimeout(function(){poll(m,s,t0);},2000);
+ }).catch(function(){setTimeout(function(){poll(m,s,t0);},2500);});}
 function load(){localStorage.setItem(K,tokEl.value.trim());var m=document.getElementById('model').value.trim(),wk=document.getElementById('worker').value.trim(),pf=document.getElementById('pushfree').checked,s=document.getElementById('status');s.textContent=(pf?'streaming ':'loading ')+m+'…';
- var b={model:m,id:m,push:pf};if(wk)b.worker=wk;
+ // async for download-free (a big push outlives a public tunnel's request timeout) — return fast, then poll status
+ var b={model:m,id:m,push:pf};if(wk)b.worker=wk;if(pf)b.async=true;
  fetch('/model/load',{method:'POST',headers:H(),body:JSON.stringify(b)}).then(function(r){return r.json();}).then(function(r){
-  if(r.error){s.textContent='✗ '+r.error;return;}MID=r.id||m;s.textContent='✓ '+MID+' on '+r.worker+' · '+r.device+' · '+((r.n_params||0)).toLocaleString()+' params'+(r.mode==='download-free'?' · download-free ('+(r.staging||'?')+')':'');}).catch(function(e){s.textContent='✗ '+e;});}
+  if(r.error){s.textContent='✗ '+r.error;return;}
+  if(r.status==='loading'){poll(m,s,Date.now());return;}
+  ready(m,r,s);}).catch(function(e){s.textContent='✗ '+e;});}
 function send(){var p=document.getElementById('prompt'),text=p.value.trim();if(!text)return;if(!MID){alert('Load a model first (top bar).');return;}
  add('user',text);p.value='';var rep=add('bot','…'),sb=document.getElementById('sendb');sb.disabled=true;
  var body={id:MID,prompt:text,max_new_tokens:(+document.getElementById('mnt').value)||96,do_sample:document.getElementById('samp').checked};
