@@ -539,7 +539,14 @@ async def run():
     paused = False; pause_reason = ""; ceil = 0.6
     while True:
         try:
-            async with websockets.connect(A.server, max_size=None) as ws:
+            # WAN-tolerant keepalive: over a high-latency tunnel the default 20s ping timeout drops the
+            # socket (the very low-bandwidth/WAN case MoreGPU targets). Tune generously + env-overridable.
+            async with websockets.connect(
+                A.server, max_size=None,
+                ping_interval=float(os.environ.get("MOREGPU_WS_PING_INTERVAL", "30")),
+                ping_timeout=float(os.environ.get("MOREGPU_WS_PING_TIMEOUT", "90")),
+                close_timeout=10,
+            ) as ws:
                 await ws.send(json.dumps({"t": "register", "joinToken": A.token, "pubkey": PUBKEY_B64,
                                           "node": {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}}))
                 key = None

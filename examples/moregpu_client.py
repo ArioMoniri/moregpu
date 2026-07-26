@@ -45,14 +45,27 @@ class MoreGPU:
         self.timeout = timeout
 
     def _req(self, path: str, method: str = "GET", body: dict | None = None, auth: bool = True) -> Any:
+        import time, urllib.error
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.base + path, data=data, method=method)
-        if body is not None:
-            req.add_header("content-type", "application/json")
-        if auth:
-            req.add_header("authorization", f"Bearer {self.token}")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode())
+        tries = int(getattr(self, "retries", 4)); last: Exception | None = None
+        for attempt in range(tries):  # retry transient gateway/tunnel errors (502/503/504, conn resets) over a WAN
+            req = urllib.request.Request(self.base + path, data=data, method=method)
+            if body is not None:
+                req.add_header("content-type", "application/json")
+            if auth:
+                req.add_header("authorization", f"Bearer {self.token}")
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code in (502, 503, 504) and attempt < tries - 1:
+                    last = e; time.sleep(0.6 * (attempt + 1)); continue
+                raise
+            except (urllib.error.URLError, ConnectionError) as e:
+                if attempt < tries - 1:
+                    last = e; time.sleep(0.6 * (attempt + 1)); continue
+                raise
+        raise last  # type: ignore[misc]
 
     def health(self) -> dict: return self._req("/health", auth=False)
     def gpu(self) -> dict: return self._req("/gpu")
