@@ -330,79 +330,131 @@ def model_generate(payload: dict) -> dict:
     return {"ok": True, "tokens": new, "n": len(new), "ms": (time.perf_counter() - t0) * 1000}
 
 # ---------------------------------------------------------------------------
-# PIPELINE-PARALLEL model SHARDING (GPT-2 family ONLY — gpt2 / gpt2-medium / …).
-# Split the transformer's h[] blocks into contiguous STAGES, one per worker; each
-# worker holds ONLY its stage's params resident and computes only its blocks. A
-# forward pipes the hidden state [1, seq, 768] stage→stage (only the activations
-# cross the wire — the low-bandwidth path — never the weights). This is the "model
-# too big for one machine" story; here it's demoed with gpt2 across ≥2 workers.
-# NOTE: GPT-2 ties lm_head.weight to wte.weight, so keeping lm_head on the last stage
-# retains the head matrix even after wte is dropped there; the first stage keeps wte.
+# PIPELINE-PARALLEL model SHARDING (two families: GPT-2 and Llama-style — the latter
+# covers Llama / SmolLM / TinyLlama / Qwen2 / Qwen3, anything with model.layers +
+# RMSNorm + RoPE). Split the transformer's decoder blocks into contiguous STAGES, one
+# per worker; each worker holds ONLY its stage's params resident and computes only its
+# blocks. A forward pipes the hidden state [1, seq, hidden] stage→stage (only the
+# activations cross the wire — the low-bandwidth path — never the weights). This is the
+# "model too big for one machine" story; demoed with gpt2 / SmolLM-135M across ≥2 workers.
+# The two families differ in the per-stage forward: GPT-2 has a learned positional
+# embedding (wpe) and a GPT2Block that masks internally; Llama-style uses RoPE, so every
+# stage recomputes cos/sin from position_ids and passes a causal mask to each layer.
+# NOTE: both families tie lm_head.weight to the input embedding, so keeping lm_head on the
+# last stage retains the head matrix even after the embedding is dropped there; the first
+# stage keeps the embedding. That one tied matrix is duplicated across the two end stages.
 # ---------------------------------------------------------------------------
 SHARDS: dict = {}  # shard id -> kept stage modules (blocks slice + optional embeddings / final head)
 
+
+def _shard_arch(model: nn.Module) -> str:
+    """Detect the sharding family from a loaded causal LM: 'gpt2' (transformer.h + learned wpe) vs
+    'llama' (model.layers + RMSNorm + RoPE — Llama / SmolLM / TinyLlama / Qwen2 / Qwen3)."""
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return "gpt2"
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return "llama"
+    raise ValueError(f"sharding unsupported for {type(model).__name__}: need GPT-2 (transformer.h) "
+                     f"or Llama-style (model.layers)")
+
 def shard_load(cfg: dict) -> dict:
-    """Load a GPT-2 model, KEEP ONLY this stage's contiguous block slice transformer.h[start:end]
-    (plus wte/wpe/drop if `first`, and ln_f/lm_head if `last`), delete everything else to actually
-    free memory, and store the kept modules under SHARDS[id]. GPT-2 family only."""
-    from transformers import GPT2LMHeadModel
+    """Load a causal LM via AutoModelForCausalLM, KEEP ONLY this stage's contiguous decoder-block slice
+    (plus the input embedding if `first`, and the final norm + LM head if `last`), delete everything else
+    to actually free memory, and store the kept modules under SHARDS[id]. Handles two families, detected
+    from the loaded model: GPT-2 (transformer.h + learned wpe) and Llama-style (model.layers + RMSNorm +
+    RoPE — Llama / SmolLM / TinyLlama / Qwen2 / Qwen3)."""
+    from transformers import AutoModelForCausalLM
     sid = cfg["id"]; start, end = int(cfg["start"]), int(cfg["end"])
     first, last = bool(cfg.get("first")), bool(cfg.get("last"))
-    model = GPT2LMHeadModel.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV).eval()
-    tr = model.transformer
-    n_layer = int(model.config.n_layer)
-    shard: dict = {"first": first, "last": last, "start": start, "end": end, "n_layer": n_layer,
-                   "blocks": tr.h[start:end],  # a GPT2Block ModuleList slice (references, not copies)
-                   "vocab_size": int(model.config.vocab_size), "hidden_dim": int(model.config.n_embd),
-                   "n_positions": int(model.config.n_positions)}
-    if first:  # first stage embeds token ids → hidden states
-        shard["wte"], shard["wpe"], shard["drop"] = tr.wte, tr.wpe, tr.drop
-    if last:  # last stage applies the final norm + LM head (lm_head.weight is tied to wte.weight)
-        shard["ln_f"], shard["lm_head"] = tr.ln_f, model.lm_head
-    # count params THIS stage actually holds, deduping the tied wte/lm_head weight by tensor identity
-    held = [shard["blocks"]] + [shard[k] for k in ("wte", "wpe", "drop", "ln_f", "lm_head") if k in shard]
+    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV).eval()
+    arch = _shard_arch(model)
+    mc = model.config
+    shard: dict = {"arch": arch, "first": first, "last": last, "start": start, "end": end,
+                   "vocab_size": int(mc.vocab_size)}
+    if arch == "gpt2":
+        base = model.transformer
+        shard.update(n_layer=int(mc.n_layer), hidden_dim=int(mc.n_embd), n_positions=int(mc.n_positions),
+                     blocks=base.h[start:end])  # a GPT2Block ModuleList slice (references, not copies)
+        if first:  # first stage embeds token ids → hidden states (token + learned positional embedding)
+            shard["wte"], shard["wpe"], shard["drop"] = base.wte, base.wpe, base.drop
+        if last:  # last stage applies the final norm + LM head (lm_head.weight is tied to wte.weight)
+            shard["ln_f"], shard["lm_head"] = base.ln_f, model.lm_head
+        base.h = shard["blocks"]  # point the block list at our slice so the unkept blocks are freed
+        held_keys = ("wte", "wpe", "drop", "ln_f", "lm_head")
+    else:  # llama-style: RoPE (no learned wpe), RMSNorm final norm; keep config + rotary_emb on EVERY
+        base = model.model  # stage so any stage can recompute cos/sin from position_ids (they're tiny)
+        shard.update(n_layer=int(mc.num_hidden_layers), hidden_dim=int(mc.hidden_size),
+                     n_positions=int(getattr(mc, "max_position_embeddings", 1 << 30)),
+                     blocks=base.layers[start:end], config=mc, rotary_emb=base.rotary_emb)
+        if first:  # first stage embeds token ids (RoPE is applied inside each layer, not here)
+            shard["embed_tokens"] = base.embed_tokens
+        if last:  # last stage applies the final RMSNorm + LM head (may be tied to embed_tokens.weight)
+            shard["norm"], shard["lm_head"] = base.norm, model.lm_head
+        base.layers = shard["blocks"]  # point the layer list at our slice so the unkept layers are freed
+        held_keys = ("embed_tokens", "norm", "lm_head")  # rotary_emb holds no params (just an inv_freq buffer)
+    # count params THIS stage actually holds, deduping the tied embedding/lm_head weight by tensor identity
+    held = [shard["blocks"]] + [shard[k] for k in held_keys if k in shard]
     seen: set = set(); params_held = 0
     for mod in held:
         for p in mod.parameters():
             if id(p) not in seen:
                 seen.add(id(p)); params_held += p.numel()
-    # Actually free the unkept weights: point the model's block list at our slice, drop the model wrapper.
-    # Our SHARDS references keep the kept modules alive; every unkept module loses its last reference and is
-    # collected (the tied head matrix survives on the last stage via lm_head even though wte is dropped).
-    tr.h = shard["blocks"]
+    # Actually free the unkept weights: we re-pointed the block list at our slice above, so dropping the
+    # model wrapper collects every unkept module. Our SHARDS references keep the kept modules alive (the
+    # tied head matrix survives on the last stage via lm_head even though the embedding is dropped there).
     SHARDS.pop(sid, None)  # replacing a live shard: drop the old modules first
     if len(SHARDS) >= MAX_RESIDENT_MODELS:  # bound VRAM, same as resident models
         SHARDS.pop(next(iter(SHARDS)), None)
-    del tr, model
+    del base, model
     _empty_cache()
     SHARDS[sid] = shard
-    return {"ok": True, "id": sid, "layers": [start, end], "first": first, "last": last, "n_layer": n_layer, "params_held": params_held}
+    return {"ok": True, "id": sid, "layers": [start, end], "first": first, "last": last,
+            "n_layer": shard["n_layer"], "arch": arch, "params_held": params_held}
 
 def shard_forward(payload: dict) -> dict:
     """Run ONE stage's blocks. If first: embed input_ids → hidden; else: reshape the piped-in hidden.
-    If last: final norm + LM head → {argmax, logits?}; else: return the hidden state for the next stage."""
+    If last: final norm + LM head → {argmax, logits?}; else: return the hidden state for the next stage.
+    Branches on the stored arch: GPT-2 blocks mask causally on their own; Llama-style layers need the
+    RoPE cos/sin (recomputed here from position_ids) and an explicit causal mask each stage."""
     sid = payload.get("id"); shard = SHARDS.get(sid)
     if shard is None:
         raise RuntimeError(f"shard {sid} not loaded — call shard_load first")
-    first, last = shard["first"], shard["last"]
+    arch = shard["arch"]; first, last = shard["first"], shard["last"]
     hidden_dim = shard["hidden_dim"]
     with torch.no_grad():
         if first:
             ids_list = payload["input_ids"]
             _check_ids(shard["vocab_size"], ids_list)
-            if len(ids_list) > shard["n_positions"]:  # position ids ≥ n_positions overflow wpe (CUDA device-assert)
+            if len(ids_list) > shard["n_positions"]:  # positions past the context window overflow the model
                 raise ValueError(f"sequence length {len(ids_list)} exceeds the model's context window {shard['n_positions']}")
             ids = torch.tensor(ids_list, dtype=torch.long, device=DEV).unsqueeze(0)  # [1, seq]
             seq = ids.shape[1]
-            pos = torch.arange(seq, dtype=torch.long, device=DEV)
-            h = shard["drop"](shard["wte"](ids) + shard["wpe"](pos))  # [1, seq, 768]
         else:
             seq = int(payload["seq"])
             h = b64_to_t(payload["hidden"]).reshape(1, seq, hidden_dim).to(DEV)
-        for blk in shard["blocks"]:  # GPT2Block applies causal self-attention internally (no mask needed)
-            h = blk(h)[0]
+        if arch == "gpt2":
+            if first:
+                pos = torch.arange(seq, dtype=torch.long, device=DEV)
+                h = shard["drop"](shard["wte"](ids) + shard["wpe"](pos))  # [1, seq, n_embd]
+            for blk in shard["blocks"]:  # GPT2Block applies causal self-attention internally (no mask needed)
+                h = blk(h)[0]
+            if last:
+                h = shard["ln_f"](h)
+        else:  # llama-style: recompute RoPE cos/sin + a causal mask exactly as LlamaModel.forward does,
+            from transformers.masking_utils import create_causal_mask  # so the layers see identical inputs
+            if first:
+                h = shard["embed_tokens"](ids)  # [1, seq, hidden] — RoPE is applied per-layer, not here
+            cache_position = torch.arange(seq, dtype=torch.long, device=DEV)
+            position_ids = cache_position.unsqueeze(0)  # [1, seq]
+            pos_emb = shard["rotary_emb"](h, position_ids)  # (cos, sin) — depends only on positions + head_dim
+            causal_mask = create_causal_mask(config=shard["config"], input_embeds=h, attention_mask=None,
+                                             cache_position=cache_position, past_key_values=None,
+                                             position_ids=position_ids)
+            for blk in shard["blocks"]:  # LlamaDecoderLayer.forward returns the hidden tensor directly
+                h = blk(h, attention_mask=causal_mask, position_ids=position_ids, position_embeddings=pos_emb)
+            if last:
+                h = shard["norm"](h)
         if last:
-            h = shard["ln_f"](h)
             logits = shard["lm_head"](h)[0, -1].float()  # last-token logits [vocab]
             res = {"ok": True, "argmax": int(logits.argmax().item())}
             if payload.get("return_logits"):

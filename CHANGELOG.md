@@ -9,11 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- README shows the `moregpu` CLI's interactive menu (gradient ANSI-Shadow wordmark) as
-  [`docs/assets/cli-menu.svg`](docs/assets/cli-menu.svg), and a PyPI version badge.
+- **Pipeline sharding now works for Llama-family models**, not just GPT-2 — the torch worker's
+  `shard_load`/`shard_forward` detect the architecture (GPT-2 `transformer.h` + learned positions vs
+  Llama-style `model.layers` + RMSNorm + RoPE) and pipe activations through either. Verified token-for-token
+  **exact match** for GPT-2 (6+6 split) *and* **SmolLM-135M** (15+15 split) across 2 workers; peak ~1.1 GB
+  RSS for the two CPU stages. GPT-2 path unchanged (regression-checked).
+- **Coordinator container on GitHub Packages** — [`Dockerfile`](Dockerfile) + a
+  [`container`](.github/workflows/container.yml) workflow publish `ghcr.io/ariomoniri/moregpu` on release:
+  `docker run -p 8787:8787 -v moregpu:/data ghcr.io/ariomoniri/moregpu:latest`. README shows the published
+  packages (PyPI · ghcr · Homebrew) and a PyPI badge; the `moregpu` CLI menu renders as
+  [`docs/assets/cli-menu.svg`](docs/assets/cli-menu.svg).
 
 ### Changed
 
+- Honesty: the CUDA/PTX matrix row now notes the torch worker **does run on CUDA via PyTorch** on NVIDIA
+  (real acceleration for serving/training/sharding) — what's absent is *custom* CUDA/PTX kernels,
+  tensor-core/int8 GEMM, and graphics/codec paths.
 - LoRA examples pick adapter targets by architecture, not model name — the worker attaches to
   whichever of `c_attn` (GPT-2 Conv1D) / `q_proj`,`v_proj` (Llama/Qwen) exist, so any GPT-2 repo
   (e.g. `sshleifer/tiny-gpt2`, `distilgpt2`) fine-tunes without a hand-set target.
