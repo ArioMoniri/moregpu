@@ -25,9 +25,21 @@ const KEY_PATH = Deno.env.get('MOREGPU_TLS_KEY');
 const C = { reset: '\x1b[0m', dim: '\x1b[2m', b: '\x1b[1m', cyan: '\x1b[36m', grn: '\x1b[32m', yel: '\x1b[33m', mag: '\x1b[35m', red: '\x1b[31m' };
 
 // ---------- base64 + sealing ----------
-function b64e(u8: Uint8Array): string { let s = ''; const K = 0x8000; for (let i = 0; i < u8.length; i += K) s += String.fromCharCode(...u8.subarray(i, i + K)); return btoa(s); }
-function b64d(s: string): Uint8Array { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
-function tokenB64url(n = 24): string { return b64e(crypto.getRandomValues(new Uint8Array(n))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+// Prefer the native TC39 Uint8Array<->base64 (Deno 2.x) — the manual String.fromCharCode loop is an order of
+// magnitude slower and dominates a weight-push (GBs of base64). Feature-detected so older runtimes still work.
+function b64e(u8: Uint8Array): string {
+  const f = (u8 as unknown as { toBase64?: () => string }).toBase64;
+  if (typeof f === 'function') return f.call(u8);
+  let s = ''; const K = 0x8000; for (let i = 0; i < u8.length; i += K) s += String.fromCharCode(...u8.subarray(i, i + K)); return btoa(s);
+}
+function b64d(s: string): Uint8Array {
+  const F = (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array }).fromBase64;
+  if (typeof F === 'function') return F(s);
+  const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u;
+}
+// base64url, but never start with '-'/'_': a leading dash makes `worker_torch.py --token <tok>` unparseable
+// (argparse reads it as a flag), and a leading dash is awkward in shells/URLs generally. Trim any from the front.
+function tokenB64url(n = 24): string { return b64e(crypto.getRandomValues(new Uint8Array(n))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '').replace(/^[-_]+/, ''); }
 async function importKey(raw: Uint8Array) { return crypto.subtle.importKey('raw', raw as BufferSource, 'AES-GCM', false, ['encrypt', 'decrypt']); }
 async function seal(key: Uint8Array, plain: Uint8Array) { const iv = crypto.getRandomValues(new Uint8Array(12)); const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as BufferSource }, await importKey(key), plain as BufferSource); return { iv: b64e(iv), ct: b64e(new Uint8Array(ct)) }; }
 async function unseal(key: Uint8Array, blob: { iv: string; ct: string }) { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(blob.iv) as BufferSource }, await importKey(key), b64d(blob.ct) as BufferSource)); }
@@ -392,7 +404,7 @@ const modelRPC = (w: Worker, op: string, payload: unknown) => relayRPC(w, 'model
 // "all weights on the admin, fleet = pure GPU compute". It's a ONE-TIME transfer (unlike the per-token
 // pipeline pipe), so it tolerates a slow/flaky tunnel far better.
 const HF_BASE = Deno.env.get('MOREGPU_HF_BASE') ?? 'https://huggingface.co';
-const PUSH_CHUNK = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_CHUNK') ?? (8 << 20))); // 8 MiB raw / chunk
+const PUSH_CHUNK = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_CHUNK') ?? (32 << 20))); // 32 MiB raw / chunk — fewer sealed round-trips
 // Safety rail against a runaway/oversized repo OOM-ing the coordinator or a donated worker (default 20 GiB,
 // env-tunable). The index.json is metadata (KB) so it gets a much tighter cap of its own.
 const PUSH_MAX_BYTES = Math.max(1 << 20, Number(Deno.env.get('MOREGPU_PUSH_MAX_BYTES') ?? (20 * (1 << 30))));
@@ -927,6 +939,12 @@ async function handler(req: Request): Promise<Response> {
     const w = body.worker ? cands.find((x) => x.id === body.worker) : cands[0];
     if (!w) return json({ error: `torch worker ${body.worker} not active` }, 404);
     const mid = body.id ?? body.model;
+    // Already resident on the target worker? reuse it instantly — a re-Load must not re-stream a live model.
+    if (modelHome.get(mid) === w.id) {
+      const s = modelLoads.get(mid);
+      log('info', `resident model ${mid} already on ${w.id} — reusing (no re-load)`);
+      return json({ ok: true, worker: w.id, id: mid, status: 'ready', reused: true, ...(s?.info ?? {}) });
+    }
     if (body.push) {
       // download-free: coordinator fetches the weights and streams them to the worker (no hub access on the worker)
       if (body.async) {
@@ -948,7 +966,9 @@ async function handler(req: Request): Promise<Response> {
     }
     const r = await modelRPC(w, 'load', { model: body.model, id: mid, fp16: !!body.fp16 });
     if (!r.ok) return json({ error: r.error }, 502);
-    modelHome.set(String(r.data?.id ?? mid), w.id);
+    const rid = String(r.data?.id ?? mid);
+    modelHome.set(rid, w.id);
+    modelLoads.set(rid, { status: 'ready', worker: w.id, model: body.model!, started: Date.now(), info: r.data }); // so /model/status is complete
     log('info', `resident model ${r.data?.id} loaded on ${w.id} · ${r.data?.n_params} params`);
     return json({ ok: true, worker: w.id, ...r.data });
   }
