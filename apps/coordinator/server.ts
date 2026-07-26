@@ -1730,7 +1730,7 @@ function load(){localStorage.setItem(K,tokEl.value.trim());MID=null;var sb=docum
  if(sh){ // SHARD across all nodes — always download-free + async; every node contributes per token
   s.textContent='sharding '+m+' across the fleet… (Send disabled until ready)';
   fetch('/model/shard',{method:'POST',headers:H(),body:JSON.stringify({model:m,id:m,push:true,async:true})}).then(function(r){return r.json();}).then(function(r){
-   if(r.error){s.textContent='✗ '+r.error;return;}
+   if(r.error){if(/already loaded/i.test(r.error)){pollShard(m,s,Date.now());return;}s.textContent='✗ '+r.error;return;} // attach to an in-flight/ready shard instead of erroring
    if(r.status==='loading'){pollShard(m,s,Date.now());return;}
    readyShard(m,r,s);}).catch(function(e){s.textContent='✗ '+e;});
   return;
@@ -1749,4 +1749,14 @@ function send(){var p=document.getElementById('prompt'),text=p.value.trim();if(!
  var body=SHARDED?{id:MID,prompt:text,max_new_tokens:mnt}:{id:MID,prompt:text,max_new_tokens:mnt,do_sample:document.getElementById('samp').checked};
  fetch(url,{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(r){
   rep.textContent=r.error?('✗ '+r.error):((r.text||'(empty)')+(r.ms?'   ·  '+(r.ms/1000).toFixed(1)+'s '+(SHARDED?('across '+((r.workers||[]).length)+' nodes'):('on '+r.worker)):''));sb.disabled=false;}).catch(function(e){rep.textContent='✗ '+e;sb.disabled=false;});}
+// deep link: /chat?model=NAME&shard=1 → prefill the model, tick "shard across fleet", and auto-Load once a token is present.
+// (token is never taken from the URL — it stays in localStorage; the model auto-shards across every node into one pipe.)
+(function(){var q=new URLSearchParams(location.search),m=q.get('model'),sh=q.get('shard');
+ if(m)document.getElementById('model').value=m;
+ if(sh&&sh!=='0')document.getElementById('shardmode').checked=true;
+ if(!(m||sh))return;
+ if((localStorage.getItem(K)||'').trim()){load();return;}
+ document.getElementById('status').textContent='enter your admin token above — this '+(sh&&sh!=='0'?'sharded ':'')+'model then loads automatically';
+ tokEl.addEventListener('change',function once(){if((tokEl.value||'').trim()){tokEl.removeEventListener('change',once);load();}});
+})();
 </script>`;
