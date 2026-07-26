@@ -581,7 +581,8 @@ def shard_forward(payload: dict) -> dict:
                 pos = torch.arange(seq, dtype=torch.long, device=DEV)
                 h = shard["drop"](shard["wte"](ids) + shard["wpe"](pos))  # [1, seq, n_embd]
             for blk in shard["blocks"]:  # GPT2Block applies causal self-attention internally (no mask needed)
-                h = blk(h)[0]
+                out = blk(h)  # older transformers returns (hidden, ...) ; newer (≥4.54) returns the hidden tensor directly
+                h = out[0] if isinstance(out, (tuple, list)) else out
             if last:
                 h = shard["ln_f"](h)
         else:  # llama-style: recompute RoPE cos/sin + a causal mask exactly as LlamaModel.forward does,
