@@ -993,17 +993,18 @@ button.mini{padding:4px 8px;font-size:11px;border-radius:7px;background:#26304a;
 button.mini.danger{background:#3a1d24;color:#fca5a5}
 .dutyin{width:50px;padding:4px 6px;font-size:11px}
 td.ctl{white-space:nowrap}
-.logo{color:var(--acc);font-size:10px;line-height:1.15;margin:0 0 6px;opacity:.9;font-family:ui-monospace,Menlo,monospace;overflow:auto}
+.logo{font-size:9px;line-height:1.05;margin:0 0 10px;font-family:ui-monospace,Menlo,monospace;overflow:auto;white-space:pre;background:linear-gradient(90deg,#5f5fff,#875fff,#af5fff,#d75fff,#ff5faf,#ff5f5f);-webkit-background-clip:text;background-clip:text;color:transparent}
 pre{background:#0e1420;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;max-height:260px;font-size:12px;margin:0}
 .lvl-error{color:var(--red)}.lvl-warn{color:var(--yel)}.lvl-info{color:#93c5fd}.lvl-debug{color:var(--mut)}
 a{color:#a5b4fc}.sp{margin-top:16px}.k{display:inline-block;background:#1a2133;color:#c7d2fe;border-radius:7px;padding:3px 9px;margin:3px 4px 0 0;font-size:12px;font-family:ui-monospace,monospace}
 </style>
 <div class=wrap>
-<pre class=logo>   __  __            ____ ____  _   _
-  |  \\/  | ___  _ __/ ___|  _ \\| | | |
-  | |\\/| |/ _ \\| '__| |  _| |_) | | | |
-  | |  | | (_) | |  | |_| |  __/| |_| |
-  |_|  |_|\\___/|_|   \\____|_|    \\___/</pre>
+<pre class=logo>███╗   ███╗ ██████╗ ██████╗ ███████╗ ██████╗ ██████╗ ██╗   ██╗
+████╗ ████║██╔═══██╗██╔══██╗██╔════╝██╔════╝ ██╔══██╗██║   ██║
+██╔████╔██║██║   ██║██████╔╝█████╗  ██║  ███╗██████╔╝██║   ██║
+██║╚██╔╝██║██║   ██║██╔══██╗██╔══╝  ██║   ██║██╔═══╝ ██║   ██║
+██║ ╚═╝ ██║╚██████╔╝██║  ██║███████╗╚██████╔╝██║     ╚██████╔╝
+╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝      ╚═════╝</pre>
 <h1>MoreGPU · admin</h1><div class=sub>Your worker fleet, presented as one virtual GPU. No cap on how many machines can join.</div>
 <div class=card style="margin-bottom:14px"><div class=row><b>Admin token</b><input id=tok type=password placeholder="paste from the server console wizard" style="flex:1;min-width:220px"><button class=ghost onclick=save()>Save</button><span id=authmsg class=mut></span></div></div>
 <div class="grid">
