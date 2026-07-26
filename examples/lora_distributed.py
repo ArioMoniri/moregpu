@@ -36,7 +36,9 @@ ROUNDS = int(os.environ.get("MOREGPU_ROUNDS", "4"))
 INNER = int(os.environ.get("MOREGPU_INNER", "3"))
 WINDOW = int(os.environ.get("MOREGPU_WINDOW", "32"))
 SEED, LR, OUTER_LR, MOM = 0, 1e-3, 0.7, 0.9
-TARGETS = ["c_attn"] if MODEL.startswith(("gpt2", "distilgpt2")) else ["q_proj", "v_proj"]
+# Union of common LoRA targets — the worker attaches to whichever exist: c_attn (GPT-2 Conv1D, any repo
+# name like sshleifer/tiny-gpt2) or q_proj/v_proj (Llama/Qwen). Architecture-agnostic, not name-based.
+TARGETS = ["c_attn", "q_proj", "v_proj"]
 
 TEXT = (
     "The compute pool learns together. Many workers, one model; each keeps its own data, shares only a "
@@ -87,13 +89,15 @@ def main():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "apps", "worker"))
     import worker_torch as wt  # reuse the worker's exact LoRA code so init matches
     from transformers import AutoModelForCausalLM
-    dev = wt.DEV
+    # run the reference on the WORKERS' device (from their label), so CPU workers verify against CPU, MPS vs MPS
+    lbl = next((w.get("label", "") for w in pool.workers() if w["id"] == tw[0]), "")
+    dev = "cuda" if "cuda" in lbl else "mps" if "mps" in lbl else "cpu"
     torch.manual_seed(SEED)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(dev)
     for m in model.modules():
         if isinstance(m, torch.nn.Dropout):
             m.p = 0.0
-    wt.attach_lora(model, TARGETS, 8, 16)
+    wt.attach_lora(model, TARGETS, 8, 16, dev=dev)
     trainable = {n: p for n, p in model.named_parameters() if p.requires_grad}
     global_ = {n: p.detach().clone() for n, p in trainable.items()}       # identical initial adapter
     momentum = {n: torch.zeros_like(v) for n, v in global_.items()}

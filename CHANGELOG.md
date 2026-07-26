@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- README shows the `moregpu` CLI's interactive menu (gradient ANSI-Shadow wordmark) as
+  [`docs/assets/cli-menu.svg`](docs/assets/cli-menu.svg), and a PyPI version badge.
+
+### Changed
+
+- LoRA examples pick adapter targets by architecture, not model name — the worker attaches to
+  whichever of `c_attn` (GPT-2 Conv1D) / `q_proj`,`v_proj` (Llama/Qwen) exist, so any GPT-2 repo
+  (e.g. `sshleifer/tiny-gpt2`, `distilgpt2`) fine-tunes without a hand-set target.
+- The training examples' verification reference now runs on the **worker's** device (from the
+  `train_load`/worker label), so CPU workers verify against a CPU reference (previously a CPU worker
+  vs an MPS reference drifted). Validated: `gpt2` on CPU workers matches the reference to 0.0.
+- Docs hygiene: DiLoCo described as an fp-tolerance (~2e-5) reference match rather than "bit-for-bit"
+  (single-worker LoRA stays bit-for-bit); CHANGELOG version links defined; `AI_USAGE.md` API table
+  lists the native-tier `/model/*` and `/train/*` endpoints.
+
 ## [0.6.0] - 2026-07-26
 
 ### Added
@@ -219,4 +236,8 @@ cross-platform workers.
 
 [Unreleased]: https://github.com/ArioMoniri/moregpu/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/ArioMoniri/moregpu/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/ArioMoniri/moregpu/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ArioMoniri/moregpu/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/ArioMoniri/moregpu/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/ArioMoniri/moregpu/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ArioMoniri/moregpu/releases/tag/v0.1.0

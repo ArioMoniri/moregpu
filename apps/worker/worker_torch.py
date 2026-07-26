@@ -160,9 +160,11 @@ def _in_out(mod: nn.Module):
         return mod.weight.shape[0], int(mod.nf)
     return None
 
-def attach_lora(model: nn.Module, targets: list[str], r: int, alpha: float) -> int:
+def attach_lora(model: nn.Module, targets: list[str], r: int, alpha: float, dev: str | None = None) -> int:
     """Freeze the base model, replace each target module (matched by name suffix) with a LoRAWrap.
-    Returns the count of trainable adapter parameters."""
+    Returns the count of trainable adapter parameters. `dev` overrides the placement device (used by an
+    out-of-band verification reference so it can reproduce a worker running on a different device)."""
+    dev = dev or DEV
     for p in model.parameters():
         p.requires_grad_(False)
     hits = []
@@ -173,7 +175,7 @@ def attach_lora(model: nn.Module, targets: list[str], r: int, alpha: float) -> i
                 hits.append((name, mod, io))
     for name, mod, (in_f, out_f) in hits:
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
-        parent.add_module(name.split(".")[-1], LoRAWrap(mod, in_f, out_f, r, alpha).to(DEV))
+        parent.add_module(name.split(".")[-1], LoRAWrap(mod, in_f, out_f, r, alpha).to(dev))
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 TRAIN: dict = {"model": None, "opt": None, "step": 0, "trainable": {}}

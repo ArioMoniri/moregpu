@@ -36,7 +36,9 @@ STEPS = int(os.environ.get("MOREGPU_STEPS", "40"))
 T = int(os.environ.get("MOREGPU_WINDOW", "32"))
 SEED = 0
 # LoRA targets: GPT-2's fused QKV Conv1D, or the standard q/v projections on Llama/Qwen-style models.
-TARGETS = ["c_attn"] if MODEL.startswith(("gpt2", "distilgpt2")) else ["q_proj", "v_proj"]
+# Union of common LoRA targets — the worker attaches to whichever exist: c_attn (GPT-2 Conv1D, any repo
+# name like sshleifer/tiny-gpt2) or q_proj/v_proj (Llama/Qwen). Architecture-agnostic, not name-based.
+TARGETS = ["c_attn", "q_proj", "v_proj"]
 
 # A short, self-contained training text (no download). Overfitting a tiny text makes learning obvious.
 TEXT = (
@@ -82,7 +84,7 @@ def main():
     print("\n== verify ==")
     import torch
     from transformers import AutoModelForCausalLM
-    dev = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    dev = info.get("device") or ("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
     # context: the frozen base model's loss (eval mode, no dropout) on batch 0 — the starting point
     base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(dev).eval()
@@ -102,12 +104,12 @@ def main():
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "apps", "worker"))
         import worker_torch as wt  # reuse the exact LoRAWrap/attach_lora so init/RNG-consumption matches the worker
         torch.manual_seed(SEED)
-        m2 = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(wt.DEV)
-        wt.attach_lora(m2, TARGETS, 8, 16)
+        m2 = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(dev)
+        wt.attach_lora(m2, TARGETS, 8, 16, dev=dev)  # reference runs on the WORKER's device (not necessarily wt.DEV)
         opt2 = torch.optim.AdamW([p for p in m2.parameters() if p.requires_grad], lr=1e-3)
         ref = []
         for b in batches:
-            xb = torch.tensor(b, device=wt.DEV).unsqueeze(0)
+            xb = torch.tensor(b, device=dev).unsqueeze(0)
             m2.train(); opt2.zero_grad()
             l = m2(input_ids=xb, labels=xb).loss
             l.backward(); opt2.step()

@@ -176,12 +176,20 @@ All admin endpoints require `Authorization: Bearer <admin token>`.
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /submit` | `{kernel, size}` (benchmark) or `{kernel, a, b?, scalar?, M?, N?, K?}` (data mode) → job |
-| `GET /gpu` | pool as one virtual GPU: slots, totals, throughput trend, per-kernel counts |
-| `GET /workers` | per-worker contribution: `share`, `units`, `shards`, `avgMs`, `trend`, util, duty |
+| `GET /gpu` · `GET /device` | pool as one virtual GPU: slots, totals, throughput; `/device` is the GPU-slot descriptor |
+| `GET /workers` · `POST /workers/:id/control` | per-worker contribution; admin pause/resume/duty/schedule/remove |
+| `POST /weights`, `GET /weights` | pin a named weight resident on a worker (weight residency / pipeline) |
 | `GET /jobs`, `GET /jobs/:id` | queue + history (list omits `output`; `/jobs/:id` includes it) |
-| `GET /logs` | recent errors/debug |
-| `GET /metrics` | Prometheus metrics (see [monitoring](../config/observability)) |
-| `GET /health` | liveness + fleet size (public) |
+| `GET /logs` · `GET /metrics` · `GET /health` | recent log · Prometheus metrics · liveness + fleet (public) |
+
+**Native-tier endpoints** (need a torch worker — see [`apps/worker/worker_torch.py`](../apps/worker/worker_torch.py)):
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /model/load` · `/model/forward` · `/model/generate` · `/model/unload` | resident-model serving (whole forward on the worker; `generate` = whole decode, one round-trip) |
+| `POST /model/shard` · `/model/shard_forward` · `/model/shard_unload` | pipeline-parallel sharding across workers (activations-only on the wire) |
+| `POST /train/load` · `/train/step` · `/train/adapter` | single-worker LoRA fine-tuning (whole train step local on the worker) |
+| `POST /train/diloco/load` · `/train/diloco/round` · `/train/diloco/adapter` | distributed LoRA via DiLoCo (coordinator = parameter server) |
 
 ---
 

@@ -1,6 +1,7 @@
 # MoreGPU
 
 [![CI](https://github.com/ArioMoniri/moregpu/actions/workflows/ci.yml/badge.svg)](https://github.com/ArioMoniri/moregpu/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/moregpu-client.svg?label=pypi%20moregpu-client&color=3775a9)](https://pypi.org/project/moregpu-client/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-site-6366f1.svg)](https://ariomoniri.github.io/moregpu/)
 
@@ -32,7 +33,7 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 | Small LLM inference (e.g. GPT-2 124M) | 🟡→✅ | **A real GPT-2 runs on the pool** — [`examples/llm_infer.py`](examples/llm_infer.py) pins the 12 layers resident, runs the full forward, and matches Hugging Face **exactly** (fp32 or fp16), now with a **client-side KV cache** (incremental decode, ~4× faster per token on the WGSL path, still exact). For real speed, the new **native torch worker** holds the model resident on-device and serves at up to **~66 tok/s** warm on an unloaded machine (~6–23 tok/s under load) with the same **exact match** — [`examples/llm_serve.py`](examples/llm_serve.py). |
 | Fast small-LLM serving (low latency) | 🟡 | The new **native torch worker** ([`apps/worker/worker_torch.py`](apps/worker/worker_torch.py), Apple MPS / CUDA) holds a whole model resident on-device and runs the **entire forward per call** — one round-trip per token instead of ~500 — so GPT-2 serves at up to **~66 tok/s** warm/unloaded (~6–23 tok/s under load) with a token-for-token **exact match** to transformers ([`llm_serve.py`](examples/llm_serve.py)). It's an **opt-in native tier** (admin-installed, not the zero-install WGSL worker). |
 | Big-model inference across machines (pipeline sharding) | 🟡 | **Pipeline-parallel sharding** ([`llm_shard.py`](examples/llm_shard.py)): split a model's transformer layers into contiguous stages, one per torch worker, piping only **activations** (`~[seq×hidden]`, never weights) — the low-bandwidth path (Petals / Mesh-LLM style). Demoed with GPT-2 split **6+6 blocks across 2 workers**, token-for-token **exact match** to transformers; each worker holds **only its stage**. GPT-2-family only so far; a real 7B would use more/bigger workers. Still no int8/tensor cores. |
-| Training / fine-tuning (LoRA) | 🟡 | **LoRA fine-tuning on the torch worker** — single-worker ([`lora_finetune.py`](examples/lora_finetune.py)) *and* **distributed across N workers via DiLoCo** ([`lora_distributed.py`](examples/lora_distributed.py)): each worker trains its own shard for H local steps, the **coordinator averages the adapters + applies an outer Nesterov step** (a real reduce path), broadcasts the global. Both verified **bit-for-bit against a seeded reference**. Synchronous DiLoCo; async + secure-aggregation are the next step. Needs the torch worker, not the WGSL path. |
+| Training / fine-tuning (LoRA) | 🟡 | **LoRA fine-tuning on the torch worker** — single-worker ([`lora_finetune.py`](examples/lora_finetune.py)) *and* **distributed across N workers via DiLoCo** ([`lora_distributed.py`](examples/lora_distributed.py)): each worker trains its own shard for H local steps, the **coordinator averages the adapters + applies an outer Nesterov step** (a real reduce path), broadcasts the global. Single-worker is verified **bit-for-bit** against a seeded reference; distributed DiLoCo matches a seeded reference to **fp tolerance** (losses ~2e-5, adapter ~1e-3). Synchronous DiLoCo; async + secure-aggregation are the next step. Needs the torch worker, not the WGSL path. |
 | Modern architectures (RMSNorm · RoPE · SwiGLU · GQA) | 🟡 | **Qwen3-0.6B runs on the pool** matching Hugging Face token-for-token ([`generic_infer.py`](examples/generic_infer.py)) — proof the pool isn't GPT-2-specific. Forward-only, round-trip-bound (~minutes/token); a portability proof, not a speed win. |
 | Conv2d / CNNs | 🧩 | im2col on the host, then pooled matmul — runnable, CPU-checked demo in [`examples/conv2d_im2col.py`](examples/conv2d_im2col.py). Off-GPU unfold. |
 | CUDA/PTX kernels · Stable Diffusion · rendering (OptiX) · NVENC · fp16/int8 tensor cores | ❌ | WGSL backend, compute-only, fp32 — none of these paths exist. |
@@ -67,6 +68,12 @@ There are **two roles** — pick yours:
 | Go to | [Admin track](#-admin-track) | [Worker track](#-worker-track) |
 
 > Every pool generates its **own** tokens on first run — nobody shares another pool's credentials. Deno is the only prerequisite (one cross-platform binary; the apps run straight from the URL).
+
+Install the CLI (`brew install --cask ArioMoniri/moregpu/moregpu`) and run **`moregpu`** with no arguments for an interactive menu covering the whole workflow:
+
+<p align="center">
+  <img src="docs/assets/cli-menu.svg" alt="moregpu CLI — interactive menu: gradient MOREGPU wordmark, then Pool (serve / join / isolate / monitor), Fleet (list / pause / set duty / remove), and Service (install / stop / status / logs)" width="720">
+</p>
 
 ---
 
