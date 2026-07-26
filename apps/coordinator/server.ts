@@ -374,7 +374,7 @@ type LoadState = { status: 'loading' | 'ready' | 'error'; worker: string; model:
 const modelLoads = new Map<string, LoadState>(); // model id → last load's progress/outcome
 // Same idea for a download-free SHARD load: streaming each stage's slice across the fleet can outlast a tunnel's
 // request timeout, so /model/shard?async loads the stages in the background and the caller polls /model/shard_status.
-type ShardLoadState = { status: 'loading' | 'ready' | 'error'; model: string; started: number; stagesDone: number; stagesTotal: number; info?: unknown; error?: string };
+type ShardLoadState = { status: 'loading' | 'ready' | 'error'; model: string; started: number; stagesDone: number; stagesTotal: number; info?: unknown; error?: string; aborted?: boolean };
 const shardLoads = new Map<string, ShardLoadState>();
 // Pipeline-parallel sharding (GPT-2 family): a model's transformer layers are split into contiguous
 // STAGES, one per worker — each worker holds ONLY its stage resident. The plan records, per shard id,
@@ -597,6 +597,26 @@ async function streamStageSafetensors(w: Worker, id: string, model: string, file
   for (const p of parts) await feed(await hfFetchRange(model, file, p.srcStart, p.srcStart + p.len - 1)); // Range-fetch just this tensor
   await push(pending, true);
   return total;
+}
+
+// Run ONE forward across a shard plan: stage 0 embeds input_ids → hidden; each next stage runs its blocks on
+// the piped hidden; the last returns {argmax, logits?}. Only activations cross the wire. Re-checks each stage's
+// worker is still connected (so a node churning mid-generation surfaces cleanly instead of hanging).
+async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
+  const plan = shardPlans.get(sid);
+  if (!plan || plan.stages.length === 0) return { ok: false, error: `shard ${sid} not loaded/ready` };
+  for (const st of plan.stages) if (!workers.has(st.worker)) return { ok: false, error: `stage worker ${st.worker} disconnected — re-shard with POST /model/shard`, disconnected: true };
+  let carry: Record<string, unknown> = {};
+  for (let i = 0; i < plan.stages.length; i++) {
+    const st = plan.stages[i]; const w = workers.get(st.worker)!;
+    const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
+    if (st.first) payload.input_ids = input_ids; else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
+    if (st.last && returnLogits) payload.return_logits = true;
+    const r = await modelRPC(w, 'shard_forward', payload);
+    if (!r.ok) return { ok: false, error: `shard_forward failed on ${st.worker} (stage ${i}, layers ${st.start}-${st.end}): ${r.error}` };
+    carry = r.data!;
+  }
+  return { ok: true, data: carry };
 }
 
 // --- DiLoCo: the coordinator is the parameter server. It holds the GLOBAL adapter + an outer Nesterov
@@ -1243,17 +1263,34 @@ async function handler(req: Request): Promise<Response> {
         if (!r.ok) { await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); await unloadAll(); throw new Error(`shard_load failed on ${st.worker} (layers ${st.start}-${st.end}): ${r.error}`); }
         info.push({ ...st, params_held: r.data?.params_held as number | undefined, bytes: stageBytes || undefined });
         const ls = shardLoads.get(sid); if (ls) ls.stagesDone = info.length; // progress for the poller
+        if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); } // deadline fired → don't resurrect
       }
+      if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); }
       shardPlans.set(sid, { model, stages }); // finalize the reservation with the real plan (unblocks shard_forward)
       log('info', `sharded ${model} (${nLayer} layers) → ${nStages} stages${push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
       return info;
     };
     if (body.async) {
       // return immediately (short request → survives a slow/tunneled link); stream stages in the background.
-      shardLoads.set(sid, { status: 'loading', model, started: Date.now(), stagesDone: 0, stagesTotal: nStages });
+      const started = Date.now();
+      shardLoads.set(sid, { status: 'loading', model, started, stagesDone: 0, stagesTotal: nStages });
+      // Deadline: a stage stalling on a half-dead node would otherwise leave the load 'loading' forever (each
+      // push_chunk only errors after RELAY_TIMEOUT_MS). On expiry flag aborted + unload finished stages. NB: this
+      // can't cancel an in-flight push_chunk on the worker (no worker-side cancel yet) — it stops the bookkeeping
+      // hang and blocks resurrection; runLoad checks `aborted` before finalizing.
+      const DEADLINE_MS = Number(Deno.env.get('MOREGPU_SHARD_LOAD_DEADLINE_MS') ?? 1_800_000); // 30 min default
+      const deadline = setTimeout(async () => {
+        const s = shardLoads.get(sid);
+        if (s && s.status === 'loading') {
+          shardLoads.set(sid, { ...s, aborted: true, status: 'error', error: `shard load exceeded ${DEADLINE_MS}ms deadline (aborted)` });
+          shardPlans.delete(sid);
+          for (const st of stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); }
+          log('warn', `shard ${sid} load timed out after ${DEADLINE_MS}ms — aborted`);
+        }
+      }, DEADLINE_MS);
       runLoad()
-        .then((info) => { shardLoads.set(sid, { status: 'ready', model, started: shardLoads.get(sid)!.started, stagesDone: nStages, stagesTotal: nStages, info }); })
-        .catch((e) => { shardPlans.delete(sid); shardLoads.set(sid, { status: 'error', model, started: shardLoads.get(sid)!.started, stagesDone: shardLoads.get(sid)!.stagesDone, stagesTotal: nStages, error: e instanceof Error ? e.message : String(e) }); log('warn', `shard ${sid} failed: ${e instanceof Error ? e.message : e}`); });
+        .then((info) => { clearTimeout(deadline); if (shardLoads.get(sid)?.aborted) return; shardLoads.set(sid, { status: 'ready', model, started, stagesDone: nStages, stagesTotal: nStages, info }); })
+        .catch((e) => { clearTimeout(deadline); if (shardLoads.get(sid)?.aborted) return; shardPlans.delete(sid); shardLoads.set(sid, { status: 'error', model, started, stagesDone: shardLoads.get(sid)?.stagesDone ?? 0, stagesTotal: nStages, error: e instanceof Error ? e.message : String(e) }); log('warn', `shard ${sid} failed: ${e instanceof Error ? e.message : e}`); });
       return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages_total: nStages, status: 'loading', poll: `/model/shard_status?id=${encodeURIComponent(sid)}` });
     }
     try {
@@ -1269,23 +1306,42 @@ async function handler(req: Request): Promise<Response> {
     if (shardPlans.get(sid)!.stages.length === 0) return json({ error: `shard ${sid} is still loading`, id: sid }, 409);
     if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
     if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints, ≤100000' }, 400);
-    const plan = shardPlans.get(sid)!;
-    for (const st of plan.stages) if (!workers.has(st.worker)) { shardPlans.delete(sid); return json({ error: `stage worker ${st.worker} disconnected — re-shard with POST /model/shard`, id: sid }, 503); }
-    // ORCHESTRATE THE PIPE: stage 0 embeds input_ids → hidden; each next stage runs its blocks on that hidden;
-    // the last stage returns {argmax, logits?}. Sequential awaits down the stages (only activations on the wire).
-    let carry: Record<string, unknown> = {};
-    for (let i = 0; i < plan.stages.length; i++) {
-      const st = plan.stages[i];
-      const w = workers.get(st.worker)!;
-      const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
-      if (st.first) payload.input_ids = body.input_ids;
-      else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
-      if (st.last && body.return_logits) payload.return_logits = true;
-      const r = await modelRPC(w, 'shard_forward', payload);
-      if (!r.ok) return json({ error: `shard_forward failed on ${st.worker} (stage ${i}, layers ${st.start}-${st.end}): ${r.error}` }, 502);
-      carry = r.data!;
-    }
-    return json({ ok: true, id: sid, ...carry });
+    const out = await shardPipe(sid, body.input_ids, !!body.return_logits);
+    if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
+    return json({ ok: true, id: sid, ...out.data });
+  }
+  // Coordinator-side pipelined GENERATE: run the whole greedy loop HERE (one client request), streaming one
+  // NDJSON line per token. On the target LAN only the fast coordinator↔fleet hops run per token; over a slow
+  // tunnel the client crosses it ONCE (steady bytes also stop an idle-proxy from 502-ing a long request).
+  // This is the "possible, not fast" inference story: N tokens = 1 streamed request, not N slow round-trips.
+  if (req.method === 'POST' && url.pathname === '/model/shard_generate') {
+    const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; max_new_tokens?: number };
+    const sid = body.id ?? [...shardPlans.keys()][0];
+    if (!sid || !shardPlans.has(sid)) return json({ error: 'no sharded model — POST /model/shard first' }, 409);
+    if (shardPlans.get(sid)!.stages.length === 0) return json({ error: `shard ${sid} is still loading`, id: sid }, 409);
+    if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
+    if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints, ≤100000' }, 400);
+    const n = Math.max(1, Math.min(Number(body.max_new_tokens ?? 32), 1024));
+    const prompt = body.input_ids.slice();
+    const seq = body.input_ids.slice();
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        const send = (o: unknown) => { try { controller.enqueue(enc.encode(JSON.stringify(o) + '\n')); } catch { /* client gone */ } };
+        const t0 = Date.now();
+        try {
+          for (let k = 0; k < n; k++) {
+            const out = await shardPipe(sid, seq, false); // NB: no KV cache on the shard path → re-runs the growing seq each token (slow, but complete)
+            if (!out.ok) { send({ error: out.error, at: k }); break; } // in-band terminal error (headers already sent → can't 502)
+            const tok = Number(out.data.argmax); seq.push(tok);
+            send({ token: tok, i: k, ms: Date.now() - t0 });
+          }
+          send({ done: true, tokens: seq.slice(prompt.length), n: seq.length - prompt.length, ms: Date.now() - t0 });
+        } catch (e) { send({ error: e instanceof Error ? e.message : String(e) }); }
+        finally { controller.close(); }
+      },
+    });
+    return new Response(stream, { headers: { 'content-type': 'application/x-ndjson', 'cache-control': 'no-cache' } });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard_unload') {
     const body = await req.json().catch(() => ({})) as { id?: string };

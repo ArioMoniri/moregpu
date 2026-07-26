@@ -322,15 +322,30 @@ class MoreGPU:
             body["return_logits"] = True
         return self._req("/model/shard_forward", "POST", body)
 
-    def shard_generate(self, input_ids: Sequence[int], max_new_tokens: int, id: str | None = None) -> list[int]:
-        """Greedy generation across the sharded pipeline: loop shard_forward, appending the argmax each step.
-        Returns the new token ids (exact-matches transformers' greedy for GPT-2)."""
-        seq = list(input_ids)
+    def shard_generate(self, input_ids: Sequence[int], max_new_tokens: int, id: str | None = None, on_token=None) -> list[int]:
+        """Greedy generation across the sharded pipeline in ONE streamed request — the coordinator runs the whole
+        loop and streams one token per line, so over a slow/tunneled link you cross it ONCE (not once per token).
+        Returns the new token ids (exact-matches transformers' greedy for GPT-2). Pass on_token(tok,i,ms) for
+        per-token progress. This is the 'possible, not fast' path — it COMPLETES over a high-latency link."""
+        body: dict[str, Any] = {"input_ids": list(input_ids), "max_new_tokens": int(max_new_tokens)}
+        if id:
+            body["id"] = id
+        req = urllib.request.Request(self.base + "/model/shard_generate", data=json.dumps(body).encode(), method="POST")
+        req.add_header("content-type", "application/json")
+        req.add_header("authorization", f"Bearer {self.token}")
         new: list[int] = []
-        for _ in range(max_new_tokens):
-            nxt = int(self.shard_forward(seq, id=id)["argmax"])
-            seq.append(nxt)
-            new.append(nxt)
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            for raw in r:  # NDJSON: {"token":..,"i":..,"ms":..} per token, then {"done":true,...} or {"error":..}
+                line = raw.decode().strip()
+                if not line:
+                    continue
+                m = json.loads(line)
+                if m.get("error"):
+                    raise RuntimeError(f"shard_generate: {m['error']}")
+                if "token" in m:
+                    new.append(int(m["token"]))
+                    if on_token:
+                        on_token(int(m["token"]), m.get("i"), m.get("ms"))
         return new
 
     def shard_unload(self, id: str | None = None) -> dict:
