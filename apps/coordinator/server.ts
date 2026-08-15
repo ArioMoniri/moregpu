@@ -73,7 +73,35 @@ async function loadOrInitConfig(): Promise<{ cfg: Config; fresh: boolean }> {
   }
 }
 const { cfg, fresh } = await loadOrInitConfig();
-const TENANT_KEY = b64d(cfg.tenantKeyB64);
+// ── PER-WORKER KEYS + KEY-EPOCH ROTATION ─────────────────────────────────────────────────────────────────
+// The pool secret in config (`tenantKeyB64`) is NO LONGER broadcast to every worker. It is now the MASTER
+// secret from which each worker's OWN sealing key is DERIVED via HKDF-SHA256 over (worker id + key epoch):
+// `welcome` hands a per-worker key, and every coordinator<->worker sealed frame (assign / model+train relay /
+// weight cache) uses THAT worker's key — so one worker cannot open another worker's coordinator traffic even if
+// it captures the wire. `keyEpoch` is a monotonic revocation counter: an admin `remove` bumps it, so a key
+// derived afterwards differs, killing a captured pre-revocation key (rotation). In-memory (like removedPubkeys):
+// a coordinator restart re-derives the whole fleet from a clean epoch anyway.
+const MASTER = b64d(cfg.tenantKeyB64);
+let keyEpoch = 0;
+const HKDF_SALT = new TextEncoder().encode('moregpu:hkdf:v1');
+async function hkdf(info: string, bytes = 32): Promise<Uint8Array> {
+  const base = await crypto.subtle.importKey('raw', MASTER as BufferSource, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: HKDF_SALT as BufferSource, info: new TextEncoder().encode(info) as BufferSource },
+    base, bytes * 8,
+  );
+  return new Uint8Array(bits);
+}
+// Per-worker coordinator<->worker key: HKDF(master, "worker:<id>:epoch:<n>"). Deterministic per (id, epoch),
+// independent across ids, rotated by an epoch bump. A reconnecting worker (same id, same epoch) re-derives the
+// SAME key, so mid-stream resume/failover is unaffected.
+const deriveWorkerKey = (workerId: string, epoch: number) => hkdf(`moregpu:worker:${workerId}:epoch:${epoch}`);
+// Per-PAIR peer-edge session key: HKDF(master, "peeredge:<sid>:ke<keyEpoch>:re<ringEpoch>:<from>-><to>"). The
+// coordinator BROKERS it — it hands `from` the seal key and `to` the open key — so a peer act/expert frame on
+// edge A->B is sealed with a key ONLY that pair holds: not the master, not either end's per-worker key. Fresh
+// per wiring (ring epoch) AND per revocation (key epoch).
+const deriveEdgeKey = (sid: string, ringEpoch: number, from: string, to: string) =>
+  hkdf(`moregpu:peeredge:${sid}:ke${keyEpoch}:re${ringEpoch}:${from}->${to}`);
 const RAW = 'https://raw.githubusercontent.com/ArioMoniri/moregpu/main';
 
 // ---------- TLS: the DEFAULT transport ----------
@@ -229,6 +257,8 @@ interface Worker {
   lastOps: number; history: number[]; // per-sample ops completed → sparkline trend (consistent unit)
   pubkey?: CryptoKey; // Ed25519 public key for verifying this worker's result signatures
   pubkeyB64?: string; // raw public key (for the removed-worker denylist)
+  key: Uint8Array; // this worker's OWN AES key = HKDF(master, id, keyEpoch) — every coordinator<->worker seal uses THIS, never a shared/fleet key
+  keyEpoch: number; // the key epoch this worker's key was minted at (bumps on an admin revocation)
   paused: boolean; // scheduled-off or admin-paused → coordinator assigns it no new work
   pausedReason?: string | null; // 'admin' | 'schedule' | null — why it's paused
   ceil: number; // the worker's reported/administered duty CEILING (distinct from the live effective duty)
@@ -287,8 +317,11 @@ function wireWorker(ws: WebSocket) {
       let pubkey: CryptoKey | undefined;
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null, peer });
-      ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
+      const wkey = await deriveWorkerKey(id, keyEpoch); // this worker's OWN sealing key — derived, never the master, never shared
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, key: wkey, keyEpoch, paused: false, pausedReason: null, peer });
+      // welcome still carries the key under `tenantKeyB64` (wire-compatible with existing workers + the fake fleet),
+      // but it is now this worker's PER-WORKER derived key, plus the key epoch it was minted at.
+      ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(wkey), epoch: keyEpoch, duty: DUTY_HINT }));
       log('info', `worker joined: ${id} (${safeId(node.label)}, ${safeId(node.os)})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
     } else if (m.t === 'heartbeat') {
@@ -587,7 +620,7 @@ async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, Re
   // onclose won't fire again to reject it. Surfacing the disconnect immediately is what lets a stage retry promptly.
   if (w.ws.readyState !== WebSocket.OPEN) return { ok: false, error: `worker ${w.id} disconnected` };
   const reqId = `${kind}-${++relaySeq}`;
-  const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify(payload)));
+  const sealed = await seal(w.key, new TextEncoder().encode(JSON.stringify(payload))); // this worker's per-worker key
   // Bind the reply to THIS worker's id, so another worker can't resolve someone else's RPC (see train_reply handler).
   // TODO(review): a timeout here only abandons the coordinator's wait — the worker keeps running the compute
   // (and, for a train op, may still commit optimizer/step state). Needs a cancel/epoch protocol (send an
@@ -607,7 +640,7 @@ async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, Re
     if (!r.ok) return { ok: false, error: r.error };
     if (!r.sealed) return { ok: true, data: {} };
     let data: Record<string, unknown>;
-    try { data = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealed))) as Record<string, unknown>; }
+    try { data = JSON.parse(new TextDecoder().decode(await unseal(w.key, r.sealed))) as Record<string, unknown>; }
     catch (e) { return { ok: false, error: `bad ${kind} reply: ${e}` }; }
     // NB: keep w.totalMs (→ avgMs) shard-only — mixing serve/train ms into a kernel-shard average corrupts it.
     if (SERVE_OPS.has(op)) { w.ops++; w.tokens += Math.max(0, Math.round(Number(data.n) || 0)); }
@@ -949,7 +982,7 @@ async function replaceStage(sid: string, failedIdx: number): Promise<{ ok: boole
 // probes reachability. When every edge is `direct`, ringPipe injects stage 0 and awaits the last stage's
 // `complete` — the hidden state travels worker->worker (sealed with the shared tenant key, Ed25519-signed by the
 // predecessor), NEVER re-crossing the coordinator between stages. Any non-reachable edge (or a cached/KV request)
-// falls back to the unchanged relay path (shardPipe). Reuses shardPlans/ShardStage, TENANT_KEY (via the workers'
+// falls back to the unchanged relay path (shardPipe). Reuses shardPlans/ShardStage, per-edge session keys (via the workers'
 // own seal), each worker's registered pubkey, tokenB64url, and the existing control WS.
 interface RingEdge { from: string; to: string; mode: 'direct' | 'relay' }
 interface Ring { sid: string; epoch: number; edges: RingEdge[]; token: string; allDirect: boolean; torn?: boolean }
@@ -992,12 +1025,15 @@ async function wireRing(sid: string): Promise<Ring | null> {
   for (let i = 0; i < plan.stages.length; i++) {
     const cur = ws[i]!, suc = i + 1 < plan.stages.length ? ws[i + 1]! : null, pre = i > 0 ? ws[i - 1]! : null;
     // hand this stage its predecessor's raw pubkey so it can origin-verify an inbound activation (direct OR bridged)
-    if (pre) { const predPub = pre.peer?.pub ?? pre.pubkeyB64; if (predPub) { try { cur.ws.send(JSON.stringify({ t: 'ring_pred', sid, epoch, pred_pub: predPub })); } catch { /* dropped socket → shardPipe covers it */ } } }
+    if (pre) { const predPub = pre.peer?.pub ?? pre.pubkeyB64; const predKey = b64e(await deriveEdgeKey(sid, epoch, pre.id, cur.id)); if (predPub) { try { cur.ws.send(JSON.stringify({ t: 'ring_pred', sid, epoch, pred_pub: predPub, pred_key: predKey })); } catch { /* dropped socket → shardPipe covers it */ } } }
     // a direct edge needs BOTH ends peer-capable + reachable + not force-relayed; otherwise the successor endpoint
     // is withheld and the predecessor bridges. Always send ring_wire (sets epoch/token even for the last stage).
     const canDirect = i + 1 < plan.stages.length && !!cur.peer && !!suc!.peer && !FORCE_RELAY.has(cur.id);
     const succEndpoint = canDirect ? { id: suc!.id, url: suc!.peer!.url, pub: suc!.peer!.pub } : null;
-    const ack = await ringWireRPC(cur, { sid, epoch, token, succ: succEndpoint });
+    // Per-edge seal key for cur->suc (needed for BOTH a direct hand-off and a bridged/relay hop — the coordinator
+    // only relays ciphertext on a bridge, it never holds this key). `suc` gets the matching key as its pred_key.
+    const succKey = suc ? b64e(await deriveEdgeKey(sid, epoch, cur.id, suc.id)) : undefined;
+    const ack = await ringWireRPC(cur, { sid, epoch, token, succ: succEndpoint, ...(succKey ? { succ_key: succKey } : {}) });
     if (suc) {
       const mode: RingEdge['mode'] = (canDirect && ack.ok && !!ack.reachable) ? 'direct' : 'relay';
       edges.push({ from: cur.id, to: suc.id, mode });
@@ -1160,7 +1196,7 @@ async function moePipe(sid: string, input_ids: number[], returnLogits: boolean):
 // its `moe_complete` — the backbone runs embed → per-layer (route → DISPATCH each routed expert to its holder
 // worker->worker over a sealed+signed peer channel → COMBINE) → head locally, so the coordinator relays ZERO expert
 // activations (only the kickoff + the final logits cross it). Any unreachable holder / mid-forward peer fault falls
-// back to the unchanged coordinator-relayed moePipe. Reuses the workers' peer listeners, TENANT_KEY seal, pubkeys.
+// back to the unchanged coordinator-relayed moePipe. Reuses the workers' peer listeners, per-edge session keys, pubkeys.
 interface MoERing { sid: string; epoch: number; token: string; allDirect: boolean }
 const moeRings = new Map<string, MoERing>();
 const pendingMoeRing = new Map<string, { resolve: (r: unknown) => void; reject: (e: Error) => void }>(); // `${sid}|${seq}`
@@ -1189,16 +1225,20 @@ async function wireMoERing(sid: string): Promise<MoERing | null> {
   if (!plan) return null;
   const bw = workers.get(plan.backbone);
   if (!bw || !bw.peer) { log('info', `moe-ring ${sid}: backbone ${plan.backbone} has no peer endpoint → relay path`); return null; }
+  const epoch = Date.now(), token = tokenB64url(18);
   const holderEps: { id: string; url: string; pub: string; experts: number[] }[] = [];
+  // Per-PAIR edge key for each backbone<->holder pair: the backbone seals its expert dispatch AND opens the
+  // returned partial with it; the holder does the mirror. Neither uses the master or a per-worker key.
+  const holderKeys: Record<string, string> = {};
   for (const h of plan.holders) {
     const hw = workers.get(h.worker);
     if (!hw || !hw.peer) { log('info', `moe-ring ${sid}: holder ${h.worker} has no peer endpoint → relay path`); return null; }
     holderEps.push({ id: hw.id, url: hw.peer.url, pub: hw.peer.pub, experts: h.experts });
+    holderKeys[hw.id] = b64e(await deriveEdgeKey(sid, epoch, bw.id, hw.id));
   }
-  const epoch = Date.now(), token = tokenB64url(18);
-  // give each holder the backbone's pubkey so it can origin-verify a dispatch frame (it can't be forged by a peer)
-  for (const h of plan.holders) { const hw = workers.get(h.worker); try { hw!.ws.send(JSON.stringify({ t: 'moe_wire_holder', sid, epoch, token, backbone_pub: bw.peer.pub })); } catch { /* dropped → relay covers it */ } }
-  const ack = await moeWireRPC(bw, { sid, epoch, token, holders: holderEps });   // backbone probes every holder, acks reachability
+  // give each holder the backbone's pubkey (origin-verify a dispatch frame) + its per-edge key (open the dispatch, seal the partial)
+  for (const h of plan.holders) { const hw = workers.get(h.worker); try { hw!.ws.send(JSON.stringify({ t: 'moe_wire_holder', sid, epoch, token, backbone_pub: bw.peer.pub, edge_key: holderKeys[hw!.id] })); } catch { /* dropped → relay covers it */ } }
+  const ack = await moeWireRPC(bw, { sid, epoch, token, holders: holderEps, holder_keys: holderKeys });   // backbone probes every holder, acks reachability
   const allDirect = ack.ok && !!ack.reachable;
   const mring: MoERing = { sid, epoch, token, allDirect };
   moeRings.set(sid, mring); moeRingStat(sid);
@@ -1306,7 +1346,7 @@ async function dispatchResilient(jobId: string, payload: Record<string, unknown>
 
 async function dispatchShard(w: Worker, jobId: string, payload: Record<string, unknown>): Promise<Float32Array> {
   const shardId = `s-${++shardSeq}-${tokenB64url(6)}`; // unguessable so results can't be forged by id
-  const sealedIn = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify(payload)));
+  const sealedIn = await seal(w.key, new TextEncoder().encode(JSON.stringify(payload))); // this worker's per-worker key
   const done = new Promise<ResultMsg>((resolve, reject) => {
     const timer = setTimeout(() => { pending.delete(shardId); reject(new Error(`shard timeout (${SHARD_TIMEOUT_MS}ms) on ${w.id}`)); }, SHARD_TIMEOUT_MS);
     pending.set(shardId, { resolve: (r) => { clearTimeout(timer); resolve(r); }, reject: (e) => { clearTimeout(timer); reject(e); }, workerId: w.id });
@@ -1317,7 +1357,7 @@ async function dispatchShard(w: Worker, jobId: string, payload: Record<string, u
   try { r = await done; } finally { pending.delete(shardId); w.busyCount = Math.max(0, w.busyCount - 1); w.busy = w.busyCount > 0; }
   if (!r.ok || !r.sealedOut) { M.shardsFailed++; throw new Error(`shard on ${w.id} failed: ${r.error}`); }
   M.shardsDone++; (r.backend?.startsWith('gpu') ? M.gpuShards++ : M.cpuShards++);
-  const outObj = JSON.parse(new TextDecoder().decode(await unseal(TENANT_KEY, r.sealedOut)));
+  const outObj = JSON.parse(new TextDecoder().decode(await unseal(w.key, r.sealedOut)));
   const out = b64ToF32(outObj.out);
   w.shards++; w.ops++; w.units += out.length; w.totalMs += r.ms ?? 0; // contribution accounting (one shard = one op)
   const js = jobSigned.get(jobId) ?? { signed: 0, total: 0 }; js.total++; if (r.signed) js.signed++; jobSigned.set(jobId, js);
@@ -1529,7 +1569,7 @@ async function handler(req: Request): Promise<Response> {
     const w = workers.get(id);
     if (!w) return json({ error: 'worker not found' }, 404);
     const body = await req.json().catch(() => ({})) as { action?: string; ceil?: number; schedule?: string; nick?: string };
-    if (body.action === 'remove') { if (w.pubkeyB64) removedPubkeys.add(w.pubkeyB64); try { w.ws.close(); } catch { /* */ } workers.delete(id); log('warn', `admin removed worker ${id}${w.pubkeyB64 ? ' (banned by key)' : ' (unsigned — could rejoin under a new id)'}`); return json({ ok: true, removed: id, banned: !!w.pubkeyB64 }); }
+    if (body.action === 'remove') { if (w.pubkeyB64) removedPubkeys.add(w.pubkeyB64); try { w.ws.close(); } catch { /* */ } workers.delete(id); keyEpoch++; /* rotate: every key derived after this differs, so a captured pre-revocation key is dead */ log('warn', `admin removed worker ${id}${w.pubkeyB64 ? ' (banned by key)' : ' (unsigned — could rejoin under a new id)'} · key epoch → ${keyEpoch}`); return json({ ok: true, removed: id, banned: !!w.pubkeyB64, epoch: keyEpoch }); }
     const ctl: Record<string, unknown> = { t: 'control' };
     if (body.action === 'pause') { w.paused = true; w.pausedReason = 'admin'; ctl.pause = true; }
     if (body.action === 'resume') { w.paused = false; w.pausedReason = null; w.consecErrors = 0; ctl.pause = false; }
@@ -1560,7 +1600,7 @@ async function handler(req: Request): Promise<Response> {
       // home = explicit worker, else the active worker holding the fewest weights (spread the model across GPUs)
       const home = body.worker ? active.find((w) => w.id === body.worker) : active.slice().sort((a, b) => residentCount(a.id) - residentCount(b.id))[0];
       if (!home) return json({ error: `worker ${body.worker} not active` }, 404);
-      const sealed = await seal(TENANT_KEY, new TextEncoder().encode(JSON.stringify({ data: body.data, rows: body.rows, cols: body.cols, dtype })));
+      const sealed = await seal(home.key, new TextEncoder().encode(JSON.stringify({ data: body.data, rows: body.rows, cols: body.cols, dtype }))); // seal to the home worker's per-worker key
       const ack = new Promise<{ ok: boolean; error?: string }>((res) => { const t = setTimeout(() => { pendingCache.delete(body.id!); res({ ok: false, error: 'cache ack timeout' }); }, 30_000); pendingCache.set(body.id!, { workerId: home.id, cb: (r) => { clearTimeout(t); res(r); } }); });
       home.ws.send(JSON.stringify({ t: 'cache', id: body.id, sealed }));
       const r = await ack;

@@ -98,6 +98,9 @@ jobs:
       - name: TLS install path — Deno worker.ts joins default self-signed wss (DENO_CERT), wrong cert refused
         run: python3 tests/security/tls_install_path.py
 
+      - name: Per-worker keys — HKDF per-worker sealing keys, cross-worker unseal fails, revocation rotates epoch
+        run: python3 tests/security/per_worker_keys.py
+
       - name: Fake-WS fleet scale — 150 no-torch nodes, connect storm + churn, control plane holds
         run: python3 tests/scale/fake_fleet.py
 

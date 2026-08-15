@@ -4,7 +4,8 @@ MoreGPU NATIVE TORCH worker — a drop-in peer of the Deno/WebGPU worker (apps/w
 computes with PyTorch on the best local device (CUDA → MPS → CPU) instead of WebGPU.
 
 It speaks the EXACT same sealed WebSocket protocol, so it joins the SAME pool with the SAME join token
-and shares the SAME tenant key as the Deno workers — the coordinator is backend-agnostic. What it adds:
+and is issued a PER-WORKER sealing key by the coordinator (HKDF of a coordinator master + this worker's id +
+the current key epoch) — no shared fleet key on the wire; the coordinator is backend-agnostic. What it adds:
 native BLAS / Apple-MPS speed per kernel, resident weights held as on-device tensors (incl. fp16), and
 — because torch has autograd — the substrate for on-pool fine-tuning (see the train_* verbs).
 
@@ -19,7 +20,8 @@ zero-install invisible WebGPU worker. Run it where you trust the machine.
 Protocol (matches apps/worker/worker.ts): register{joinToken,pubkey,node} → welcome{tenantKeyB64,duty} ;
 sealed assign{shardId,jobId,sealedIn} → result{shardId,jobId,ok,sealedOut,sig,ms,backend} ;
 cache{id,sealed}→cached{id,ok} ; uncache{id} ; control{...} ; ~4s heartbeat. Payloads are AES-256-GCM
-sealed with the tenant key; every result is Ed25519-signed over `${shardId}|${iv}|${ct}`.
+sealed with THIS worker's per-worker key (welcome.tenantKeyB64); every result is Ed25519-signed over
+`${shardId}|${iv}|${ct}`.
 """
 from __future__ import annotations
 import argparse, asyncio, base64, hashlib, json, os, platform, socket, ssl, time
@@ -1094,8 +1096,8 @@ def model_dispatch(op: str, payload: dict) -> dict:
 # transport". LAN-ONLY caveat: the advertised URL is a raw LAN IPv4 — no STUN/TURN/NAT
 # traversal; a segmented/NAT'd edge fails the probe and the coordinator keeps it on relay.
 # ============================================================================
-RING: dict = {}         # sid -> {epoch, token, succ:{id,url,pub}|None, pred_pub:bytes|None, conn}
-_KEY = None             # tenant key (set from `welcome`; the SAME key the coordinator hands every worker)
+RING: dict = {}         # sid -> {epoch, token, succ:{id,url,pub}|None, succ_key:bytes|None, pred_pub:bytes|None, pred_key:bytes|None, conn}
+_KEY = None             # this worker's PER-WORKER key (from `welcome`) — coordinator<->worker seals; peer act/expert frames use the per-EDGE succ_key/pred_key/edge_key above
 _CEIL = [0.6]           # current duty ceiling, shared with the async peer handlers
 _LOOP = None            # the worker's asyncio loop (run_in_executor from peer handlers)
 _CTRL_SEND = [None]     # bound ws_send of the LIVE control connection (for complete/edge_fault frames)
@@ -1165,7 +1167,7 @@ async def ring_send(sid, seq, epoch, out, want_logits, cache=None):
             frame["logits"] = out["logits"]
         await _ctrl_send(frame)
         return
-    sealed = seal(_KEY, json.dumps(out).encode())            # same seal() the coordinator uses — any tenant peer can open it
+    sealed = seal(r["succ_key"], json.dumps(out).encode())   # per-EDGE session key (coordinator-brokered) — only this successor can open it
     sig = b64e(_sk.sign(f'{sid}|{seq}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
     frame = {"sid": sid, "seq": seq, "epoch": epoch, "token": r["token"], "sealed": sealed, "sig": sig, "return_logits": want_logits}
     if cache is not None:
@@ -1197,7 +1199,7 @@ async def _handle_act(m):
         Ed25519PublicKey.from_public_bytes(r["pred_pub"]).verify(b64d(m["sig"]), msg)
     except Exception:
         print("[torch-worker] peer act: Ed25519 verify FAILED — dropping"); return
-    inner = json.loads(unseal(_KEY, b).decode())             # {hidden, seq, hidden_dim}
+    inner = json.loads(unseal(r["pred_key"], b).decode())    # per-EDGE session key for THIS predecessor (fails closed if unset/rotated)
     payload = {"id": sid, "first": False, "last": _ring_last(r), "hidden": inner["hidden"], "seq": inner["seq"]}
     cache = None
     if m.get("cached"):                                      # KV-over-peer: run this stage's cached shard_forward
@@ -1247,6 +1249,7 @@ async def _handle_ring_wire(m):
         except Exception:
             pass
     r.update(epoch=m["epoch"], token=m["token"], succ=m.get("succ"), conn=None, relay=False)
+    r["succ_key"] = b64d(m["succ_key"]) if m.get("succ_key") else None  # per-edge key to SEAL our outgoing act frames
     reachable = True
     if m.get("succ"):
         reachable = await _peer_probe(m["succ"]["url"], sid)
@@ -1265,6 +1268,7 @@ async def _handle_ring_mode(m):
 async def _handle_ring_pred(m):
     sid = m["sid"]; r = RING.setdefault(sid, {})
     r["pred_pub"] = b64d(m["pred_pub"]); r["epoch"] = m.get("epoch", r.get("epoch"))
+    r["pred_key"] = b64d(m["pred_key"]) if m.get("pred_key") else None  # per-edge key to OPEN our predecessor's act frames
 
 
 async def _handle_inject(m):
@@ -1319,7 +1323,8 @@ async def _handle_moe_wire(m):
     old = MOE_WIRE.get(sid)
     if old:
         await _moe_close_conns(old)
-    MOE_WIRE[sid] = {"epoch": m["epoch"], "token": m["token"], "holders": m["holders"], "conns": {}}
+    MOE_WIRE[sid] = {"epoch": m["epoch"], "token": m["token"], "holders": m["holders"], "conns": {},
+                     "holder_keys": {hid: b64d(k) for hid, k in (m.get("holder_keys") or {}).items()}}  # per backbone<->holder edge key
     reachable = True
     for h in m["holders"]:
         if not await _peer_probe(h["url"], sid):
@@ -1330,14 +1335,16 @@ async def _handle_moe_wire(m):
 async def _handle_moe_wire_holder(m):
     """HOLDER: stash the backbone's pubkey + ring token/epoch so it can origin-verify inbound dispatch frames."""
     sid = m["sid"]
-    MOE_PEER[sid] = {"epoch": m["epoch"], "token": m["token"], "backbone_pub": b64d(m["backbone_pub"])}
+    MOE_PEER[sid] = {"epoch": m["epoch"], "token": m["token"], "backbone_pub": b64d(m["backbone_pub"]),
+                     "edge_key": b64d(m["edge_key"]) if m.get("edge_key") else None}  # per-edge key with the backbone
 
 
 async def _moe_dispatch_to_holder(sid, L, epoch, token, seq, k, moe_in, topi, topw, experts, h, mw):
     """BACKBONE→HOLDER over the peer WS: seal+sign the routed-FFN input + this holder's routed experts, await the
     signed partial back, origin-verify it, and return the partial hidden. One persistent conn per holder."""
     payload = {"layer": L, "seq": seq, "k": k, "hidden": moe_in, "topk_i": topi, "topk_w": topw, "experts": experts}
-    sealed = seal(_KEY, json.dumps(payload).encode())
+    ekey = mw["holder_keys"][h["id"]]                        # per-edge key for THIS backbone->holder pair
+    sealed = seal(ekey, json.dumps(payload).encode())
     sig = b64e(_sk.sign(f'{sid}|{L}|{epoch}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
     frame = {"t": "moe_dispatch", "sid": sid, "layer": L, "epoch": epoch, "token": token, "sealed": sealed, "sig": sig}
     conn = mw["conns"].get(h["id"])
@@ -1349,7 +1356,7 @@ async def _moe_dispatch_to_holder(sid, L, epoch, token, seq, k, moe_in, topi, to
         raise RuntimeError(f"bad moe_partial from holder {h['id']}")
     b = resp["sealed"]; msg = f'{sid}|{L}|{epoch}|{b["iv"]}|{b["ct"]}'.encode()
     Ed25519PublicKey.from_public_bytes(b64d(h["pub"])).verify(b64d(resp["sig"]), msg)  # origin-auth the holder
-    return json.loads(unseal(_KEY, b).decode())["partial"]
+    return json.loads(unseal(ekey, b).decode())["partial"]  # same per-edge key opens the holder's partial
 
 
 async def _handle_moe_inject(m):
@@ -1400,9 +1407,9 @@ async def _handle_moe_dispatch(ws, m):
         Ed25519PublicKey.from_public_bytes(mp["backbone_pub"]).verify(b64d(m["sig"]), msg)
     except Exception:
         print("[torch-worker] moe_dispatch: Ed25519 verify FAILED — dropping"); return
-    payload = json.loads(unseal(_KEY, b).decode()); payload["id"] = sid
+    payload = json.loads(unseal(mp["edge_key"], b).decode()); payload["id"] = sid  # per-edge key with the backbone
     out = await _run_moe(expert_forward, payload)
-    sealed = seal(_KEY, json.dumps({"partial": out["partial"]}).encode())
+    sealed = seal(mp["edge_key"], json.dumps({"partial": out["partial"]}).encode())
     sig = b64e(_sk.sign(f'{sid}|{L}|{epoch}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
     await ws.send(json.dumps({"t": "moe_partial", "sid": sid, "layer": L, "epoch": epoch, "sealed": sealed, "sig": sig}))
 
@@ -1519,8 +1526,11 @@ async def run():
                                     print(f"[torch-worker] rejected (fatal): {reason}"); return
                                 print(f"[torch-worker] rejected: {reason} — retrying in 5s"); await asyncio.sleep(5); break
                             elif t == "welcome":
-                                key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6))
-                                _KEY = key; _CEIL[0] = ceil  # peer handlers seal/unseal with the same tenant key
+                                # `tenantKeyB64` is now a PER-WORKER key the coordinator DERIVED for this worker
+                                # (HKDF of a coordinator master + our id + the current key epoch), not a shared fleet
+                                # key — we hold+use the bytes it hands us for every coordinator<->worker seal.
+                                key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6)); epoch = int(m.get("epoch", 0))
+                                _KEY = key; _CEIL[0] = ceil  # per-worker key; peer act/expert frames use per-EDGE keys (brokered into RING/MOE_*) instead
                                 # fresh session: the coordinator forgets our resident state on disconnect, so a
                                 # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
                                 # KEEP in-progress PUSH staging, though: a stage that dropped mid-stream can then
@@ -1528,7 +1538,7 @@ async def run():
                                 # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
                                 resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); MOE_BB.clear(); MOE_EXPERTS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
                                 RING.clear(); MOE_WIRE.clear(); MOE_PEER.clear()  # a fresh coordinator session re-wires the ring/mesh after (re)load
-                                print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
+                                print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}% · key epoch {epoch} (per-worker key)")
                             elif t == "control":
                                 if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
                                 if "ceil" in m and m["ceil"] is not None: ceil = float(m["ceil"]); _CEIL[0] = ceil
