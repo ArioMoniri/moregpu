@@ -582,6 +582,11 @@ async function pushModelToWorker(w: Worker, model: string, id: string, fp16: boo
 // weight whose name contains ".h.<i>." (GPT-2) or ".layers.<i>." (Llama-family); everything else is non-layer
 // (embeddings / final norm / lm_head) and goes to the end stages only.
 type STHeader = Record<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>;
+// A tensor's RESOLVED source: which safetensors file it lives in, that file's data-region start (8 + its
+// own header length), and its byte offsets WITHIN that file. A single-file model and a multi-file (sharded)
+// model both resolve to one of these maps, so the staging code below is agnostic to how many files back it.
+type TensorLoc = { dtype: string; shape: number[]; data_offsets: [number, number]; file: string; dataStart: number };
+type STPlan = Record<string, TensorLoc>;
 const LAYER_RE = /(?:^|\.)(?:h|layers)\.(\d+)\./;
 
 async function hfFetchRange(model: string, file: string, start: number, end: number): Promise<Uint8Array> {
@@ -605,7 +610,33 @@ async function hfSafetensorsHeader(model: string, file: string): Promise<{ heade
   return { header: parsed as STHeader, headerLen };
 }
 
-function stageTensors(header: STHeader, start: number, end: number, first: boolean, last: boolean): string[] {
+// Resolve a model's weights into ONE tensor→location plan. Fast path: a single model.safetensors (one header
+// fetch). Sharded path: model.safetensors.index.json's weight_map (tensorName→fileName) — fetch EACH referenced
+// file's header via Range and merge, tagging every tensor with its file + that file's data-region start. Key
+// order follows weight_map insertion order, so the per-stage byte layout stays deterministic across resumes.
+async function hfSafetensorsPlan(model: string, indexText: string | null): Promise<STPlan> {
+  const plan: STPlan = {};
+  if (indexText === null) { // single-file fast path — same tensors, same order as before
+    const { header, headerLen } = await hfSafetensorsHeader(model, 'model.safetensors');
+    const dataStart = 8 + headerLen;
+    for (const [name, t] of Object.entries(header)) plan[name] = { dtype: t.dtype, shape: t.shape, data_offsets: t.data_offsets, file: 'model.safetensors', dataStart };
+    return plan;
+  }
+  const idx = JSON.parse(indexText) as { weight_map?: Record<string, string> };
+  const weightMap = idx.weight_map ?? {};
+  const files = [...new Set(Object.values(weightMap))];
+  if (files.length === 0) throw new Error(`${model}: empty safetensors index (no weight_map)`);
+  const headers = new Map<string, { header: STHeader; dataStart: number }>();
+  for (const f of files) { const { header, headerLen } = await hfSafetensorsHeader(model, f); headers.set(f, { header, dataStart: 8 + headerLen }); }
+  for (const [name, f] of Object.entries(weightMap)) {
+    const h = headers.get(f); if (!h) throw new Error(`${model}: index maps ${name}→${f} but that file has no header`);
+    const t = h.header[name]; if (!t) throw new Error(`${model}: ${name} is in the index but absent from ${f}'s header`);
+    plan[name] = { dtype: t.dtype, shape: t.shape, data_offsets: t.data_offsets, file: f, dataStart: h.dataStart };
+  }
+  return plan;
+}
+
+function stageTensors(header: STPlan, start: number, end: number, first: boolean, last: boolean): string[] {
   const names: string[] = [];
   for (const name of Object.keys(header)) {
     const m = LAYER_RE.exec(name);
@@ -616,16 +647,18 @@ function stageTensors(header: STHeader, start: number, end: number, first: boole
 }
 
 // Build a valid per-stage safetensors (recomputed contiguous offsets) and stream it as "model.safetensors".
+// The selected tensors may come from ONE source file or from MANY (a sharded index) — each is Range-fetched
+// from its own file via the plan — but the output is always a single merged per-stage file for the worker.
 // `resumeFrom` = bytes already staged on the worker (from a dropped attempt): the byte layout is deterministic
 // (same tensor order → same header), so we skip whole segments before the offset (no HF re-fetch) and append only
 // the tail — a churned stage makes forward progress across reconnects instead of restarting from zero.
-async function streamStageSafetensors(w: Worker, id: string, model: string, file: string, header: STHeader, srcHeaderLen: number, names: string[], budget: { left: number }, resumeFrom = 0): Promise<number> {
-  const newHeader: STHeader = {}; const parts: { srcStart: number; len: number }[] = []; let off = 0;
-  const dataStart = 8 + srcHeaderLen;
+async function streamStageSafetensors(w: Worker, id: string, model: string, plan: STPlan, names: string[], budget: { left: number }, resumeFrom = 0): Promise<number> {
+  const newHeader: STHeader = {}; const parts: { file: string; srcStart: number; len: number }[] = []; let off = 0;
   for (const name of names) {
-    const t = header[name]; const len = t.data_offsets[1] - t.data_offsets[0];
+    const t = plan[name]; const len = t.data_offsets[1] - t.data_offsets[0];
     newHeader[name] = { dtype: t.dtype, shape: t.shape, data_offsets: [off, off + len] };
-    parts.push({ srcStart: dataStart + t.data_offsets[0], len }); off += len;
+    // each tensor's bytes come from ITS OWN file (single-file → all the same file; sharded → mixed)
+    parts.push({ file: t.file, srcStart: t.dataStart + t.data_offsets[0], len }); off += len;
   }
   let hstr = JSON.stringify(newHeader);
   while ((8 + new TextEncoder().encode(hstr).length) % 8 !== 0) hstr += ' '; // safetensors: header padded so data is 8-byte aligned
@@ -651,7 +684,7 @@ async function streamStageSafetensors(w: Worker, id: string, model: string, file
   };
   await emit(prefix.length, () => Promise.resolve(prefix));
   await emit(hbytes.length, () => Promise.resolve(hbytes));
-  for (const p of parts) await emit(p.len, () => hfFetchRange(model, file, p.srcStart, p.srcStart + p.len - 1)); // Range-fetch just this tensor
+  for (const p of parts) await emit(p.len, () => hfFetchRange(model, p.file, p.srcStart, p.srcStart + p.len - 1)); // Range-fetch just this tensor from its file
   await push(pending, true);
   return resumeFrom + total; // full staged size (already-there + this attempt's tail)
 }
@@ -1270,16 +1303,19 @@ async function handler(req: Request): Promise<Response> {
     const fail = (msg: string, code: number) => { shardPlans.delete(sid); return json({ error: msg, id: sid }, code); };
     // DOWNLOAD-FREE: fetch config + the safetensors header ON THE COORDINATOR (no worker download), so the
     // fleet gets only its per-stage slice. Also gives the real layer count without a worker-side model_load.
-    let configText: string | null = null, stHeader: STHeader | null = null, stHeaderLen = 0, nLayer = 0;
+    let configText: string | null = null, stPlan: STPlan | null = null, nLayer = 0;
     if (body.push) {
       try {
         configText = await hfFetchText(body.model, 'config.json', PUSH_INDEX_MAX);
         if (!configText) return fail(`${body.model}: no config.json on HF`, 502);
         const cfg = JSON.parse(configText) as Record<string, unknown>;
         nLayer = Math.floor(Number(cfg.num_hidden_layers ?? cfg.n_layer ?? 0));
-        if (await hfFetchText(body.model, 'model.safetensors.index.json', 4096).catch(() => null))
-          return fail(`${body.model} ships SHARDED safetensors — download-free sharding needs a single-file model.safetensors (v1)`, 400);
-        const h = await hfSafetensorsHeader(body.model, 'model.safetensors'); stHeader = h.header; stHeaderLen = h.headerLen;
+        // Weights may be a single model.safetensors OR split across many files (model.safetensors.index.json's
+        // weight_map). Resolve either into one tensor→{file,offsets} plan; each stage then Range-fetches only its
+        // tensors from the CORRECT file. The fleet still downloads nothing — the coordinator merges the selected
+        // tensors into one per-stage safetensors before streaming it (a 404 index → single-file fast path).
+        const indexText = await hfFetchText(body.model, 'model.safetensors.index.json', PUSH_INDEX_MAX);
+        stPlan = await hfSafetensorsPlan(body.model, indexText);
       } catch (e) { return fail(`download-free shard preflight failed: ${e instanceof Error ? e.message : e}`, 502); }
     } else {
       // Resolve the model's REAL layer count (config-only, no weights) so gpt2-medium/large/xl shard correctly.
@@ -1324,8 +1360,8 @@ async function handler(req: Request): Promise<Response> {
               const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
             }
           }
-          const names = stageTensors(stHeader!, st.start, st.end, st.first, st.last);
-          const bytes = await streamStageSafetensors(w, sid, model, 'model.safetensors', stHeader!, stHeaderLen, names, budget, Number(sizes['model.safetensors']) || 0);
+          const names = stageTensors(stPlan!, st.start, st.end, st.first, st.last);
+          const bytes = await streamStageSafetensors(w, sid, model, stPlan!, names, budget, Number(sizes['model.safetensors']) || 0);
           const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
           return { ...r, bytes };
         } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }

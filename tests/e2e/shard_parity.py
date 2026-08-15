@@ -32,6 +32,9 @@ def gen_models(root):
     g = GPT2LMHeadModel(GPT2Config(vocab_size=256, n_positions=64, n_embd=32, n_layer=4, n_head=2))
     g.save_pretrained(os.path.join(root, "tiny-gpt2"), safe_serialization=True)
     specs["tiny-gpt2"] = "gpt2"
+    # same weights, but split across many files + a model.safetensors.index.json — exercises the multi-file loader
+    g.save_pretrained(os.path.join(root, "tiny-gpt2-multi"), safe_serialization=True, max_shard_size="64KB")
+    specs["tiny-gpt2-multi"] = "gpt2·multi"
     L = LlamaForCausalLM(LlamaConfig(vocab_size=256, hidden_size=32, intermediate_size=64,
                                      num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
                                      max_position_embeddings=64))
