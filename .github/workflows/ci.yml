@@ -89,6 +89,9 @@ jobs:
       - name: Seal negatives — tampered ciphertext / bad-or-replayed signature rejected
         run: python3 tests/security/seal_negatives.py
 
+      - name: Release verify — tampered / wrong-key / unsigned worker release rejected (install-time gate)
+        run: python3 tests/security/release_verify.py
+
       - name: Fake-WS fleet scale — 150 no-torch nodes, connect storm + churn, control plane holds
         run: python3 tests/scale/fake_fleet.py
 
