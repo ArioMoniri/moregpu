@@ -63,11 +63,13 @@ function log(level: Level, msg: string, ctx?: string) {
 }
 
 // ---------- config / wizard ----------
-interface Config { adminToken: string; joinToken: string; tenantKeyB64: string; created: string; }
+// keyEpoch + removedPubkeys are PERSISTED so a revocation survives a coordinator restart: without this a restart
+// resets the epoch to 0 (re-deriving pre-revocation keys) and empties the ban list, resurrecting a removed worker.
+interface Config { adminToken: string; joinToken: string; tenantKeyB64: string; created: string; keyEpoch?: number; removedPubkeys?: string[]; }
 async function loadOrInitConfig(): Promise<{ cfg: Config; fresh: boolean }> {
   try { return { cfg: JSON.parse(await Deno.readTextFile(CONFIG_PATH)), fresh: false }; }
   catch {
-    const cfg: Config = { adminToken: tokenB64url(24), joinToken: tokenB64url(18), tenantKeyB64: b64e(crypto.getRandomValues(new Uint8Array(32))), created: new Date().toISOString() };
+    const cfg: Config = { adminToken: tokenB64url(24), joinToken: tokenB64url(18), tenantKeyB64: b64e(crypto.getRandomValues(new Uint8Array(32))), created: new Date().toISOString(), keyEpoch: 0, removedPubkeys: [] };
     await Deno.writeTextFile(CONFIG_PATH, JSON.stringify(cfg, null, 2));
     return { cfg, fresh: true };
   }
@@ -79,10 +81,15 @@ const { cfg, fresh } = await loadOrInitConfig();
 // `welcome` hands a per-worker key, and every coordinator<->worker sealed frame (assign / model+train relay /
 // weight cache) uses THAT worker's key — so one worker cannot open another worker's coordinator traffic even if
 // it captures the wire. `keyEpoch` is a monotonic revocation counter: an admin `remove` bumps it, so a key
-// derived afterwards differs, killing a captured pre-revocation key (rotation). In-memory (like removedPubkeys):
-// a coordinator restart re-derives the whole fleet from a clean epoch anyway.
+// derived afterwards differs, killing a captured pre-revocation key (rotation). keyEpoch + the ban list are
+// PERSISTED to config (saveConfig), so a revocation survives a coordinator restart instead of resetting to 0.
 const MASTER = b64d(cfg.tenantKeyB64);
-let keyEpoch = 0;
+let keyEpoch = cfg.keyEpoch ?? 0;
+// Persist mutable trust state (epoch + ban list) back to the config file so revocation is durable across restarts.
+async function saveConfig(): Promise<void> {
+  const out: Config = { adminToken: cfg.adminToken, joinToken: cfg.joinToken, tenantKeyB64: cfg.tenantKeyB64, created: cfg.created, keyEpoch, removedPubkeys: [...removedPubkeys] };
+  try { await Deno.writeTextFile(CONFIG_PATH, JSON.stringify(out, null, 2)); } catch (e) { log('warn', `could not persist config: ${e instanceof Error ? e.message : e}`); }
+}
 const HKDF_SALT = new TextEncoder().encode('moregpu:hkdf:v1');
 async function hkdf(info: string, bytes = 32): Promise<Uint8Array> {
   const base = await crypto.subtle.importKey('raw', MASTER as BufferSource, 'HKDF', false, ['deriveBits']);
@@ -268,7 +275,7 @@ interface Worker {
   reflexiveIp?: string; // the source IP the coordinator observed for this worker's control connection (a STUN-like hint for MOREGPU_PEER_PUBLIC)
 }
 const workers = new Map<string, Worker>();
-const removedPubkeys = new Set<string>(); // workers an admin removed — refuse their re-registration (ban by key)
+const removedPubkeys = new Set<string>(cfg.removedPubkeys ?? []); // workers an admin removed — refuse their re-registration (ban by key); restored from config so a ban survives restart
 // Weight RESIDENCY: a named weight is cached on ONE worker; a resident matmul (bRef) runs there without
 // re-sending the weight. Place different layers' weights on different workers to split a model (pipeline).
 const weightHome = new Map<string, { worker: string; rows: number; cols: number; dtype: 'f32' | 'f16' }>(); // weightId → home worker + dims
@@ -1034,7 +1041,8 @@ async function wireRing(sid: string): Promise<Ring | null> {
     const canDirect = i + 1 < plan.stages.length && !!cur.peer && !!suc!.peer && !FORCE_RELAY.has(cur.id);
     const succEndpoint = canDirect ? { id: suc!.id, url: suc!.peer!.url, pub: suc!.peer!.pub, candidates: suc!.peer!.candidates } : null;
     // Per-edge seal key for cur->suc (needed for BOTH a direct hand-off and a bridged/relay hop — the coordinator
-    // only relays ciphertext on a bridge, it never holds this key). `suc` gets the matching key as its pred_key.
+    // only relays ciphertext on a bridge, it does not USE this key to open the frame — though as the broker it can
+    // derive every edge key from MASTER; the coordinator is fully trusted). `suc` gets the matching key as pred_key.
     const succKey = suc ? b64e(await deriveEdgeKey(sid, epoch, cur.id, suc.id)) : undefined;
     const ack = await ringWireRPC(cur, { sid, epoch, token, succ: succEndpoint, ...(succKey ? { succ_key: succKey } : {}) });
     if (suc) {
@@ -1577,7 +1585,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     const w = workers.get(id);
     if (!w) return json({ error: 'worker not found' }, 404);
     const body = await req.json().catch(() => ({})) as { action?: string; ceil?: number; schedule?: string; nick?: string };
-    if (body.action === 'remove') { if (w.pubkeyB64) removedPubkeys.add(w.pubkeyB64); try { w.ws.close(); } catch { /* */ } workers.delete(id); keyEpoch++; /* rotate: every key derived after this differs, so a captured pre-revocation key is dead */ log('warn', `admin removed worker ${id}${w.pubkeyB64 ? ' (banned by key)' : ' (unsigned — could rejoin under a new id)'} · key epoch → ${keyEpoch}`); return json({ ok: true, removed: id, banned: !!w.pubkeyB64, epoch: keyEpoch }); }
+    if (body.action === 'remove') { if (w.pubkeyB64) removedPubkeys.add(w.pubkeyB64); try { w.ws.close(); } catch { /* */ } workers.delete(id); keyEpoch++; /* rotate: every key derived after this differs, so a captured pre-revocation key is dead */ await saveConfig(); /* persist so the bump + ban survive a restart */ log('warn', `admin removed worker ${id}${w.pubkeyB64 ? ' (banned by key)' : ' (unsigned — could rejoin under a new id)'} · key epoch → ${keyEpoch}`); return json({ ok: true, removed: id, banned: !!w.pubkeyB64, epoch: keyEpoch }); }
     const ctl: Record<string, unknown> = { t: 'control' };
     if (body.action === 'pause') { w.paused = true; w.pausedReason = 'admin'; ctl.pause = true; }
     if (body.action === 'resume') { w.paused = false; w.pausedReason = null; w.consecErrors = 0; ctl.pause = false; }
@@ -2119,7 +2127,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   //   POST /model/moe_unload   { id? }                               → free backbone + every holder
   if (req.method === 'POST' && url.pathname === '/model/moe_shard') {
     const body = await req.json().catch(() => ({})) as { model?: string; id?: string; push?: boolean };
-    if (!body.model) return json({ error: 'need {model} (a routed-MoE — OLMoE / Qwen2-MoE)' }, 400);
+    if (!body.model) return json({ error: 'need {model} (a pure routed-MoE — OLMoE / Qwen3-MoE; shared-expert families like Qwen2-MoE / DeepSeek are not supported yet)' }, 400);
     const push = body.push !== false;   // download-free by default (the coordinator is the one-time weight source)
     if (push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free MoE shard` }, 400);
     const cands = torchWorkers();

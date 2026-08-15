@@ -634,6 +634,19 @@ def shard_load(cfg: dict) -> dict:
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
     arch = _shard_arch(model)
     mc = model.config
+    # REJECT sliding-window / mixed-attention models: a middle stage recomputes ONE full-causal mask for all its
+    # layers, so a sliding/local-attention layer would attend OUTSIDE its window and diverge from the monolithic
+    # model once the sequence exceeds the window. Fail closed instead of silently returning wrong logits (Mistral,
+    # Gemma-2/3, sliding Qwen2). Full-attention models (Llama/Qwen2.5/SmolLM/TinyLlama/GPT-2) are unaffected.
+    if arch != "gpt2":
+        _sw = getattr(mc, "sliding_window", None)
+        _lt = getattr(mc, "layer_types", None)
+        if (_sw not in (None, 0)) or (_lt and any("sliding" in str(t).lower() for t in _lt)):
+            raise ValueError(
+                "pipeline sharding does not support sliding-window / mixed-attention models yet "
+                f"(sliding_window={_sw}) — a sharded middle stage would attend outside the window and produce "
+                "wrong logits past the window length. Shard a full-attention model (Llama / Qwen2.5 / SmolLM / "
+                "TinyLlama / GPT-2), or serve this model un-sharded on one node. See docs/ROADMAP.md.")
     shard: dict = {"arch": arch, "first": first, "last": last, "start": start, "end": end,
                    "vocab_size": int(mc.vocab_size)}
     if arch == "gpt2":
@@ -748,10 +761,10 @@ def shard_forward(payload: dict) -> dict:
             if last:
                 h = shard["ln_f"](h)
         else:  # llama-style: recompute RoPE cos/sin + a causal mask exactly as LlamaModel.forward does,
-            # TODO(review): this feeds ONE full-causal mask to every layer, which is correct for standard
-            # Llama/Qwen/SmolLM/TinyLlama but WRONG for sliding-window / mixed-attention models (Mistral,
-            # Gemma-2/3, sliding Qwen2): those need per-layer masks dispatched by decoder_layer.attention_type
-            # (create_sliding_window_causal_mask for the sliding layers). Reject such configs until supported.
+            # This feeds ONE full-causal mask to every layer — correct for standard full-attention models
+            # (Llama/Qwen2.5/SmolLM/TinyLlama). Sliding-window / mixed-attention models (Mistral, Gemma-2/3,
+            # sliding Qwen2) would need per-layer masks by decoder_layer.attention_type and are REJECTED up front
+            # at shard_load (see the sliding_window/layer_types guard there) rather than silently mis-masked here.
             from transformers.masking_utils import create_causal_mask  # so the layers see identical inputs
             import inspect
             if first:
@@ -830,6 +843,26 @@ def _moe_arch_ok(model) -> bool:
     return hasattr(model, "model") and hasattr(model.model, "layers") and hasattr(model.model, "rotary_emb")
 
 
+def _require_pure_routed_moe(model) -> None:
+    """MoE EP computes ONLY the routed experts with plain softmax-topk routing (OLMoE, Qwen3-MoE). REJECT families
+    the backbone proxy would silently mis-handle: a SHARED/dense expert (Qwen2-MoE, DeepSeek-V2/V3) — the proxy
+    drops it, so its all-tokens contribution is lost → wrong logits — and non-softmax routers (DeepSeek's sigmoid +
+    group routing). Fail closed with a clear message instead of returning a plausible-but-wrong distribution."""
+    mc = model.config
+    blk = model.model.layers[0].mlp
+    has_shared = (getattr(mc, "shared_expert_intermediate_size", None) not in (None, 0)) \
+        or getattr(mc, "n_shared_experts", None) not in (None, 0) \
+        or hasattr(blk, "shared_expert") or hasattr(blk, "shared_experts")
+    scoring = str(getattr(mc, "scoring_func", "softmax")).lower()
+    if has_shared or scoring not in ("softmax", "none", ""):
+        why = "a shared/dense expert" if has_shared else f"a '{scoring}' router (not softmax-topk)"
+        raise ValueError(
+            f"MoE expert parallelism supports only PURE routed MoE with softmax-topk routing (OLMoE, Qwen3-MoE); "
+            f"this model ({type(model).__name__}) has {why}, which the backbone proxy would drop or mis-route — "
+            f"the output would be silently wrong. Serve it un-sharded, or pipeline-shard its dense layers. "
+            f"See docs/ROADMAP.md.")
+
+
 def _require_indexable_experts(model) -> None:
     """MoE expert parallelism addresses experts BY INDEX (experts[e]) — the OLMoE `nn.ModuleList` layout.
     transformers 5.x fuses per-layer experts into a single batched `Experts` module that isn't subscriptable,
@@ -850,7 +883,8 @@ def _require_indexable_experts(model) -> None:
         pass  # any other shape → let the downstream arch/slicing logic surface it
 
 def moe_backbone_load(cfg: dict) -> dict:
-    """Load a routed-MoE causal LM (Llama-style: model.layers + RoPE + RMSNorm — OLMoE / Qwen2-MoE), KEEP the
+    """Load a PURE routed-MoE causal LM (Llama-style: model.layers + RoPE + RMSNorm — OLMoE / Qwen3-MoE; shared-
+    expert / non-softmax-router families like Qwen2-MoE / DeepSeek are rejected by _require_pure_routed_moe), KEEP the
     dense backbone, and swap every layer's expert block for a router-only proxy (see _MoEBackboneProxy). Loaded
     from the streamed BACKBONE-only partial checkpoint (experts absent → random-init, then discarded by the
     proxy swap) so the worker downloads nothing. dtype float32 (parity reference is fp32; real deploys use fp16)."""
@@ -873,6 +907,7 @@ def moe_backbone_load(cfg: dict) -> dict:
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE (model.layers + rotary_emb), got {type(model).__name__}")
     _require_indexable_experts(model)
+    _require_pure_routed_moe(model)
     mm = model.model; mc = model.config
     proxies = []
     for layer in mm.layers:
@@ -920,6 +955,7 @@ def expert_load(cfg: dict) -> dict:
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE, got {type(model).__name__}")
     _require_indexable_experts(model)
+    _require_pure_routed_moe(model)
     mm = model.model; mc = model.config; n_layer = int(mc.num_hidden_layers)
     kept: dict = {}
     for L in range(n_layer):
@@ -1510,9 +1546,17 @@ async def run():
                                   f"possible MITM; not joining. Update MOREGPU_PIN if the coordinator cert rotated.")
                             await asyncio.sleep(5); continue
                         print(f"[torch-worker] coordinator TLS cert pinned OK · sha256:{fp[:16]}…")
+                    elif os.environ.get("MOREGPU_ALLOW_UNPINNED", "").lower() in ("1", "true", "yes", "on"):
+                        print(f"[torch-worker] !! MOREGPU_ALLOW_UNPINNED: wss:// with NO pin — coordinator cert "
+                              f"{('sha256:' + fp[:16] + '…') if fp else '(unavailable)'} is UNAUTHENTICATED. Local hacking only; never join a real pool this way.")
                     else:
-                        print(f"[torch-worker] warning: wss:// but no MOREGPU_PIN/--pin — coordinator cert "
-                              f"{('sha256:' + fp[:16] + '…') if fp else '(unavailable)'} is UNPINNED; set MOREGPU_PIN to authenticate it.")
+                        # FAIL CLOSED (matches scripts/install.sh): a self-signed wss:// coordinator with no pin
+                        # cannot be authenticated, so we REFUSE before the join token / tenant key ever cross the
+                        # wire — otherwise a MITM that terminates TLS with its own cert would harvest them.
+                        print("[torch-worker] REFUSED: wss:// but no MOREGPU_PIN/--pin — will not send the join token to an "
+                              "unauthenticated coordinator (possible MITM). Copy MOREGPU_PIN from the coordinator's join "
+                              "banner, or set MOREGPU_ALLOW_UNPINNED=1 for LOCAL hacking only.")
+                        return
                 node = {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}
                 if PEER_TRANSPORT and _PEER_URL:  # advertise the peer endpoint so the coordinator can wire a direct ring
                     node["peer"] = {"url": _PEER_URL, "candidates": _PEER_CANDIDATES, "pub": PUBKEY_B64}

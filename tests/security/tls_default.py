@@ -199,6 +199,14 @@ def main() -> int:
         never = not worker_registered("https", port, ADMIN, "w-badpin", tries=8)
         check(never, "worker with a mismatched pin NEVER registered (rejected before the token crossed the wire)")
 
+        # ── (3b) NO pin on wss:// is ALSO refused (fail-closed, mirrors scripts/install.sh) ───────────────
+        print("\n(3b) a worker with NO pin on wss:// is refused (does not leak the join token)", flush=True)
+        start_worker(root, "wss", port, JOIN, "w-nopin", pin=None)
+        check(log_has(os.path.join(root, "w-nopin.log"), "REFUSED", tries=40),
+              "worker on wss:// with NO MOREGPU_PIN logs REFUSED (fail-closed — was fail-OPEN before the fix)")
+        check(not worker_registered("https", port, ADMIN, "w-nopin", tries=8),
+              "worker with no pin NEVER registers on wss:// (join token never sent to an unauthenticated coordinator)")
+
         # ── (4) ws:// opt-out (MOREGPU_INSECURE=1) still works — the existing CI path ─────────────────────
         print("\n(4) MOREGPU_INSECURE=1 opt-out still serves plaintext ws:// for local/CI", flush=True)
         iport = free_port(); icfg = os.path.join(root, "mg-insecure.json")

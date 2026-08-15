@@ -150,7 +150,17 @@ def main():
                                                             "return_logits": True}, admin=ADMIN)
             si = fr.get("argmax")
             match = (si == gi)
-            print(f"  {'PASS' if match else 'FAIL'} {model:10s} ({arch:5s}): shard argmax={si} golden argmax={gi}", flush=True)
+            # We requested return_logits — actually CHECK them (argmax alone can miss a sub-argmax numeric drift).
+            ldiff = "n/a"
+            if fr.get("logits"):
+                import numpy as _np, base64 as _b64
+                pl = _np.frombuffer(_b64.b64decode(fr["logits"]), dtype="<f4").astype("float64")
+                gl = glogits.detach().cpu().numpy().astype("float64").reshape(-1)
+                ldiff = float(_np.abs(pl - gl).max()) if pl.shape == gl.shape else 9e9
+                match = match and (ldiff < 1e-3)
+            else:
+                match = False  # requested logits but the shard path returned none
+            print(f"  {'PASS' if match else 'FAIL'} {model:10s} ({arch:5s}): shard argmax={si} golden={gi} max|Δlogit|={ldiff}", flush=True)
             ok = ok and match
     finally:
         for p in PROCS:

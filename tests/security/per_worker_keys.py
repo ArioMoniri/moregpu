@@ -288,6 +288,36 @@ async def amain() -> int:
         check(opened4 is not None, "w4 UNSEALS its own (epoch-1) coordinator traffic")
         cannot_open(stale0, blob4, "the pre-revocation (epoch-0) key for w4 tries to unseal its epoch-1 traffic")
 
+        # ---- (E) revocation is DURABLE across a coordinator RESTART (keyEpoch + ban persisted to config) ----
+        print("\n(E) revocation survives a coordinator restart  [keyEpoch + ban persisted to config]")
+        conf_after = json.load(open(cfg))
+        check(conf_after.get("keyEpoch") == 1,
+              f"keyEpoch was persisted to config on remove (config keyEpoch={conf_after.get('keyEpoch')})")
+        check(w2.pubkey in (conf_after.get("removedPubkeys") or []),
+              "the removed worker's pubkey was persisted to the config ban list")
+        # Restart the coordinator on a NEW port with the SAME config file — a fresh process must RESTORE epoch 1,
+        # not reset to 0 (which would resurrect every pre-revocation key). This is the durable-revocation fix.
+        procs[0].terminate()
+        try: procs[0].wait(timeout=5)
+        except Exception: pass
+        await asyncio.sleep(1.0)
+        port2 = free_port()
+        env2 = dict(os.environ, PORT=str(port2), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1")
+        env2.pop("MOREGPU_PEER_TRANSPORT", None)
+        procs.append(subprocess.Popen(
+            ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "apps/coordinator/server.ts"],
+            cwd=REPO, env=env2, stdout=open(os.path.join(root, "coord2.log"), "w"), stderr=subprocess.STDOUT))
+        for _ in range(80):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port2}/health", timeout=2); break
+            except Exception:
+                await asyncio.sleep(0.5)
+        w5 = RawWorker("w5", f"ws://127.0.0.1:{port2}/ws", JOIN); await w5.start(); workers.append(w5)
+        check(w5.epoch == 1,
+              f"after restart, a new worker is STILL minted at epoch 1 (not reset to 0) — revocation is durable (w5={w5.epoch})")
+        check(w5.key == derive_worker_key(master, "w5", 1),
+              "w5 key == HKDF(master, 'w5', epoch 1) after restart (master stable, epoch restored from config)")
+
     finally:
         for w in workers:
             try:

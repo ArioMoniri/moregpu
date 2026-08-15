@@ -127,3 +127,9 @@ jobs:
 
       - name: KV-cache parity — cached == uncached == un-sharded golden (O(n^2)->O(n))
         run: python3 tests/e2e/kv_cache_parity.py
+
+      - name: Serve parity — single-node download-free serving == un-sharded golden (forward + generate)
+        run: python3 tests/e2e/serve_parity.py
+
+      - name: Single-worker LoRA — /train/load+step+adapter learns (loss decreases, adapter trained)
+        run: python3 tests/e2e/train_single.py
