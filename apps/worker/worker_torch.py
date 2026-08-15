@@ -657,14 +657,18 @@ def shard_forward(payload: dict) -> dict:
             # Gemma-2/3, sliding Qwen2): those need per-layer masks dispatched by decoder_layer.attention_type
             # (create_sliding_window_causal_mask for the sliding layers). Reject such configs until supported.
             from transformers.masking_utils import create_causal_mask  # so the layers see identical inputs
+            import inspect
             if first:
                 h = shard["embed_tokens"](ids)  # [1, seq, hidden] — RoPE is applied per-layer, not here
             cache_position = torch.arange(seq, dtype=torch.long, device=DEV)
             position_ids = cache_position.unsqueeze(0)  # [1, seq]
             pos_emb = shard["rotary_emb"](h, position_ids)  # (cos, sin) — depends only on positions + head_dim
-            causal_mask = create_causal_mask(config=shard["config"], input_embeds=h, attention_mask=None,
-                                             cache_position=cache_position, past_key_values=None,
-                                             position_ids=position_ids)
+            # transformers renamed input_embeds -> inputs_embeds (and trims kwargs across versions) — pick by signature
+            _msig = inspect.signature(create_causal_mask).parameters
+            _mkw = {"config": shard["config"], "attention_mask": None, "cache_position": cache_position,
+                    "past_key_values": None, "position_ids": position_ids,
+                    ("inputs_embeds" if "inputs_embeds" in _msig else "input_embeds"): h}
+            causal_mask = create_causal_mask(**{k: v for k, v in _mkw.items() if k in _msig})
             for blk in shard["blocks"]:  # LlamaDecoderLayer.forward returns the hidden tensor directly
                 h = blk(h, attention_mask=causal_mask, position_ids=position_ids, position_embeddings=pos_emb)
             if last:
