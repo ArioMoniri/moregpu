@@ -66,10 +66,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install cryptography websockets numpy
+          pip install cryptography websockets numpy transformers safetensors
 
       - name: Compile-check native code
         run: python -m py_compile apps/worker/worker_torch.py examples/*.py clients/python/moregpu/__init__.py
 
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh
+
+      - name: Download-free shard exact-match parity (GPT-2 + Llama, no model download)
+        run: python3 tests/e2e/shard_parity.py
