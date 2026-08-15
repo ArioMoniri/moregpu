@@ -185,7 +185,7 @@ def main():
         # coordinator — small SHARD_RECONNECT_WAIT so the "no spare" branch (not exercised here: w4 IS a spare)
         # can't hang CI, generous stage tries so re-placement + restart has headroom.
         port = free_port(); cfg = os.path.join(root, "mg.json")
-        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                    MOREGPU_HF_BASE=f"http://127.0.0.1:{hfport}",
                    MOREGPU_SHARD_LOAD_DEADLINE_MS="600000",
                    MOREGPU_SHARD_STAGE_TRIES="12",

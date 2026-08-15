@@ -12,6 +12,10 @@
  *
  * Flags: --help
  * Env: PORT(8787) MOREGPU_BIND(0.0.0.0) MOREGPU_HOST MOREGPU_CONFIG MOREGPU_TLS_CERT+MOREGPU_TLS_KEY MOREGPU_DUTY
+ *
+ * TLS IS THE DEFAULT: with no MOREGPU_TLS_CERT/_KEY the coordinator mints a self-signed cert on first run
+ * (persisted beside MOREGPU_CONFIG) and serves wss:// + https, printing the cert's SHA-256 fingerprint as the
+ * worker pin (MOREGPU_PIN). Set MOREGPU_INSECURE=1 to opt back into plaintext ws:// for a simple local/CI run.
  */
 if (Deno.args.includes('--help') || Deno.args.includes('-h')) { printHelp(); Deno.exit(0); }
 
@@ -70,9 +74,73 @@ async function loadOrInitConfig(): Promise<{ cfg: Config; fresh: boolean }> {
 }
 const { cfg, fresh } = await loadOrInitConfig();
 const TENANT_KEY = b64d(cfg.tenantKeyB64);
-const scheme = CERT_PATH && KEY_PATH ? 'wss' : 'ws';
-const httpScheme = CERT_PATH && KEY_PATH ? 'https' : 'http';
 const RAW = 'https://raw.githubusercontent.com/ArioMoniri/moregpu/main';
+
+// ---------- TLS: the DEFAULT transport ----------
+// MoreGPU serves wss:// (+ https) by DEFAULT. If the operator supplies MOREGPU_TLS_CERT+_KEY we use those;
+// otherwise, on first run, the coordinator MINTS its own self-signed P-256 cert and persists it beside the
+// pool config (the MOREGPU_CONFIG dir), so the fingerprint is STABLE across restarts. The cert's SHA-256
+// fingerprint is printed in the wizard and handed to workers as the pin (MOREGPU_PIN) — a worker refuses any
+// coordinator whose cert doesn't match. Set MOREGPU_INSECURE=1 to opt back into plaintext ws:// (the simple
+// local/CI path, unchanged). The generated private key never leaves the admin box and is written mode 0600.
+const INSECURE = ['1', 'true', 'yes', 'on'].includes((Deno.env.get('MOREGPU_INSECURE') ?? '').toLowerCase());
+const CONFIG_DIR = (() => { const i = Math.max(CONFIG_PATH.lastIndexOf('/'), CONFIG_PATH.lastIndexOf('\\')); return i >= 0 ? CONFIG_PATH.slice(0, i) : '.'; })();
+const CERT_STORE = `${CONFIG_DIR}/moregpu-cert.pem`;
+const KEY_STORE = `${CONFIG_DIR}/moregpu-key.pem`;
+// A minimal DER encoder + a self-signed X.509v3 ECDSA-P256/SHA-256 cert, built with WebCrypto ONLY — no
+// external deps and no --allow-run, so the documented one-liner `deno run` keeps its exact permission set.
+const _dLen = (n: number): number[] => { if (n < 0x80) return [n]; const b: number[] = []; let x = n; while (x > 0) { b.unshift(x & 0xff); x = Math.floor(x / 256); } return [0x80 | b.length, ...b]; };
+const _der = (tag: number, c: number[]): number[] => [tag, ..._dLen(c.length), ...c];
+const _dInt = (bytes: number[]): number[] => { let b = bytes.slice(); while (b.length > 1 && b[0] === 0 && (b[1] & 0x80) === 0) b.shift(); if (b[0] & 0x80) b = [0, ...b]; return _der(0x02, b); };
+const _ALG_ES256 = _der(0x30, _der(0x06, [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02])); // AlgorithmIdentifier ecdsa-with-SHA256 (no params)
+function _toPem(label: string, der: Uint8Array): string { const b64 = b64e(der).replace(/(.{64})/g, '$1\n').replace(/\n$/, ''); return `-----BEGIN ${label}-----\n${b64}\n-----END ${label}-----\n`; }
+function _firstCertDer(pem: string): Uint8Array { const m = pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/); if (!m) throw new Error('no CERTIFICATE block in PEM'); return b64d(m[1].replace(/\s+/g, '')); }
+// The pin is the SHA-256 of the DER of the LEAF certificate — byte-identical to `openssl x509 -fingerprint -sha256`.
+async function certFingerprint(certPem: string): Promise<string> { return [...new Uint8Array(await crypto.subtle.digest('SHA-256', _firstCertDer(certPem) as BufferSource))].map((x) => x.toString(16).padStart(2, '0')).join(''); }
+async function generateSelfSigned(): Promise<{ certPem: string; keyPem: string }> {
+  const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']) as CryptoKeyPair;
+  const spki = [...new Uint8Array(await crypto.subtle.exportKey('spki', kp.publicKey))]; // DER SubjectPublicKeyInfo, as-is
+  const serial = [...crypto.getRandomValues(new Uint8Array(16))]; serial[0] &= 0x7f; if (serial[0] === 0) serial[0] = 1; // positive
+  const utc = (d: Date) => { const p = (n: number) => String(n).padStart(2, '0'); return _der(0x17, [...new TextEncoder().encode(`${p(d.getUTCFullYear() % 100)}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}Z`)]); };
+  const now = Date.now();
+  const validity = _der(0x30, [...utc(new Date(now - 3600e3)), ...utc(new Date(now + 3650 * 864e5))]); // ~10y, 1h backdated for skew
+  const nm = _der(0x30, _der(0x31, _der(0x30, [..._der(0x06, [0x55, 0x04, 0x03]), ..._der(0x0c, [...new TextEncoder().encode('moregpu')])]))); // CN=moregpu
+  // subjectAltName: localhost + 127.0.0.1 (+ the advertised host), so a verifying LAN client also matches.
+  const gn: number[] = []; const dns = (h: string) => { const b = [...new TextEncoder().encode(h)]; gn.push(0x82, ..._dLen(b.length), ...b); }; const ip4 = (a: number[]) => gn.push(0x87, 0x04, ...a);
+  dns('localhost');
+  const asIp = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ADVERTISE_HOST || '');
+  if (ADVERTISE_HOST && ADVERTISE_HOST !== 'localhost' && !asIp && /^[A-Za-z0-9.-]+$/.test(ADVERTISE_HOST)) dns(ADVERTISE_HOST);
+  ip4([127, 0, 0, 1]);
+  if (asIp) ip4([+asIp[1] & 0xff, +asIp[2] & 0xff, +asIp[3] & 0xff, +asIp[4] & 0xff]);
+  const san = _der(0x30, [..._der(0x06, [0x55, 0x1d, 0x11]), ..._der(0x04, _der(0x30, gn))]);
+  const bc = _der(0x30, [..._der(0x06, [0x55, 0x1d, 0x13]), 0x01, 0x01, 0xff, ..._der(0x04, _der(0x30, []))]); // basicConstraints CA:FALSE, critical
+  const exts = _der(0xa3, _der(0x30, [...bc, ...san])); // [3] EXPLICIT Extensions
+  const tbs = _der(0x30, [..._der(0xa0, _dInt([2])), ..._dInt(serial), ..._ALG_ES256, ...nm, ...validity, ...nm, ...spki, ...exts]);
+  const rawSig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, kp.privateKey, Uint8Array.from(tbs) as BufferSource)); // IEEE-P1363 r||s
+  const sig = _der(0x30, [..._dInt([...rawSig.slice(0, 32)]), ..._dInt([...rawSig.slice(32, 64)])]); // → DER Ecdsa-Sig-Value
+  const cert = Uint8Array.from(_der(0x30, [...tbs, ..._ALG_ES256, ..._der(0x03, [0x00, ...sig])]));
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey));
+  return { certPem: _toPem('CERTIFICATE', cert), keyPem: _toPem('PRIVATE KEY', pkcs8) };
+}
+let TLS_CERT: string | undefined, TLS_KEY: string | undefined, TLS_FP: string | undefined, TLS_CERT_FILE: string | undefined;
+if (!INSECURE) {
+  if (CERT_PATH && KEY_PATH) {
+    TLS_CERT = await Deno.readTextFile(CERT_PATH); TLS_KEY = await Deno.readTextFile(KEY_PATH); TLS_CERT_FILE = CERT_PATH;
+  } else {
+    try { TLS_CERT = await Deno.readTextFile(CERT_STORE); TLS_KEY = await Deno.readTextFile(KEY_STORE); } // reuse a persisted cert → stable pin
+    catch {
+      const g = await generateSelfSigned(); TLS_CERT = g.certPem; TLS_KEY = g.keyPem;
+      await Deno.writeTextFile(CERT_STORE, TLS_CERT);
+      await Deno.writeTextFile(KEY_STORE, TLS_KEY, { mode: 0o600 });
+      try { await Deno.chmod(KEY_STORE, 0o600); } catch { /* windows / best-effort: keep the key non-world-readable */ }
+      log('info', `minted self-signed TLS cert → ${CERT_STORE} (private key ${KEY_STORE}, mode 0600)`);
+    }
+    TLS_CERT_FILE = CERT_STORE;
+  }
+  TLS_FP = await certFingerprint(TLS_CERT);
+}
+const scheme = TLS_CERT ? 'wss' : 'ws';
+const httpScheme = TLS_CERT ? 'https' : 'http';
 
 function art() {
   // ANSI Shadow "MOREGPU" with an indigo→pink→red 256-color gradient (matches the `moregpu` CLI).
@@ -89,20 +157,25 @@ function art() {
 }
 function wizardBanner() {
   const wsUrl = `${scheme}://${ADVERTISE_HOST}:${PORT}/ws`;
+  const pinEnv = TLS_FP ? ` MOREGPU_PIN=${TLS_FP}` : '';
   console.log(art());
   console.log(`\n  ${C.b}${fresh ? C.grn + 'NEW POOL CREATED' : 'pool ready'}${C.reset}`);
   console.log(`  ${C.dim}dashboard${C.reset}  ${httpScheme}://${ADVERTISE_HOST}:${PORT}`);
   console.log(`  ${C.dim}admin token${C.reset}  ${C.yel}${cfg.adminToken}${C.reset}   ${C.dim}(controls the pool — keep secret)${C.reset}`);
   console.log(`  ${C.dim}join token${C.reset}   ${C.mag}${cfg.joinToken}${C.reset}   ${C.dim}(lets machines enroll)${C.reset}`);
+  if (TLS_FP) console.log(`  ${C.dim}cert pin${C.reset}     ${C.grn}sha256:${TLS_FP}${C.reset}   ${C.dim}(workers verify this — MOREGPU_PIN)${C.reset}`);
   console.log(`  ${C.dim}config${C.reset}       ${CONFIG_PATH}`);
   console.log(`\n  ${C.b}Add a machine to this pool${C.reset} ${C.dim}(Linux/macOS)${C.reset}:`);
   console.log(`    ${C.grn}curl -fsSL ${RAW}/scripts/install.sh \\`);
-  console.log(`      | MOREGPU_SERVER=${wsUrl} MOREGPU_TOKEN=${cfg.joinToken} sh${C.reset}`);
-  console.log(`  ${C.dim}Windows:  $env:MOREGPU_SERVER="${wsUrl}"; $env:MOREGPU_TOKEN="${cfg.joinToken}"; irm ${RAW}/scripts/install.ps1 | iex${C.reset}`);
+  console.log(`      | MOREGPU_SERVER=${wsUrl} MOREGPU_TOKEN=${cfg.joinToken}${pinEnv} sh${C.reset}`);
+  console.log(`  ${C.dim}Windows:  $env:MOREGPU_SERVER="${wsUrl}"; $env:MOREGPU_TOKEN="${cfg.joinToken}";${TLS_FP ? ` $env:MOREGPU_PIN="${TLS_FP}";` : ''} irm ${RAW}/scripts/install.ps1 | iex${C.reset}`);
   console.log(`  ${C.dim}reboot-surviving service: add MOREGPU_SERVICE=1 · type /help in this console's HTTP: ${httpScheme}://${ADVERTISE_HOST}:${PORT}/help${C.reset}`);
-  if (!(CERT_PATH && KEY_PATH) && BIND !== '127.0.0.1' && BIND !== 'localhost') {
-    console.log(`\n  ${C.red}${C.b}⚠ no TLS and bound to ${BIND}${C.reset}${C.red} — the join handshake (including the tenant key) travels in plaintext.${C.reset}`);
-    console.log(`  ${C.dim}For untrusted networks: set MOREGPU_TLS_CERT + MOREGPU_TLS_KEY (wss://), or MOREGPU_BIND=127.0.0.1 behind a VPN/tunnel.${C.reset}`);
+  if (TLS_FP) {
+    console.log(`\n  ${C.grn}${C.b}✔ TLS on${C.reset}${C.dim} — serving ${scheme}:// with a ${CERT_PATH && KEY_PATH ? 'provided' : 'self-signed'} cert. Workers pin the fingerprint above; a mismatched cert is refused.${C.reset}`);
+    console.log(`  ${C.dim}Simple local/CI plaintext: set MOREGPU_INSECURE=1 to serve ws:// instead.${C.reset}`);
+  } else if (BIND !== '127.0.0.1' && BIND !== 'localhost') {
+    console.log(`\n  ${C.red}${C.b}⚠ MOREGPU_INSECURE=1 and bound to ${BIND}${C.reset}${C.red} — the join handshake (including the tenant key) travels in plaintext.${C.reset}`);
+    console.log(`  ${C.dim}Drop MOREGPU_INSECURE for the default wss://, or bind MOREGPU_BIND=127.0.0.1 behind a VPN/tunnel.${C.reset}`);
   }
   console.log('');
 }
@@ -118,8 +191,9 @@ function printHelp() {
     PORT=8787              HTTP/WebSocket port
     MOREGPU_BIND=0.0.0.0   bind address (0.0.0.0 = reachable from other machines)
     MOREGPU_HOST=localhost hostname advertised in the wizard/worker command
-    MOREGPU_CONFIG=./.moregpu-server.json   pool identity (tokens + key)
-    MOREGPU_TLS_CERT / MOREGPU_TLS_KEY      PEM paths → serve https + wss
+    MOREGPU_CONFIG=./.moregpu-server.json   pool identity (tokens + key); its dir also holds the self-signed cert
+    MOREGPU_TLS_CERT / MOREGPU_TLS_KEY      PEM paths → serve https + wss (else a self-signed cert is minted)
+    MOREGPU_INSECURE=1     opt out of TLS → plaintext ws:// (simple local/CI); default is wss://
     MOREGPU_DUTY=0.6       duty-cycle ceiling hint sent to workers
 
   ${C.b}HTTP API${C.reset} ${C.dim}(admin endpoints need: Authorization: Bearer <admin token>)${C.reset}
@@ -1380,6 +1454,14 @@ async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   if (url.pathname === '/ws') { const { socket, response } = Deno.upgradeWebSocket(req); wireWorker(socket); return response; }
   if (url.pathname === '/health') return json({ ok: true, fleet: workers.size, queue: queue.length });
+  // Public leaf cert (PEM) so a joining worker's installer can fetch it and DENO_CERT-trust it AFTER checking
+  // its sha256 fingerprint == the out-of-band MOREGPU_PIN (see scripts/install.sh). The cert is public; the
+  // private key never leaves the admin box. 404 under MOREGPU_INSECURE=1 (plaintext ws:// — no cert exists).
+  if (url.pathname === '/cert.pem') {
+    return TLS_CERT
+      ? new Response(TLS_CERT, { status: 200, headers: { 'content-type': 'application/x-pem-file', 'x-moregpu-cert-sha256': TLS_FP ?? '' } })
+      : new Response('no TLS cert: coordinator is running MOREGPU_INSECURE=1 (plaintext ws://)\n', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }
   if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/device', '/gpu', '/workers', 'POST /workers/:id/control', 'POST /submit (?async=1)', '/jobs', '/jobs/:id', '/logs', '/metrics'], workerSchedule: 'MOREGPU_SCHEDULE=always|idle-only|HH:MM-HH:MM', auth: 'admin endpoints require Authorization: Bearer <admin token>' });
   // admin-gated
   if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights', '/net'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || url.pathname.startsWith('/train/') || url.pathname.startsWith('/model/') || (req.method === 'POST' && url.pathname === '/submit')) {
@@ -2124,7 +2206,7 @@ function prometheus(): string {
 }
 
 const serveOpts: Deno.ServeTcpOptions & { cert?: string; key?: string } = { port: PORT, hostname: BIND, onListen: () => wizardBanner() };
-if (CERT_PATH && KEY_PATH) { serveOpts.cert = await Deno.readTextFile(CERT_PATH); serveOpts.key = await Deno.readTextFile(KEY_PATH); }
+if (TLS_CERT && TLS_KEY) { serveOpts.cert = TLS_CERT; serveOpts.key = TLS_KEY; } // resolved above: provided cert, persisted mint, or (INSECURE) none
 Deno.serve(serveOpts, handler);
 
 // Built-in worker: with --worker (or MOREGPU_SELF_WORKER=1) the admin's OWN machine joins its own pool
@@ -2133,10 +2215,13 @@ const SELF_WORKER = Deno.args.includes('--worker') || Deno.env.get('MOREGPU_SELF
 if (SELF_WORKER) {
   try {
     const workerUrl = new URL('../worker/worker.ts', import.meta.url).href;
-    const wsUrl = `ws://127.0.0.1:${PORT}/ws`;
+    // Under the default TLS the built-in worker connects over wss:// to `localhost` (a cert SAN) and trusts the
+    // freshly minted cert via DENO_CERT (Deno's CA-file env) — no separate pin needed on this loopback hop.
+    const wsUrl = TLS_CERT ? `wss://localhost:${PORT}/ws` : `ws://127.0.0.1:${PORT}/ws`;
     new Deno.Command(Deno.execPath(), {
       args: ['run', '--unstable-webgpu', '--allow-net', '--allow-env', '--allow-sys', workerUrl,
         '--server', wsUrl, '--token', cfg.joinToken, '--name', Deno.env.get('MOREGPU_NAME') ?? 'admin-slot'],
+      env: TLS_CERT_FILE ? { DENO_CERT: TLS_CERT_FILE } : {}, // merged onto the inherited env; trusts our self-signed cert
       stdout: 'inherit', stderr: 'inherit',
     }).spawn();
     log('info', 'built-in worker started — this machine is a pool slot (admin-slot). Submit a job; it just runs.');

@@ -92,6 +92,12 @@ jobs:
       - name: Release verify — tampered / wrong-key / unsigned worker release rejected (install-time gate)
         run: python3 tests/security/release_verify.py
 
+      - name: TLS default — self-signed wss + worker cert pinning; wrong pin refused; ws:// opt-out intact
+        run: python3 tests/security/tls_default.py
+
+      - name: TLS install path — Deno worker.ts joins default self-signed wss (DENO_CERT), wrong cert refused
+        run: python3 tests/security/tls_install_path.py
+
       - name: Fake-WS fleet scale — 150 no-torch nodes, connect storm + churn, control plane holds
         run: python3 tests/scale/fake_fleet.py
 

@@ -288,7 +288,7 @@ async def main():
     loop = asyncio.get_event_loop()
     try:
         port = free_port(); cfg = os.path.join(root, "mg.json"); coord_log = os.path.join(root, "coord.log")
-        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                    MOREGPU_REGISTER_TIMEOUT_MS="30000")   # generous auth window for a large connect storm
         print(f"starting coordinator on 127.0.0.1:{port} · target fleet N={N} · drop {int(DROP_FRAC*100)}% "
               f"· /health budget {HEALTH_MAX_MS:.0f}ms", flush=True)

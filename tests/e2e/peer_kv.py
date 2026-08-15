@@ -132,7 +132,7 @@ def start_cluster(root, hfport, peer, tag, nworkers=3, extra_cenv=None):
     coordinator and the workers (+ MOREGPU_PEER_HOST=127.0.0.1 → loopback peer URL). extra_cenv adds coordinator env
     (e.g. MOREGPU_PEER_FORCE_RELAY, the failover deadlines). Returns (port, admin, worker_procs, coord_log)."""
     port = free_port(); cfg = os.path.join(root, f"mg-{tag}.json")
-    cenv = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+    cenv = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                 MOREGPU_HF_BASE=f"http://127.0.0.1:{hfport}", MOREGPU_SHARD_LOAD_DEADLINE_MS="600000")
     cenv.pop("MOREGPU_PEER_TRANSPORT", None); cenv.pop("MOREGPU_PEER_FORCE_RELAY", None)
     if peer:

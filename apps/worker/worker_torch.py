@@ -12,7 +12,9 @@ This is ADR-0007's native-accelerator tier: a signed, admin-installed binary on 
 zero-install invisible WebGPU worker. Run it where you trust the machine.
 
     pip install torch cryptography websockets
-    python3 apps/worker/worker_torch.py --server ws://ADMIN:8787/ws --token <join-token> [--cpu]
+    python3 apps/worker/worker_torch.py --server wss://ADMIN:8787/ws --token <join-token> --pin <sha256> [--cpu]
+    # --pin (or MOREGPU_PIN) is the coordinator's cert fingerprint from its join banner. Plaintext ws:// still
+    # works for a trusted LAN/CI (the coordinator must run with MOREGPU_INSECURE=1); no pin is used there.
 
 Protocol (matches apps/worker/worker.ts): register{joinToken,pubkey,node} → welcome{tenantKeyB64,duty} ;
 sealed assign{shardId,jobId,sealedIn} → result{shardId,jobId,ok,sealedOut,sig,ms,backend} ;
@@ -20,7 +22,7 @@ cache{id,sealed}→cached{id,ok} ; uncache{id} ; control{...} ; ~4s heartbeat. P
 sealed with the tenant key; every result is Ed25519-signed over `${shardId}|${iv}|${ct}`.
 """
 from __future__ import annotations
-import argparse, asyncio, base64, json, os, platform, socket, time
+import argparse, asyncio, base64, hashlib, json, os, platform, socket, ssl, time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -35,6 +37,8 @@ ap.add_argument("--server", default=os.environ.get("MOREGPU_SERVER", "ws://local
 ap.add_argument("--token", default=os.environ.get("MOREGPU_TOKEN", ""))
 ap.add_argument("--name", default=os.environ.get("MOREGPU_NAME", f"torch-{platform.node().split('.')[0][:12]}-{os.getpid()%100000}"))
 ap.add_argument("--cpu", action="store_true", help="force CPU even if a GPU is available")
+ap.add_argument("--pin", default=os.environ.get("MOREGPU_PIN", ""),
+                help="pin the coordinator's TLS cert SHA-256 fingerprint (hex); a mismatched cert is refused")
 A, _ = ap.parse_known_args()  # parse_known_args so this module can also be imported (e.g. by a training reference)
 
 DEV = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -52,6 +56,32 @@ PUBKEY_B64 = base64.b64encode(_sk.public_key().public_bytes(Encoding.Raw, Public
 
 # OPT-IN peer worker->worker activation transport (default OFF → relay path is unchanged). See docs/ROADMAP.md.
 PEER_TRANSPORT = os.environ.get("MOREGPU_PEER_TRANSPORT", "").lower() in ("1", "true", "yes", "on")
+
+# ---- TLS cert pinning ----------------------------------------------------------------------------
+# The coordinator serves wss:// by default with a SELF-SIGNED cert, so there's no CA/hostname chain to
+# trust — instead we PIN its exact cert SHA-256 fingerprint (MOREGPU_PIN / --pin, handed out in the join
+# info). We complete the TLS handshake with verification disabled, then reject any coordinator whose leaf
+# cert doesn't match the pin BEFORE sending the join token — so the token/tenant key never reach a MITM.
+PIN = "".join(c for c in A.pin.lower() if c in "0123456789abcdef")  # normalize: strip 'sha256:' prefix, colons, case
+
+
+def _tls_ctx():
+    """SSL context for a wss:// coordinator (None for plaintext ws://). Verification is disabled here on
+    purpose — a self-signed cert has no chain — and replaced by the fingerprint pin check in _verify_pin()."""
+    if not A.server.startswith("wss://"):
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _peer_fp(ws):
+    """SHA-256 fingerprint (hex) of the coordinator's leaf cert as presented on this live TLS socket."""
+    tr = getattr(ws, "transport", None) or getattr(ws, "_transport", None)
+    sslobj = tr.get_extra_info("ssl_object") if tr else None
+    der = sslobj.getpeercert(binary_form=True) if sslobj else None  # binary_form works even under CERT_NONE
+    return hashlib.sha256(der).hexdigest() if der else None
 
 def b64e(b: bytes) -> str: return base64.b64encode(b).decode()
 def b64d(s: str) -> bytes: return base64.b64decode(s)
@@ -1389,11 +1419,25 @@ async def run():
             # WAN-tolerant keepalive: over a high-latency tunnel the default 20s ping timeout drops the
             # socket (the very low-bandwidth/WAN case MoreGPU targets). Tune generously + env-overridable.
             async with websockets.connect(
-                A.server, max_size=None,
+                A.server, max_size=None, ssl=_tls_ctx(),
                 ping_interval=float(os.environ.get("MOREGPU_WS_PING_INTERVAL", "30")),
                 ping_timeout=float(os.environ.get("MOREGPU_WS_PING_TIMEOUT", "90")),
                 close_timeout=10,
             ) as ws:
+                # TLS PIN CHECK — before anything secret (the join token) crosses the wire. A wss:// coordinator
+                # whose cert fingerprint doesn't match MOREGPU_PIN is REFUSED (possible MITM); we retry so a
+                # legitimately rotated cert just needs the operator to update the pin.
+                if A.server.startswith("wss://"):
+                    fp = _peer_fp(ws)
+                    if PIN:
+                        if fp != PIN:
+                            print(f"[torch-worker] REFUSED: coordinator cert sha256:{fp} != pinned sha256:{PIN} — "
+                                  f"possible MITM; not joining. Update MOREGPU_PIN if the coordinator cert rotated.")
+                            await asyncio.sleep(5); continue
+                        print(f"[torch-worker] coordinator TLS cert pinned OK · sha256:{fp[:16]}…")
+                    else:
+                        print(f"[torch-worker] warning: wss:// but no MOREGPU_PIN/--pin — coordinator cert "
+                              f"{('sha256:' + fp[:16] + '…') if fp else '(unavailable)'} is UNPINNED; set MOREGPU_PIN to authenticate it.")
                 node = {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}
                 if PEER_TRANSPORT and _PEER_URL:  # advertise the peer endpoint so the coordinator can wire a direct ring
                     node["peer"] = {"url": _PEER_URL, "pub": PUBKEY_B64}

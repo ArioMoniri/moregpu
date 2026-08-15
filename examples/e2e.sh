@@ -11,7 +11,10 @@ trap cleanup EXIT
 PIDS=()
 
 echo "== starting admin server (:$PORT) — first run prints the setup wizard =="
-PORT="$PORT" MOREGPU_CONFIG="$CFG" deno run --allow-net --allow-env --allow-read --allow-write apps/coordinator/server.ts >/tmp/moregpu-server.log 2>&1 &
+# This local demo uses plaintext ws:// (MOREGPU_INSECURE=1) to stay dependency-free. The DEFAULT transport is
+# now wss:// with a self-signed cert: for a real pool, drop MOREGPU_INSECURE and add each worker with the
+# printed MOREGPU_PIN (curl scripts/install.sh | … MOREGPU_PIN=<pin> sh). See SECURITY.md.
+PORT="$PORT" MOREGPU_CONFIG="$CFG" MOREGPU_INSECURE=1 deno run --allow-net --allow-env --allow-read --allow-write apps/coordinator/server.ts >/tmp/moregpu-server.log 2>&1 &
 PIDS+=($!); sleep 2
 JOIN=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$CFG')).joinToken)")
 ADMIN=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$CFG')).adminToken)")

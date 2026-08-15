@@ -14,6 +14,9 @@ set -eu
 
 REPO="${MOREGPU_REPO:-ArioMoniri/moregpu}"; BRANCH="${MOREGPU_BRANCH:-main}"
 SERVER="${MOREGPU_SERVER:-ws://localhost:8787/ws}"; TOKEN="${MOREGPU_TOKEN:-}"
+# Coordinator TLS cert pin (from the join banner). Normalize: strip a leading sha256:/colons, lowercase.
+PIN="${MOREGPU_PIN:-}"; PIN="${PIN#sha256:}"; PIN="${PIN#SHA256:}"
+PIN="$(printf '%s' "$PIN" | tr 'A-Z' 'a-z' | tr -d ':')"
 WORKER_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/apps/worker/worker.ts"
 SIG_URL="${WORKER_URL}.sig"
 
@@ -171,10 +174,64 @@ MOREGPU_VERIFY_EOF
   fi
 fi
 
+# --- TLS: pin + trust the coordinator's self-signed cert (default transport is wss://) ---------------
+# The coordinator serves wss:// with a SELF-SIGNED cert whose SHA-256 fingerprint it prints as MOREGPU_PIN.
+# Deno's WebSocket has no per-connection "trust this self-signed cert" switch, so we can't fingerprint-pin
+# the live socket the way the Python worker does. Instead we do a MITM-safe trust-on-fetch: pull the public
+# leaf cert from the coordinator's /cert.pem, verify its sha256(DER) == the out-of-band MOREGPU_PIN, and only
+# then hand it to Deno via DENO_CERT so the live wss handshake is validated against exactly that cert. A wrong
+# cert (attacker's) has a different fingerprint → fails the pin check → we abort before the token is ever sent.
+CERT_FILE=""
+case "$SERVER" in
+  wss://*)
+    if [ -z "$PIN" ]; then
+      echo "[moregpu] ERROR: $SERVER is wss:// but no MOREGPU_PIN was given — a self-signed coordinator cert"
+      echo "          cannot be trusted without its pinned fingerprint. Copy MOREGPU_PIN from the coordinator's"
+      echo "          join banner, or use MOREGPU_SERVER=ws://… with the coordinator started MOREGPU_INSECURE=1."
+      exit 1
+    fi
+    base="${SERVER#wss://}"; base="${base%/ws}"; base="${base%/}"
+    CERT_URL="https://${base}/cert.pem"
+    echo "[moregpu] fetching coordinator TLS cert ($CERT_URL) to pin against sha256:${PIN}…"
+    # -k: the fetch itself is unauthenticated; the sha256==PIN check below is what makes it trustworthy.
+    if ! curl -fsSLk "$CERT_URL" -o "$MG_DIR/moregpu-cert.pem.new"; then
+      echo "[moregpu] ERROR: could not fetch $CERT_URL — is the coordinator reachable and serving TLS?"; exit 1
+    fi
+    GOT_FP="$(CERTF="$MG_DIR/moregpu-cert.pem.new" "$DENO_BIN" eval '
+      const pem = await Deno.readTextFile(Deno.env.get("CERTF"));
+      const m = pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+      if (!m) { console.error("no CERTIFICATE block in fetched PEM"); Deno.exit(2); }
+      const der = Uint8Array.from(atob(m[1].replace(/\s+/g, "")), (c) => c.charCodeAt(0));
+      const dig = new Uint8Array(await crypto.subtle.digest("SHA-256", der));
+      console.log([...dig].map((x) => x.toString(16).padStart(2, "0")).join(""));
+    ' 2>/dev/null)"
+    if [ "$GOT_FP" != "$PIN" ]; then
+      echo "[moregpu] ERROR: coordinator cert fingerprint sha256:${GOT_FP:-<none>} != pinned sha256:${PIN}"
+      echo "          REFUSING to join (possible MITM, or the coordinator cert rotated — re-copy MOREGPU_PIN)."
+      rm -f "$MG_DIR/moregpu-cert.pem.new"; exit 1
+    fi
+    mv "$MG_DIR/moregpu-cert.pem.new" "$MG_DIR/moregpu-cert.pem"
+    CERT_FILE="$MG_DIR/moregpu-cert.pem"
+    echo "[moregpu] coordinator TLS cert pinned OK · sha256:$(printf '%s' "$PIN" | cut -c1-16)… — trusting via DENO_CERT"
+    ;;
+esac
+
 RUN_ARGS="run --unstable-webgpu --allow-net --allow-env --allow-sys $MG_DIR/worker.ts --server $SERVER"
 [ -n "$TOKEN" ] && RUN_ARGS="$RUN_ARGS --token $TOKEN"
 [ -n "${MOREGPU_NAME:-}" ] && RUN_ARGS="$RUN_ARGS --name $MOREGPU_NAME"
 [ -n "${MOREGPU_THROTTLE:-}" ] && RUN_ARGS="$RUN_ARGS --throttle $MOREGPU_THROTTLE"
+
+# If we pinned a self-signed coordinator cert above, trust it on every launch path. `export` covers the
+# foreground / tmux / supervised loop (child inherits it); the service managers don't inherit the installer's
+# env, so we also bake DENO_CERT into the systemd unit / launchd plist below.
+SYSTEMD_CERT_ENV=""; PLIST_ENV=""
+if [ -n "$CERT_FILE" ]; then
+  export DENO_CERT="$CERT_FILE"
+  SYSTEMD_CERT_ENV="Environment=DENO_CERT=$CERT_FILE
+"
+  PLIST_ENV="  <key>EnvironmentVariables</key><dict><key>DENO_CERT</key><string>$CERT_FILE</string></dict>
+"
+fi
 
 if [ "${MOREGPU_SERVICE:-0}" = "1" ]; then
   OS="$(uname -s)"
@@ -185,7 +242,7 @@ if [ "${MOREGPU_SERVICE:-0}" = "1" ]; then
 Description=MoreGPU worker
 After=network-online.target
 [Service]
-ExecStart=$DENO_BIN $RUN_ARGS
+${SYSTEMD_CERT_ENV}ExecStart=$DENO_BIN $RUN_ARGS
 Restart=always
 RestartSec=5
 Nice=15
@@ -205,7 +262,7 @@ EOF
 <plist version="1.0"><dict>
   <key>Label</key><string>dev.moregpu.worker</string>
   <key>ProgramArguments</key><array><string>$DENO_BIN</string>$ARGS_XML</array>
-  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+${PLIST_ENV}  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
 </dict></plist>
 EOF

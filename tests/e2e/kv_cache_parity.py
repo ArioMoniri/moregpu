@@ -169,7 +169,7 @@ def main():
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
         port = free_port(); cfg = os.path.join(root, "mg.json")
-        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                    MOREGPU_HF_BASE=f"http://127.0.0.1:{hfport}", MOREGPU_SHARD_LOAD_DEADLINE_MS="600000")
         PROCS.append(subprocess.Popen(["deno", "run", "--allow-net", "--allow-env", "--allow-read", "--allow-write",
                                        "apps/coordinator/server.ts"], cwd=REPO, env=env,

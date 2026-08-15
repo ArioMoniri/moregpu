@@ -139,7 +139,7 @@ def start_cluster(root, hfport, peer, tag):
     procs) — procs is this cluster's process list (also appended to PROCS for final cleanup)."""
     procs = []
     port = free_port(); cfg = os.path.join(root, f"mg-{tag}.json")
-    cenv = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+    cenv = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                 MOREGPU_HF_BASE=f"http://127.0.0.1:{hfport}", MOREGPU_SHARD_LOAD_DEADLINE_MS="600000")
     cenv.pop("MOREGPU_PEER_TRANSPORT", None)
     if peer:

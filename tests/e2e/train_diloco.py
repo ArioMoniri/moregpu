@@ -125,7 +125,7 @@ def main():
 
         # ---- start the coordinator (Deno) ----
         port = free_port(); cfg = os.path.join(root, "mg.json")
-        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1")
+        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1")
         PROCS.append(subprocess.Popen(
             ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "apps/coordinator/server.ts"],
             cwd=REPO, env=env, stdout=open(coord_log, "w"), stderr=subprocess.STDOUT))

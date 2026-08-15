@@ -248,7 +248,7 @@ def main():
 
         # coordinator — small PUSH_CHUNK makes the resume granularity fine (many flushed chunks); generous churn caps
         port = free_port(); cfg = os.path.join(root, "mg.json")
-        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+        env = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                    MOREGPU_HF_BASE=f"http://127.0.0.1:{hfport}",
                    MOREGPU_PUSH_CHUNK=str(PUSH_CHUNK),
                    MOREGPU_SHARD_LOAD_DEADLINE_MS="600000",

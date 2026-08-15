@@ -117,7 +117,7 @@ def start_cluster(root, hfport, peer, tag):
     """Launch a coordinator + 3 CPU torch workers (1 dense backbone + 2 expert holders). peer=True sets
     MOREGPU_PEER_TRANSPORT=1 on the coordinator + workers (+ MOREGPU_PEER_HOST=127.0.0.1 → loopback peer URL)."""
     port = free_port(); cfg = os.path.join(root, f"mg-{tag}.json")
-    cenv = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1",
+    cenv = dict(os.environ, PORT=str(port), MOREGPU_CONFIG=cfg, MOREGPU_BIND="127.0.0.1", MOREGPU_INSECURE="1",
                 MOREGPU_HF_BASE=f"http://127.0.0.1:{hfport}", MOREGPU_SHARD_LOAD_DEADLINE_MS="600000")
     cenv.pop("MOREGPU_PEER_TRANSPORT", None)
     if peer:

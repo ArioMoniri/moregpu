@@ -15,7 +15,9 @@ trap cleanup EXIT
 PIDS=(); rm -f "$CFG"
 
 echo "== starting server (+built-in worker slot) + a CPU worker on :$PORT =="
-PORT="$PORT" MOREGPU_CONFIG="$CFG" deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys \
+# MOREGPU_INSECURE=1: loopback smoke over plaintext ws:// (default transport is wss://; TLS is covered by
+# tests/security/tls_default.py + tls_install_path.py). The built-in --worker slot then connects ws://127.0.0.1.
+PORT="$PORT" MOREGPU_CONFIG="$CFG" MOREGPU_INSECURE=1 deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys \
   apps/coordinator/server.ts --worker >/tmp/smoke-srv.log 2>&1 &
 PIDS+=($!); sleep 5
 JOIN=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$CFG')).joinToken)")

@@ -11,7 +11,9 @@ cleanup(){ kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; rm -f "$CFG"; }
 trap cleanup EXIT
 
 echo "== starting coordinator + a CPU torch worker on :$PORT =="
-PORT="$PORT" MOREGPU_CONFIG="$CFG" deno run --allow-net --allow-env --allow-read --allow-write \
+# MOREGPU_INSECURE=1: this loopback smoke uses plaintext ws:// (the default transport is wss://; the TLS path
+# has its own coverage in tests/security/tls_default.py + tls_install_path.py).
+PORT="$PORT" MOREGPU_CONFIG="$CFG" MOREGPU_INSECURE=1 deno run --allow-net --allow-env --allow-read --allow-write \
   apps/coordinator/server.ts >/tmp/torch-smoke-srv.log 2>&1 &
 PIDS+=($!)
 for i in $(seq 1 40); do curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 0.5; done

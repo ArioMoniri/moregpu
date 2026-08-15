@@ -131,7 +131,7 @@ deno run --allow-net --allow-env --allow-read --allow-write \
 <details>
 <summary><b>▶ What to expect · verify it's up · monitor · stop</b></summary>
 
-**Expect:** a colored ASCII wizard printing the **Admin token**, the **Worker join token**, the dashboard URL (`http://HOST:8787`), and a ready-to-paste worker one-liner. Copy the two tokens — the admin token controls the pool; the join token lets machines enroll.
+**Expect:** a colored ASCII wizard printing the **Admin token**, the **Worker join token**, the **cert pin** (`sha256:…`, since TLS/`wss://` is on by default), the dashboard URL, and a ready-to-paste worker one-liner. Copy the two tokens and the pin — the admin token controls the pool; the join token lets machines enroll; the pin authenticates the coordinator's self-signed cert.
 
 **Verify it's up:**
 ```sh
@@ -143,7 +143,7 @@ curl -s http://localhost:8787/device -H "authorization: Bearer <admin-token>"
 ```
 **Stop:** `Ctrl-C` in its terminal. Tokens/key persist in `.moregpu-server.json`, so the next start reuses the same pool.
 
-Optional env: `PORT`, `MOREGPU_HOST`, `MOREGPU_TLS_CERT`+`MOREGPU_TLS_KEY` (→ `wss://` TLS), `MOREGPU_DUTY`.
+Optional env: `PORT`, `MOREGPU_HOST`, `MOREGPU_TLS_CERT`+`MOREGPU_TLS_KEY` (use your own cert instead of the auto self-signed one), `MOREGPU_INSECURE=1` (opt out of TLS → plaintext `ws://` for local/CI), `MOREGPU_DUTY`. TLS (`wss://`) is the **default** — see [SECURITY.md](SECURITY.md).
 
 </details>
 
@@ -184,15 +184,17 @@ The dashboard (any browser, even if the server host is headless/CLI-only) shows 
 > 🖥️ **Run this on each machine you want to lend** (with the admin's join token). Installs Deno if needed; uses the GPU (WebGPU → Metal / Vulkan / D3D12) or falls back to CPU. Nothing shows on screen — it only dials **out**.
 
 ```sh
-# Linux / macOS
+# Linux / macOS  — copy the exact line from the coordinator's wizard (it fills in the pin for you)
 curl -fsSL https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.sh \
-  | MOREGPU_SERVER=wss://ADMIN:8787/ws MOREGPU_TOKEN=<join-token> sh
+  | MOREGPU_SERVER=wss://ADMIN:8787/ws MOREGPU_TOKEN=<join-token> MOREGPU_PIN=<cert-pin> sh
 ```
 ```powershell
 # Windows (PowerShell)
-$env:MOREGPU_SERVER="wss://ADMIN:8787/ws"; $env:MOREGPU_TOKEN="<join-token>"
+$env:MOREGPU_SERVER="wss://ADMIN:8787/ws"; $env:MOREGPU_TOKEN="<join-token>"; $env:MOREGPU_PIN="<cert-pin>"
 irm https://raw.githubusercontent.com/ArioMoniri/moregpu/main/scripts/install.ps1 | iex
 ```
+
+> **`MOREGPU_PIN`** is the coordinator's TLS cert fingerprint, printed in the wizard (`cert pin  sha256:…`). Transport is **`wss://` by default** (the coordinator self-signs on first run); the installer fetches the coordinator's public cert, checks its fingerprint against this pin, and only then trusts it — so the join token never reaches a wrong/MITM cert. For a simple trusted-LAN run you can instead start the coordinator with `MOREGPU_INSECURE=1` and join over `ws://` (no pin).
 
 <details>
 <summary><b>▶ What to expect · verify you joined · monitor your impact · stop · run as a service</b></summary>
