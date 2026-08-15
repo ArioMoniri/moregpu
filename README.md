@@ -440,6 +440,22 @@ Deployment topology — admin coordinator and outbound-only workers:
   <img src="docs/assets/deploy.svg" alt="Deployment topology — Linux/macOS/Windows workers dial outbound (wss + join token) to one isolated admin server" width="900">
 </p>
 
+## Roadmap
+
+Today MoreGPU does **download-free pipeline sharding** (the coordinator streams each worker only its layer slice — the fleet downloads nothing), **sharded chat** (every node contributes to each token), **churn-tolerant loading** (a node that drops mid-stream reconnects and the load resumes from where it left off, not from zero), and **DiLoCo LoRA fine-tuning** — all verified exact-match / coherent, including a live multi-GPU run.
+
+What's next, in honest order:
+
+- **Multi-file weight loader.** The shard loader needs a single-file `model.safetensors` today; a Kimi-K2-class model ships as many files. Cheapest unlock — and it's the per-expert addressing that MoE needs.
+- **KV cache on the shard path.** Sharded decode re-runs the growing sequence each token (O(n²)); a per-stage cache makes it linear. Biggest single latency win.
+- **Post-load fault tolerance.** Churn tolerance covers *loading*; a node dropping *after* load still breaks a live request. Warm spares + failover close that gap.
+- **Coordinator off the per-token path.** Direct worker→worker activation handoff removes the throughput ceiling and the single point of failure — and is the prerequisite for MoE all-to-all.
+- **MoE expert parallelism** — the path to a ~1T sparse model like Kimi K2: experts placed across nodes, each token routed to only its active few. Experts are *resident* and *router-selected per token* (not lazily paged), so it needs the multi-file loader + peer transport first. The hard, multi-month bet.
+- **Fine-tuning at scale:** async DiLoCo (no straggler barrier), training-run checkpoint/resume, robust aggregation, and sharded-base training for models too big for one node.
+- **Deployment hardening:** per-worker keys, signed worker releases, TLS by default; fleet-scale observability and kernel-enforced resource limits.
+
+**Two limits no engineering removes:** a *single* request can't be made faster by adding GPUs over a WAN — per-token pipeline hops are round-trip-bound, so this is a LAN technique — and the coordinator stays the one-time weight source. The fleet's value is **capacity** (models too big for one machine), **throughput** (many concurrent requests), and **fine-tuning**, not single-request latency.
+
 ## Authorized use only
 
 Run workers only on machines you own or are explicitly authorized to use. MoreGPU is neutral infrastructure: it ships a generic authorized-runtime worker joiner (usable on any runtime you're permitted to use, including a notebook you control such as [`examples/colab_worker.ipynb`](examples/colab_worker.ipynb)) and **no automation for evading** any platform's Terms of Service, quotas, or bot-detection. Using it on third-party platforms is very often prohibited by their Terms of Service. All responsibility, legal risk, and compliance rest entirely with the operator. See the acceptable-use notice above and `LICENSE` for full terms.
