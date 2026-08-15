@@ -78,12 +78,16 @@ def _tls_ctx():
       endpoint without a pin. MOREGPU_ALLOW_UNPINNED=1 forces verification off (local hacking only)."""
     if not A.server.startswith("wss://"):
         return None
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     if PIN or _ALLOW_UNPINNED:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    # else: keep the secure defaults (check_hostname=True, verify_mode=CERT_REQUIRED) → normal CA validation.
-    return ctx
+        return ctx
+    # no pin → NORMAL CA verification. create_default_context() LOADS the system/certifi CA bundle (a bare
+    # SSLContext does not — it would fail every cert with "unable to get local issuer certificate") and sets
+    # check_hostname=True + CERT_REQUIRED, so a real-CA coordinator (tunnel / Let's Encrypt) validates and a
+    # self-signed one fails the handshake.
+    return ssl.create_default_context()
 
 
 def _peer_fp(ws):
