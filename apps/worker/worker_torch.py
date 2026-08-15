@@ -502,6 +502,37 @@ def model_generate(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 SHARDS: dict = {}  # shard id -> kept stage modules (blocks slice + optional embeddings / final head)
 SHARD_TOKS: dict = {}  # shard id -> tokenizer (only on the FIRST stage) so a browser can chat a sharded model
+# --- per-stage incremental KV CACHE (the fix for the O(n^2) shard decode) ---------------------------------
+# In "cached" mode each stage keeps its OWN layers' past_key_values (an HF DynamicCache) across shard_forward
+# calls, keyed by (shard id, session id). A decode step then feeds only the NEW token (first stage) / its hidden
+# (later stages) instead of the whole growing prefix, and each stage attends to its cached past — turning the
+# re-run-the-prefix decode into a true single-token step. The stage's decoder blocks are re-indexed 0-based at
+# shard_load (see shard_load) so this per-stage cache is self-contained: DynamicCache indexes layers from 0 and
+# create_causal_mask reads get_mask_sizes(cache_position, layer_idx=0) off THIS stage's first real layer.
+SHARD_KV: dict = {}  # (shard id, session id) -> HF DynamicCache holding just this stage's layers' K/V
+MAX_KV_SESSIONS = int(os.environ.get("MOREGPU_MAX_KV_SESSIONS", "8"))  # bound VRAM: LRU-evict live decode caches
+
+def _kv_get(sid: str, session: str, fresh: bool):
+    """Fetch (or lazily create) THIS stage's DynamicCache for (sid, session); `fresh` drops any prior cache first
+    (a pos-0 prefill restarts the session). LRU-evicts the oldest session when over MAX_KV_SESSIONS."""
+    from transformers import DynamicCache
+    key = (sid, session)
+    if fresh:
+        SHARD_KV.pop(key, None)
+    kv = SHARD_KV.pop(key, None)  # pop+reinsert = mark most-recently-used (dict preserves insertion order)
+    if kv is None:
+        while len(SHARD_KV) >= MAX_KV_SESSIONS:
+            SHARD_KV.pop(next(iter(SHARD_KV)), None)  # evict the LRU (oldest) session's cache
+        kv = DynamicCache()
+    SHARD_KV[key] = kv
+    return kv
+
+def _kv_drop(sid, session=None) -> int:
+    """Evict a session's cache (or, if session is None, every session of this shard). Returns count evicted."""
+    keys = [k for k in SHARD_KV if k[0] == sid and (session is None or k[1] == session)]
+    for k in keys:
+        SHARD_KV.pop(k, None)
+    return len(keys)
 
 def shard_tok(payload: dict) -> dict:
     """Tokenize a text prompt for a sharded model (runs on the FIRST stage, which holds the tokenizer). Applies
@@ -576,6 +607,8 @@ def shard_load(cfg: dict) -> dict:
         if last:  # last stage applies the final norm + LM head (lm_head.weight is tied to wte.weight)
             shard["ln_f"], shard["lm_head"] = base.ln_f, model.lm_head
         base.h = shard["blocks"]  # point the block list at our slice so the unkept blocks are freed
+        for _li, _blk in enumerate(shard["blocks"]):  # re-index this stage's blocks 0-based so a per-stage
+            _blk.attn.layer_idx = _li                 # DynamicCache (incremental decode) is self-contained
         held_keys = ("wte", "wpe", "drop", "ln_f", "lm_head")
     else:  # llama-style: RoPE (no learned wpe), RMSNorm final norm; keep config + rotary_emb on EVERY
         base = model.model  # stage so any stage can recompute cos/sin from position_ids (they're tiny)
@@ -587,6 +620,8 @@ def shard_load(cfg: dict) -> dict:
         if last:  # last stage applies the final RMSNorm + LM head (may be tied to embed_tokens.weight)
             shard["norm"], shard["lm_head"] = base.norm, model.lm_head
         base.layers = shard["blocks"]  # point the layer list at our slice so the unkept layers are freed
+        for _li, _blk in enumerate(shard["blocks"]):  # re-index 0-based (see gpt2 branch) so this stage's KV
+            _blk.self_attn.layer_idx = _li            # cache indexes from 0 and create_causal_mask reads it
         held_keys = ("embed_tokens", "norm", "lm_head")  # rotary_emb holds no params (just an inv_freq buffer)
     # count params THIS stage actually holds, deduping the tied embedding/lm_head weight by tensor identity
     held = [shard["blocks"]] + [shard[k] for k in held_keys if k in shard]
@@ -598,7 +633,7 @@ def shard_load(cfg: dict) -> dict:
     # Actually free the unkept weights: we re-pointed the block list at our slice above, so dropping the
     # model wrapper collects every unkept module. Our SHARDS references keep the kept modules alive (the
     # tied head matrix survives on the last stage via lm_head even though the embedding is dropped there).
-    SHARDS.pop(sid, None)  # replacing a live shard: drop the old modules first
+    SHARDS.pop(sid, None); _kv_drop(sid)  # replacing a live shard: drop the old modules + any live KV sessions
     if len(SHARDS) >= MAX_RESIDENT_MODELS:  # bound VRAM, same as resident models
         SHARDS.pop(next(iter(SHARDS)), None)
     del base, model
@@ -625,30 +660,53 @@ def shard_forward(payload: dict) -> dict:
     """Run ONE stage's blocks. If first: embed input_ids → hidden; else: reshape the piped-in hidden.
     If last: final norm + LM head → {argmax, logits?}; else: return the hidden state for the next stage.
     Branches on the stored arch: GPT-2 blocks mask causally on their own; Llama-style layers need the
-    RoPE cos/sin (recomputed here from position_ids) and an explicit causal mask each stage."""
+    RoPE cos/sin (recomputed here from position_ids) and an explicit causal mask each stage.
+
+    INCREMENTAL KV CACHE: when payload carries a session id in "cached" mode, this stage keeps its own layers'
+    past_key_values across calls (SHARD_KV[(sid, session)]). A pos-0 call is the PREFILL (whole prompt, cache
+    restarts empty); a pos>0 call is a DECODE step feeding only the NEW token / hidden (seq==1). Positions are
+    taken from the cache length so RoPE / wpe / the causal mask all offset by the cached prefix — the cached
+    greedy stream is therefore token-identical to the uncached one, at O(n) instead of O(n^2). When cached is
+    off (no session), the code path below is byte-identical to the original stateless forward."""
     sid = payload.get("id"); shard = SHARDS.get(sid)
     if shard is None:
         raise RuntimeError(f"shard {sid} not loaded — call shard_load first")
     arch = shard["arch"]; first, last = shard["first"], shard["last"]
     hidden_dim = shard["hidden_dim"]
+    session = payload.get("session")
+    cached = bool(payload.get("cached")) and session is not None
+    kv = None; past_len = 0
+    if cached:
+        pos = int(payload.get("pos", 0))
+        kv = _kv_get(sid, session, fresh=(pos == 0))  # pos 0 == prefill → restart this session's cache
+        past_len = kv.get_seq_length(0)               # tokens already cached on THIS stage (0 for a fresh prefill)
+        # FAULT TOLERANCE: a stage that dropped AFTER load lost its LIVE KV (a fresh `welcome` clears SHARD_KV)
+        # while the coordinator still holds the shard plan → a decode step then arrives with pos>0 but an empty
+        # cache here. Surface it clearly so the coordinator re-prefills, instead of silently emitting garbage.
+        if past_len != pos:
+            raise RuntimeError(f"KV desync for session {session!r}: stage holds {past_len} cached tokens but the "
+                               f"coordinator sent pos={pos} — this stage lost its live KV (reconnect/evict); re-prefill")
     with torch.no_grad():
         if first:
             ids_list = payload["input_ids"]
             _check_ids(shard["vocab_size"], ids_list)
-            if len(ids_list) > shard["n_positions"]:  # positions past the context window overflow the model
-                raise ValueError(f"sequence length {len(ids_list)} exceeds the model's context window {shard['n_positions']}")
+            if past_len + len(ids_list) > shard["n_positions"]:  # positions past the context window overflow the model
+                raise ValueError(f"sequence length {past_len + len(ids_list)} exceeds the model's context window {shard['n_positions']}")
             ids = torch.tensor(ids_list, dtype=torch.long, device=DEV).unsqueeze(0)  # [1, seq]
             seq = ids.shape[1]
         else:
             seq = int(payload["seq"])
             h = b64_to_t(payload["hidden"]).reshape(1, seq, hidden_dim).to(DEV)
+        # absolute positions of THIS call's tokens: [past_len .. past_len+seq). For an uncached call past_len==0,
+        # so cache_position == arange(seq) and every path below reduces to the original stateless numerics.
+        cache_position = torch.arange(past_len, past_len + seq, dtype=torch.long, device=DEV)
         if arch == "gpt2":
             if first:
-                pos = torch.arange(seq, dtype=torch.long, device=DEV)
-                h = shard["drop"](shard["wte"](ids) + shard["wpe"](pos))  # [1, seq, n_embd]
-            for blk in shard["blocks"]:  # GPT2Block applies causal self-attention internally (no mask needed)
-                out = blk(h)  # older transformers returns (hidden, ...) ; newer (≥4.54) returns the hidden tensor directly
-                h = out[0] if isinstance(out, (tuple, list)) else out
+                h = shard["drop"](shard["wte"](ids) + shard["wpe"](cache_position))  # [1, seq, n_embd]
+            for blk in shard["blocks"]:  # GPT2Block masks causally on its own: attn_mask None → is_causal for a
+                kw = {"past_key_values": kv, "use_cache": True, "cache_position": cache_position} if cached else {}
+                out = blk(h, **kw)  # multi-token prefill, and is_causal off for a 1-token decode (attends to all cached kv)
+                h = out[0] if isinstance(out, (tuple, list)) else out  # older transformers: (hidden, …); ≥4.54: tensor
             if last:
                 h = shard["ln_f"](h)
         else:  # llama-style: recompute RoPE cos/sin + a causal mask exactly as LlamaModel.forward does,
@@ -660,17 +718,20 @@ def shard_forward(payload: dict) -> dict:
             import inspect
             if first:
                 h = shard["embed_tokens"](ids)  # [1, seq, hidden] — RoPE is applied per-layer, not here
-            cache_position = torch.arange(seq, dtype=torch.long, device=DEV)
-            position_ids = cache_position.unsqueeze(0)  # [1, seq]
+            position_ids = cache_position.unsqueeze(0)  # [1, seq] — absolute (offset by the cached prefix)
             pos_emb = shard["rotary_emb"](h, position_ids)  # (cos, sin) — depends only on positions + head_dim
-            # transformers renamed input_embeds -> inputs_embeds (and trims kwargs across versions) — pick by signature
+            # transformers renamed input_embeds -> inputs_embeds (and trims kwargs across versions) — pick by signature.
+            # Passing the cache lets create_causal_mask size the mask as [q=seq, kv=past_len+seq] for a decode step.
             _msig = inspect.signature(create_causal_mask).parameters
             _mkw = {"config": shard["config"], "attention_mask": None, "cache_position": cache_position,
-                    "past_key_values": None, "position_ids": position_ids,
+                    "past_key_values": (kv if cached else None), "position_ids": position_ids,
                     ("inputs_embeds" if "inputs_embeds" in _msig else "input_embeds"): h}
             causal_mask = create_causal_mask(**{k: v for k, v in _mkw.items() if k in _msig})
             for blk in shard["blocks"]:  # LlamaDecoderLayer.forward returns the hidden tensor directly
-                h = blk(h, attention_mask=causal_mask, position_ids=position_ids, position_embeddings=pos_emb)
+                kw = {"attention_mask": causal_mask, "position_ids": position_ids, "position_embeddings": pos_emb}
+                if cached:
+                    kw.update(past_key_values=kv, use_cache=True, cache_position=cache_position)
+                h = blk(h, **kw)
             if last:
                 h = shard["norm"](h)
         if last:
@@ -680,9 +741,19 @@ def shard_forward(payload: dict) -> dict:
                 res["logits"] = f32_to_b64(logits)
         else:
             res = {"ok": True, "hidden": f32_to_b64(h.flatten()), "seq": seq, "hidden_dim": hidden_dim}
+    if cached:
+        res["past"] = int(past_len + seq)  # cache length after this call == the coordinator's next pos
     if DEV == "cuda": torch.cuda.synchronize()
     elif DEV == "mps": torch.mps.synchronize()
     return res
+
+def shard_reset(payload: dict) -> dict:
+    """Evict a live decode KV cache: {id, session?} — drop one session, or (session omitted) every session of the
+    shard. The coordinator calls this after a cached chat/generate finishes, or to force a clean re-prefill."""
+    sid = payload.get("id")
+    n = _kv_drop(sid, payload.get("session"))
+    _empty_cache()
+    return {"ok": True, "id": sid, "evicted": n}
 
 def model_arch(cfg: dict) -> dict:
     """Cheap: read a model's layer count + context window from config.json (no weights) so the coordinator
@@ -741,9 +812,10 @@ def model_dispatch(op: str, payload: dict) -> dict:
     if op == "unload": _push_cleanup(payload.get("id")); MODELS.pop(payload.get("id"), None); MODEL_NAMES.pop(payload.get("id"), None); _TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     if op == "shard_load": return shard_load(payload)
     if op == "shard_forward": return shard_forward(payload)
+    if op == "shard_reset": return shard_reset(payload)
     if op == "shard_tok": return shard_tok(payload)
     if op == "shard_detok": return shard_detok(payload)
-    if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); SHARD_TOKS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
+    if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); SHARD_TOKS.pop(payload.get("id"), None); _kv_drop(payload.get("id")); _empty_cache(); return {"ok": True}
     raise ValueError(f"unknown model op {op}")
 
 async def run():
@@ -843,7 +915,7 @@ async def run():
                                 # KEEP in-progress PUSH staging, though: a stage that dropped mid-stream can then
                                 # RESUME (the coordinator re-streams only the missing bytes). A genuinely new
                                 # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
-                                resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
+                                resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":
                                 if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""

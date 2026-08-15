@@ -692,7 +692,14 @@ async function streamStageSafetensors(w: Worker, id: string, model: string, plan
 // Run ONE forward across a shard plan: stage 0 embeds input_ids → hidden; each next stage runs its blocks on
 // the piped hidden; the last returns {argmax, logits?}. Only activations cross the wire. Re-checks each stage's
 // worker is still connected (so a node churning mid-generation surfaces cleanly instead of hanging).
-async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
+//
+// KV CACHE (`cache`): pass {session,pos} to run in cached mode — each stage keeps its own layers' past_key_values
+// keyed by (sid,session). A pos-0 call PREFILLS the whole prompt; a pos>0 call is a DECODE step where `input_ids`
+// is just the ONE new token (first stage) and the piped hidden is a single position — so decode stops re-running
+// the growing prefix (O(n) not O(n^2)). `pos` = tokens already cached; the stage rejects a pos mismatch (its KV was
+// lost to a reconnect → re-prefill needed). Uncached (no `cache`) is the original stateless full-sequence pipe.
+type ShardCache = { session: string; pos: number };
+async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean, cache?: ShardCache): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
   const plan = shardPlans.get(sid);
   if (!plan || plan.stages.length === 0) return { ok: false, error: `shard ${sid} not loaded/ready` };
   for (const st of plan.stages) if (!workers.has(st.worker)) return { ok: false, error: `stage worker ${st.worker} disconnected — re-shard with POST /model/shard`, disconnected: true };
@@ -701,12 +708,21 @@ async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean
     const st = plan.stages[i]; const w = workers.get(st.worker)!;
     const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
     if (st.first) payload.input_ids = input_ids; else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
+    if (cache) { payload.cached = true; payload.session = cache.session; payload.pos = cache.pos; }
     if (st.last && returnLogits) payload.return_logits = true;
     const r = await modelRPC(w, 'shard_forward', payload);
     if (!r.ok) return { ok: false, error: `shard_forward failed on ${st.worker} (stage ${i}, layers ${st.start}-${st.end}): ${r.error}` };
     carry = r.data!;
   }
   return { ok: true, data: carry };
+}
+
+// Evict a shard's live KV on every stage (one session, or all sessions when `session` is omitted). Best-effort:
+// a disconnected/racing stage just skips. Called when a cached chat/generate finishes and on explicit reset.
+async function shardReset(sid: string, session?: string): Promise<void> {
+  const plan = shardPlans.get(sid);
+  if (!plan) return;
+  for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_reset', { id: sid, ...(session != null ? { session } : {}) }).catch(() => {}); }
 }
 
 // --- DiLoCo: the coordinator is the parameter server. It holds the GLOBAL adapter + an outer Nesterov
@@ -1279,7 +1295,9 @@ async function handler(req: Request): Promise<Response> {
   // Pipeline-parallel sharding (GPT-2 family only). Split the layer range into contiguous stages across
   // the torch workers, load each stage on its worker, and record the plan.
   //   POST /model/shard          { model, id?, layers?, workers? }              → { id, stages:[{worker,start,end,first,last,params_held}] }
-  //   POST /model/shard_forward  { id?, input_ids:[...], return_logits? }       → { argmax, logits? }  (pipes hidden state stage→stage)
+  //   POST /model/shard_forward  { id?, input_ids:[...], return_logits?,        → { argmax, logits?, past? }  (pipes hidden state stage→stage;
+  //                                session?, cached?, pos? }                            cached mode keeps per-stage KV — pos-0 prefills, pos>0 decodes one token)
+  //   POST /model/shard_reset    { id?, session? }                              → evict live KV (one session or all) — weights stay loaded
   //   POST /model/shard_unload   { id? }                                        → unload every stage + drop the plan
   if (req.method === 'GET' && url.pathname === '/model/shard_status') {
     const id = url.searchParams.get('id') ?? [...shardLoads.keys()].pop();
@@ -1428,13 +1446,17 @@ async function handler(req: Request): Promise<Response> {
     } catch (e) { return fail(e instanceof Error ? e.message : String(e), 502); }
   }
   if (req.method === 'POST' && url.pathname === '/model/shard_forward') {
-    const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean };
+    const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean; session?: string; cached?: boolean; pos?: number };
     const sid = body.id ?? [...shardPlans.keys()][0];
     if (!sid || !shardPlans.has(sid)) return json({ error: 'no sharded model — POST /model/shard first' }, 409);
     if (shardPlans.get(sid)!.stages.length === 0) return json({ error: `shard ${sid} is still loading`, id: sid }, 409);
     if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
     if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints, ≤100000' }, 400);
-    const out = await shardPipe(sid, body.input_ids, !!body.return_logits);
+    // Optional cached mode: {session, cached:true, pos} runs the incremental KV path (pos-0 prefill, then a
+    // decode step feeds only the ONE new token in input_ids). Lets a client (or the parity test) drive the
+    // cache step-by-step; omit it for the original stateless full-sequence forward.
+    const cache = (body.cached && typeof body.session === 'string') ? { session: body.session, pos: Math.max(0, Math.floor(Number(body.pos ?? 0))) } : undefined;
+    const out = await shardPipe(sid, body.input_ids, !!body.return_logits, cache);
     if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
     return json({ ok: true, id: sid, ...out.data });
   }
@@ -1452,6 +1474,7 @@ async function handler(req: Request): Promise<Response> {
     const n = Math.max(1, Math.min(Number(body.max_new_tokens ?? 32), 1024));
     const prompt = body.input_ids.slice();
     const seq = body.input_ids.slice();
+    const session = `${sid}::${crypto.randomUUID()}`; // fresh per request → each stage's KV starts clean, no stale carry
     const enc = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
@@ -1459,14 +1482,17 @@ async function handler(req: Request): Promise<Response> {
         const t0 = Date.now();
         try {
           for (let k = 0; k < n; k++) {
-            const out = await shardPipe(sid, seq, false); // NB: no KV cache on the shard path → re-runs the growing seq each token (slow, but complete)
+            // KV CACHE: k==0 PREFILLS the whole prompt (pos 0); every later step feeds ONLY the new token, and each
+            // stage attends to its cached prefix — so decode no longer re-runs the growing sequence.
+            const step = k === 0 ? seq.slice() : [seq[seq.length - 1]];
+            const out = await shardPipe(sid, step, false, { session, pos: k === 0 ? 0 : seq.length - 1 });
             if (!out.ok) { send({ error: out.error, at: k }); break; } // in-band terminal error (headers already sent → can't 502)
             const tok = Number(out.data.argmax); seq.push(tok);
             send({ token: tok, i: k, ms: Date.now() - t0 });
           }
           send({ done: true, tokens: seq.slice(prompt.length), n: seq.length - prompt.length, ms: Date.now() - t0 });
         } catch (e) { send({ error: e instanceof Error ? e.message : String(e) }); }
-        finally { controller.close(); }
+        finally { await shardReset(sid, session); controller.close(); } // evict this request's live KV on every stage
       },
     });
     return new Response(stream, { headers: { 'content-type': 'application/x-ndjson', 'cache-control': 'no-cache' } });
@@ -1486,17 +1512,34 @@ async function handler(req: Request): Promise<Response> {
     const seq = (tk.data!.input_ids as number[]).slice();
     const promptLen = seq.length, eos = Number(tk.data!.eos);
     const n = Math.max(1, Math.min(Number(body.max_new_tokens ?? 64), 512));
+    const session = `${sid}::${crypto.randomUUID()}`; // fresh KV session per chat request
     const t0 = Date.now();
-    for (let k = 0; k < n; k++) {
-      const out = await shardPipe(sid, seq, false);
-      if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
-      const tok = Number(out.data.argmax); seq.push(tok);
-      if (Number.isFinite(eos) && tok === eos) break;
-    }
+    let piped: { ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean } | null = null;
+    try {
+      for (let k = 0; k < n; k++) {
+        // KV CACHE: prefill the whole prompt on step 0, then send ONLY the new token each step — the stages
+        // attend to their cached prefix, so a sharded chat no longer re-runs the growing sequence per token.
+        const step = k === 0 ? seq.slice() : [seq[seq.length - 1]];
+        const out = await shardPipe(sid, step, false, { session, pos: k === 0 ? 0 : seq.length - 1 });
+        if (!out.ok) { piped = out; break; }
+        const tok = Number(out.data.argmax); seq.push(tok);
+        if (Number.isFinite(eos) && tok === eos) break;
+      }
+    } finally { await shardReset(sid, session); } // evict this request's live KV on every stage (also on error/return)
+    if (piped && !piped.ok) { if (piped.disconnected) shardPlans.delete(sid); return json({ error: piped.error, id: sid }, piped.disconnected ? 503 : 502); }
     const newTokens = seq.slice(promptLen);
     const dt = await modelRPC(first, 'shard_detok', { id: sid, tokens: newTokens });
     if (!dt.ok) return json({ error: `decode failed: ${dt.error}` }, 502);
     return json({ ok: true, id: sid, text: dt.data!.text, n: newTokens.length, ms: Date.now() - t0, workers: plan.stages.map((s) => s.worker) });
+  }
+  // Evict a shard's live KV cache without unloading the weights: {id?, session?} — one session, or all sessions
+  // when session is omitted. Frees the incremental-decode caches; the sharded model stays loaded and ready.
+  if (req.method === 'POST' && url.pathname === '/model/shard_reset') {
+    const body = await req.json().catch(() => ({})) as { id?: string; session?: string };
+    const sid = body.id ?? [...shardPlans.keys()][0];
+    if (!sid || !shardPlans.has(sid)) return json({ error: 'no such sharded model' }, 404);
+    await shardReset(sid, body.session);
+    return json({ ok: true, id: sid, session: body.session ?? null });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard_unload') {
     const body = await req.json().catch(() => ({})) as { id?: string };

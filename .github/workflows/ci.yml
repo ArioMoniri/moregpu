@@ -82,3 +82,6 @@ jobs:
 
       - name: DiLoCo LoRA training — loss decreases + non-finite guard
         run: python3 tests/e2e/train_diloco.py
+
+      - name: KV-cache parity — cached == uncached == un-sharded golden (O(n^2)->O(n))
+        run: python3 tests/e2e/kv_cache_parity.py
