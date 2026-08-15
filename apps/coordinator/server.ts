@@ -455,6 +455,15 @@ const shardPlans = new Map<string, { model: string; stages: ShardStage[] }>();
 // to a fresh worker without redoing the /model/shard preflight. push:false shards carry nulls. Lifecycle = shardPlans.
 type ShardStream = { model: string; push: boolean; configText: string | null; stPlan: STPlan | null };
 const shardStreams = new Map<string, ShardStream>();
+// EXPERT PARALLELISM (MoE) hybrid plan — see docs/ROADMAP.md "MoE expert parallelism (the Kimi path)". The DENSE
+// backbone (embed / attention / router / final norm+head) lives on ONE worker; the routed experts are SPLIT across
+// holder workers (each resident for a SUBSET of expert indices, all layers). Sibling of shardPlans. /model/moe_forward
+// drives one forward layer-by-layer, RELAYING the router dispatch/combine THROUGH THE COORDINATOR — no peer mesh yet
+// (that all-to-all is the SPOF the mesh removes; a LATER increment, roadmap §4). Only [seq×hidden] activations + the
+// tiny routing table cross the wire, never the weights.
+interface MoEHolder { worker: string; experts: number[] }
+interface MoEPlan { model: string; backbone: string; holders: MoEHolder[]; nLayer: number; nExperts: number; topk: number }
+const moePlans = new Map<string, MoEPlan>();
 // Generous by default: model_load/train_load download & instantiate a model on the worker, which for a
 // heavy model or a slow link can far exceed 2min. Fine-tuning + big-model inference need this headroom.
 const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 600_000);
@@ -686,6 +695,26 @@ function stageTensors(header: STPlan, start: number, end: number, first: boolean
     else if (first || last) names.push(name);                                          // embeddings / final norm / head
   }
   return names;
+}
+
+// ── EXPERT PARALLELISM (MoE) tensor selection — see docs/ROADMAP.md "MoE expert parallelism (the Kimi path)".
+// stageTensors is LAYER-only (it has no notion of an expert index); these add EXPERT-index selection so a stage
+// can be assigned a SUBSET of experts. The LOADER is untouched: hfSafetensorsPlan already tagged every tensor
+// with its {file, offsets}, so selecting one expert's (possibly cross-file) tensors is pure selection — the
+// UNCHANGED streamStageSafetensors Range-fetches each from its own file and merges them into one per-node file.
+// Grounded in real routed-MoE naming (OLMoE / Qwen2-MoE / DeepSeek-V3-Kimi):
+//   routed expert  = "….mlp.experts.<E>.{gate,up,down}_proj.weight"   → EXPERT plane (split across holders)
+//   router         = "….mlp.gate.weight"     ┐
+//   attention/norms= "….self_attn.*" / "….*layernorm.*"              ├ DENSE backbone (one worker, EP×pipe hybrid)
+//   embed/head/norm= "model.embed_tokens.*" / "…norm.*" / "lm_head.*" ┘
+const EXPERT_RE = /(?:^|\.)experts\.(\d+)\./;              // captures the routed-expert index E
+function isExpertTensor(name: string): boolean { return EXPERT_RE.test(name); }
+// Backbone = every tensor that is NOT a routed expert (the router mlp.gate and any shared expert STAY dense).
+function stageBackboneTensors(plan: STPlan): string[] { return Object.keys(plan).filter((n) => !isExpertTensor(n)); }
+// Expert selection = the exact routed-expert tensors whose index is in `experts`, across ALL layers (a holder
+// keeps the same expert-index subset for every layer). One expert's 3 tensors may live in DIFFERENT source files.
+function stageExpertTensors(plan: STPlan, experts: Set<number>): string[] {
+  return Object.keys(plan).filter((n) => { const m = EXPERT_RE.exec(n); return !!m && experts.has(Number(m[1])); });
 }
 
 // Build a valid per-stage safetensors (recomputed contiguous offsets) and stream it as "model.safetensors".
@@ -928,6 +957,59 @@ async function shardReset(sid: string, session?: string): Promise<void> {
   const plan = shardPlans.get(sid);
   if (!plan) return;
   for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_reset', { id: sid, ...(session != null ? { session } : {}) }).catch(() => {}); }
+}
+
+// ── EXPERT PARALLELISM (MoE): stream ONE role's tensors download-free to a worker and load it. Reuses the SAME
+// push staging + the UNCHANGED streamStageSafetensors (Range-fetch each selected tensor from its own file, merge
+// into one per-node model.safetensors), then calls `loadOp` (moe_backbone_load | expert_load). `names` is the
+// role's tensor selection (stageBackboneTensors | stageExpertTensors) — a SUBSET of the checkpoint.
+async function streamMoERole(sid: string, model: string, configText: string, stPlan: STPlan, names: string[], w: Worker, loadOp: string, loadCfg: Record<string, unknown>): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> {
+  try {
+    const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume: false }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+    const budget = { left: PUSH_MAX_BYTES };
+    const cb = new TextEncoder().encode(configText);
+    const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+    const bytes = await streamStageSafetensors(w, sid, model, stPlan, names, budget, 0);
+    const r = await modelRPC(w, loadOp, { model, id: sid, push: true, ...loadCfg });
+    return { ...r, bytes };
+  } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }
+}
+
+// Drive ONE MoE forward across the hybrid plan, RELAYING the router dispatch/combine THROUGH THE COORDINATOR
+// (correctness-first; the peer-mesh all-to-all is a LATER increment — roadmap §4). Per MoE layer: the backbone
+// runs attention + router (moe_route) → the coordinator groups the routed experts by holder and DISPATCHES to
+// each holder that owns ≥1 routed expert (expert_forward on its resident subset) → the backbone COMBINES the
+// partials + residual (moe_apply). Only activations + the tiny routing table cross the wire, never the weights.
+async function moePipe(sid: string, input_ids: number[], returnLogits: boolean): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
+  const plan = moePlans.get(sid);
+  if (!plan) return { ok: false, error: `moe ${sid} not loaded/ready` };
+  const bw = workers.get(plan.backbone);
+  if (!bw) return { ok: false, error: `moe backbone worker ${plan.backbone} disconnected`, disconnected: true };
+  for (const h of plan.holders) if (!workers.has(h.worker)) return { ok: false, error: `expert holder ${h.worker} disconnected`, disconnected: true };
+  const emb = await modelRPC(bw, 'moe_embed', { id: sid, input_ids });
+  if (!emb.ok) return { ok: false, error: `moe_embed: ${emb.error}` };
+  let hidden = emb.data!.hidden as string; const seq = emb.data!.seq as number;
+  for (let L = 0; L < plan.nLayer; L++) {
+    const rt = await modelRPC(bw, 'moe_route', { id: sid, layer: L, hidden, seq });
+    if (!rt.ok) return { ok: false, error: `moe_route L${L}: ${rt.error}` };
+    const moeIn = rt.data!.moe_in as string, topkI = rt.data!.topk_i as number[], topkW = rt.data!.topk_w as string, k = rt.data!.k as number;
+    const used = new Set<number>(topkI);                                   // routed experts this layer
+    const partials: string[] = [];
+    for (const holder of plan.holders) {
+      const residentUsed = holder.experts.filter((e) => used.has(e));      // DISPATCH: only this holder's routed experts
+      if (residentUsed.length === 0) continue;                             // skip a holder with nothing routed to it
+      const hw = workers.get(holder.worker)!;
+      const ef = await modelRPC(hw, 'expert_forward', { id: sid, layer: L, seq, hidden: moeIn, topk_i: topkI, topk_w: topkW, k, experts: residentUsed });
+      if (!ef.ok) return { ok: false, error: `expert_forward L${L} holder ${holder.worker}: ${ef.error}` };
+      partials.push(ef.data!.partial as string);
+    }
+    const ap = await modelRPC(bw, 'moe_apply', { id: sid, layer: L, attn_hidden: rt.data!.attn_hidden, partials, seq });
+    if (!ap.ok) return { ok: false, error: `moe_apply L${L}: ${ap.error}` };
+    hidden = ap.data!.hidden as string;
+  }
+  const hd = await modelRPC(bw, 'moe_head', { id: sid, hidden, seq, return_logits: returnLogits });
+  if (!hd.ok) return { ok: false, error: `moe_head: ${hd.error}` };
+  return { ok: true, data: hd.data! };
 }
 
 // --- DiLoCo: the coordinator is the parameter server. It holds the GLOBAL adapter + an outer Nesterov
@@ -1747,6 +1829,84 @@ async function handler(req: Request): Promise<Response> {
     for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }); }
     log('info', `sharded model ${sid} unloaded (${plan.stages.length} stages)`);
     return json({ ok: true, id: sid, stages: plan.stages.length });
+  }
+  // EXPERT PARALLELISM (MoE) — see docs/ROADMAP.md. FIRST verifiable increment: a routed-MoE placed as an EP×pipe
+  // hybrid — the DENSE backbone on one worker, the routed experts SPLIT across holder workers (each resident for a
+  // SUBSET), and one forward driven layer-by-layer with the router dispatch/combine RELAYED THROUGH THE COORDINATOR.
+  //   POST /model/moe_shard    { model, id?, push? }                 → place backbone + split experts (download-free)
+  //   POST /model/moe_forward  { id?, input_ids:[...], return_logits?} → { argmax, logits? }  (coordinator-relayed EP)
+  //   POST /model/moe_unload   { id? }                               → free backbone + every holder
+  if (req.method === 'POST' && url.pathname === '/model/moe_shard') {
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; push?: boolean };
+    if (!body.model) return json({ error: 'need {model} (a routed-MoE — OLMoE / Qwen2-MoE)' }, 400);
+    const push = body.push !== false;   // download-free by default (the coordinator is the one-time weight source)
+    if (push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free MoE shard` }, 400);
+    const cands = torchWorkers();
+    if (cands.length < 2) return json({ error: 'MoE expert parallelism needs ≥2 native (torch) workers — 1 dense backbone + ≥1 expert holder' }, 503);
+    const sid = body.id ?? body.model;
+    if (moePlans.has(sid)) return json({ error: `moe ${sid} already loaded — POST /model/moe_unload first`, id: sid }, 409);
+    // Preflight ON THE COORDINATOR (no worker download): config → layer/expert counts + top-k; safetensors plan
+    // (single OR multi-file). hfSafetensorsPlan already resolves every routed-expert tensor to its {file,offsets},
+    // so an expert's 3 tensors can live in different shards and still be selected + merged download-free.
+    let configText: string, stPlan: STPlan, nLayer: number, nExperts: number, topk: number;
+    try {
+      const ct = await hfFetchText(body.model, 'config.json', PUSH_INDEX_MAX);
+      if (!ct) return json({ error: `${body.model}: no config.json on HF` }, 502);
+      configText = ct;
+      const cfg = JSON.parse(configText) as Record<string, unknown>;
+      nLayer = Math.floor(Number(cfg.num_hidden_layers ?? 0));
+      nExperts = Math.floor(Number(cfg.num_experts ?? cfg.n_routed_experts ?? cfg.num_local_experts ?? 0));
+      topk = Math.floor(Number(cfg.num_experts_per_tok ?? cfg.num_experts_per_token ?? 0));
+      if (!(nLayer > 0 && nExperts > 0 && topk > 0)) return json({ error: `${body.model}: not a routed-MoE config (num_hidden_layers=${nLayer}, num_experts=${nExperts}, num_experts_per_tok=${topk})` }, 400);
+      const indexText = await hfFetchText(body.model, 'model.safetensors.index.json', PUSH_INDEX_MAX);
+      stPlan = await hfSafetensorsPlan(body.model, indexText);
+    } catch (e) { return json({ error: `MoE preflight failed: ${e instanceof Error ? e.message : e}` }, 502); }
+    // PLACEMENT: dense backbone on cands[0]; routed experts split as evenly as possible across cands[1..] (holders
+    // ≤ nExperts). Contiguity is irrelevant for experts (unlike pipeline layers), so this is a simple even split.
+    const backboneW = cands[0], holderWs = cands.slice(1);
+    const nH = Math.min(holderWs.length, nExperts);
+    const holders: MoEHolder[] = []; const per = Math.floor(nExperts / nH), extra = nExperts % nH; let curE = 0;
+    for (let i = 0; i < nH; i++) { const size = per + (i < extra ? 1 : 0); holders.push({ worker: holderWs[i].id, experts: Array.from({ length: size }, (_, j) => curE + j) }); curE += size; }
+    moePlans.set(sid, { model: body.model, backbone: backboneW.id, holders, nLayer, nExperts, topk }); // RESERVE (TOCTOU)
+    const cleanup = async () => { const bw = workers.get(backboneW.id); if (bw) await modelRPC(bw, 'moe_unload', { id: sid }).catch(() => {}); for (const h of holders) { const w = workers.get(h.worker); if (w) await modelRPC(w, 'moe_unload', { id: sid }).catch(() => {}); } };
+    const fail = async (msg: string, code: number) => { moePlans.delete(sid); await cleanup(); return json({ error: msg, id: sid }, code); };
+    try {
+      // stream the DENSE backbone (every tensor that is NOT a routed expert — attn, router gate, embed, norm, head)
+      const bbNames = stageBackboneTensors(stPlan);
+      const br = await streamMoERole(sid, body.model, configText, stPlan, bbNames, backboneW, 'moe_backbone_load', {});
+      if (!br.ok) return await fail(`backbone load on ${backboneW.id} failed: ${br.error}`, 502);
+      // stream each holder ONLY its routed-expert subset (selected across all layers, merged from the right files)
+      const holderInfo: Record<string, unknown>[] = [];
+      for (const h of holders) {
+        const hw = workers.get(h.worker); if (!hw) return await fail(`holder worker ${h.worker} disconnected during load`, 503);
+        const enames = stageExpertTensors(stPlan, new Set(h.experts));
+        const hr = await streamMoERole(sid, body.model, configText, stPlan, enames, hw, 'expert_load', { experts: h.experts });
+        if (!hr.ok) return await fail(`expert holder ${h.worker} (experts ${h.experts.join(',')}) load failed: ${hr.error}`, 502);
+        holderInfo.push({ worker: h.worker, experts: h.experts, params_held: hr.data?.params_held, bytes: hr.bytes });
+      }
+      log('info', `moe-sharded ${body.model} (${nLayer} layers · ${nExperts} experts · top-${topk}): backbone=${backboneW.id} · holders ${holders.map((h) => `${h.worker}{${h.experts.join(',')}}`).join(' ')}`);
+      return json({ ok: true, id: sid, model: body.model, layers: nLayer, n_experts: nExperts, topk, mode: push ? 'download-free' : 'download', backbone: { worker: backboneW.id, params_held: br.data?.params_held, bytes: br.bytes }, holders: holderInfo });
+    } catch (e) { return await fail(e instanceof Error ? e.message : String(e), 502); }
+  }
+  if (req.method === 'POST' && url.pathname === '/model/moe_forward') {
+    const body = await req.json().catch(() => ({})) as { id?: string; input_ids?: number[]; return_logits?: boolean };
+    const sid = body.id ?? [...moePlans.keys()][0];
+    if (!sid || !moePlans.has(sid)) return json({ error: 'no MoE model — POST /model/moe_shard first' }, 409);
+    if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
+    if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints, ≤100000' }, 400);
+    const out = await moePipe(sid, body.input_ids, !!body.return_logits);
+    if (!out.ok) { if (out.disconnected) moePlans.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
+    return json({ ok: true, id: sid, ...out.data });
+  }
+  if (req.method === 'POST' && url.pathname === '/model/moe_unload') {
+    const body = await req.json().catch(() => ({})) as { id?: string };
+    const sid = body.id ?? [...moePlans.keys()][0];
+    if (!sid || !moePlans.has(sid)) return json({ error: 'no such MoE model' }, 404);
+    const plan = moePlans.get(sid)!; moePlans.delete(sid);
+    const bw = workers.get(plan.backbone); if (bw) await modelRPC(bw, 'moe_unload', { id: sid }).catch(() => {});
+    for (const h of plan.holders) { const w = workers.get(h.worker); if (w) await modelRPC(w, 'moe_unload', { id: sid }).catch(() => {}); }
+    log('info', `moe model ${sid} unloaded (backbone ${plan.backbone} + ${plan.holders.length} holders)`);
+    return json({ ok: true, id: sid, backbone: plan.backbone, holders: plan.holders.length });
   }
   if (url.pathname === '/logs') return json(LOG.slice(-200).reverse());
   if (url.pathname === '/metrics') return new Response(prometheus(), { headers: { 'content-type': 'text/plain; version=0.0.4' } });

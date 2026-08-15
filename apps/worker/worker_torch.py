@@ -758,6 +758,228 @@ def shard_reset(payload: dict) -> dict:
     _empty_cache()
     return {"ok": True, "id": sid, "evicted": n}
 
+# ── EXPERT PARALLELISM (MoE) — see docs/ROADMAP.md "MoE expert parallelism (the Kimi path)". FIRST verifiable
+# increment. A worker plays ONE of two roles for a routed-MoE model, both loaded via the SAME partial-checkpoint
+# push path as shard_load (missing tensors random-init, then dropped/ignored — the worker never touches the hub):
+#   • BACKBONE holder — the DENSE lane: token embedding, every attention block, both layernorms, the router
+#     `mlp.gate`, the final norm + LM head. Its routed FFN is NOT resident; each MoE layer's expert `mlp` is
+#     swapped for a proxy that keeps the real router, captures the block's normed input, and returns ZEROS for
+#     the FFN — so re-running the REAL decoder layer yields exactly the post-attention residual and the routed
+#     FFN is supplied later by the remote holders.
+#   • EXPERT holder — the SPARSE plane: a SUBSET of the routed experts (the same expert-index set across every
+#     layer), resident. It runs the routed FFN for ONLY its resident experts on the tokens routed to them.
+# The coordinator drives one forward LAYER-BY-LAYER (moe_embed → per-layer moe_route → dispatch to holders'
+# expert_forward → moe_apply → moe_head), RELAYING the router dispatch/combine through ITSELF. A peer-mesh
+# all-to-all (coordinator off the per-token data path) is a LATER increment — this coordinator relay is exactly
+# the SPOF/throughput bottleneck the mesh will remove (roadmap §4). Correctness-first: numerics identical to the
+# un-sharded model, comms not yet optimal.
+MOE_BB: dict = {}       # sid -> backbone state (the whole model + swapped-in router proxies)
+MOE_EXPERTS: dict = {}  # sid -> {"H": hidden, "experts": {(layer, E): nn.Module}, "ids": [E...]}
+
+class _MoEBackboneProxy(nn.Module):
+    """Stand-in for a routed-MoE layer's expert block on the BACKBONE. Keeps the real router `gate`, captures the
+    block's (normed) input and the router logits, and returns ZEROS for the routed-FFN output. Mirrors the
+    (final_hidden_states, router_logits) return contract of OlmoeSparseMoeBlock / Qwen2MoeSparseMoeBlock, so the
+    UNCHANGED decoder layer runs its attention + residual normally and the FFN contribution is added back later
+    from the remote expert holders (via moe_apply)."""
+    def __init__(self, gate: nn.Module):
+        super().__init__(); self.gate = gate; self.cap = None; self.router_logits = None
+    def forward(self, hidden_states):
+        B, S, H = hidden_states.shape
+        flat = hidden_states.reshape(-1, H)
+        self.cap = flat                       # [B*S, H] — the routed-FFN input (post_attention_layernorm output)
+        self.router_logits = self.gate(flat)  # [B*S, n_experts] — router, kept dense on the backbone
+        return torch.zeros(B, S, H, dtype=hidden_states.dtype, device=hidden_states.device), self.router_logits
+
+def _moe_arch_ok(model) -> bool:
+    return hasattr(model, "model") and hasattr(model.model, "layers") and hasattr(model.model, "rotary_emb")
+
+def moe_backbone_load(cfg: dict) -> dict:
+    """Load a routed-MoE causal LM (Llama-style: model.layers + RoPE + RMSNorm — OLMoE / Qwen2-MoE), KEEP the
+    dense backbone, and swap every layer's expert block for a router-only proxy (see _MoEBackboneProxy). Loaded
+    from the streamed BACKBONE-only partial checkpoint (experts absent → random-init, then discarded by the
+    proxy swap) so the worker downloads nothing. dtype float32 (parity reference is fp32; real deploys use fp16)."""
+    from transformers import AutoModelForCausalLM
+    sid = cfg["id"]
+    if cfg.get("push"):
+        st = PUSH.get(sid)
+        if st is None:
+            raise RuntimeError("moe backbone weights not staged — push_begin/push_chunk must precede a push moe_backbone_load")
+        try:
+            from transformers.utils import logging as _tflog; _tflog.set_verbosity_error()  # quiet the partial-checkpoint report (by design)
+        except Exception:
+            pass
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
+    if not _moe_arch_ok(model):
+        raise ValueError(f"MoE EP needs a Llama-style routed-MoE (model.layers + rotary_emb), got {type(model).__name__}")
+    mm = model.model; mc = model.config
+    proxies = []
+    for layer in mm.layers:
+        if not hasattr(layer.mlp, "gate"):
+            raise ValueError("a decoder layer's mlp has no router `gate` — not a routed-MoE model")
+        p = _MoEBackboneProxy(layer.mlp.gate); layer.mlp = p; proxies.append(p)  # drop the (random) experts; keep the router
+    n_experts = int(getattr(mc, "num_experts", getattr(mc, "n_routed_experts", getattr(mc, "num_local_experts", 0))))
+    topk = int(getattr(mc, "num_experts_per_tok", getattr(mc, "num_experts_per_token", 0)))
+    if not (n_experts > 0 and topk > 0):
+        raise ValueError(f"could not read routed-expert count / top-k from config ({n_experts=}, {topk=})")
+    MOE_BB.pop(sid, None)
+    if len(MOE_BB) >= MAX_RESIDENT_MODELS:
+        MOE_BB.pop(next(iter(MOE_BB)), None)
+    MOE_BB[sid] = {"model": model, "mm": mm, "layers": mm.layers, "proxies": proxies, "config": mc,
+                   "n_layer": int(mc.num_hidden_layers), "hidden": int(mc.hidden_size), "vocab": int(mc.vocab_size),
+                   "n_experts": n_experts, "topk": topk, "norm_topk": bool(getattr(mc, "norm_topk_prob", False))}
+    if cfg.get("push"):
+        _push_cleanup(sid)
+    _empty_cache()
+    return {"ok": True, "id": sid, "role": "backbone", "n_layer": int(mc.num_hidden_layers), "n_experts": n_experts,
+            "topk": topk, "hidden": int(mc.hidden_size), "params_held": sum(p.numel() for p in model.parameters())}
+
+def expert_load(cfg: dict) -> dict:
+    """Load ONLY a SUBSET of a routed-MoE's experts, resident. Built from the streamed EXPERT-subset partial
+    checkpoint (all non-expert tensors + non-resident experts random-init → dropped when we keep just our expert
+    modules). {id, experts:[E...], model?, push?}. This is the download-free per-expert placement the roadmap's
+    stageExpertTensors selects (one expert's gate/up/down_proj may live in different source files; the coordinator
+    merged the selected tensors into this stage's model.safetensors)."""
+    from transformers import AutoModelForCausalLM
+    sid = cfg["id"]; experts = sorted(int(e) for e in cfg["experts"])
+    if cfg.get("push"):
+        st = PUSH.get(sid)
+        if st is None:
+            raise RuntimeError("expert weights not staged — push_begin/push_chunk must precede a push expert_load")
+        try:
+            from transformers.utils import logging as _tflog; _tflog.set_verbosity_error()
+        except Exception:
+            pass
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
+    if not _moe_arch_ok(model):
+        raise ValueError(f"MoE EP needs a Llama-style routed-MoE, got {type(model).__name__}")
+    mm = model.model; mc = model.config; n_layer = int(mc.num_hidden_layers)
+    kept: dict = {}
+    for L in range(n_layer):
+        experts_ml = mm.layers[L].mlp.experts  # nn.ModuleList indexed by GLOBAL expert id
+        for E in experts:
+            kept[(L, E)] = experts_ml[E]       # reference the resident expert module (survives the model drop below)
+    MOE_EXPERTS.pop(sid, None)
+    if len(MOE_EXPERTS) >= MAX_RESIDENT_MODELS:
+        MOE_EXPERTS.pop(next(iter(MOE_EXPERTS)), None)
+    params = sum(p.numel() for m in kept.values() for p in m.parameters())
+    MOE_EXPERTS[sid] = {"H": int(mc.hidden_size), "experts": kept, "ids": experts}
+    del model, mm  # our `kept` references keep only the resident experts alive; the rest (attn/embed/other experts) is freed
+    if cfg.get("push"):
+        _push_cleanup(sid)
+    _empty_cache()
+    return {"ok": True, "id": sid, "role": "expert_holder", "experts": experts, "params_held": params}
+
+def _moe_bb(sid):
+    bb = MOE_BB.get(sid)
+    if bb is None:
+        raise RuntimeError(f"moe backbone {sid} not loaded — call moe_backbone_load first")
+    return bb
+
+def moe_embed(payload: dict) -> dict:
+    """BACKBONE: token ids → hidden [1,S,H] (the input embedding). Start of one MoE forward."""
+    bb = _moe_bb(payload["id"]); mm = bb["mm"]
+    ids_list = payload["input_ids"]; _check_ids(bb["vocab"], ids_list)
+    if len(ids_list) > bb["config"].max_position_embeddings:
+        raise ValueError(f"sequence length {len(ids_list)} exceeds context window {bb['config'].max_position_embeddings}")
+    with torch.no_grad():
+        ids = torch.tensor(ids_list, dtype=torch.long, device=DEV).unsqueeze(0)
+        h = mm.embed_tokens(ids)
+    return {"ok": True, "hidden": f32_to_b64(h.flatten()), "seq": int(ids.shape[1])}
+
+def moe_route(payload: dict) -> dict:
+    """BACKBONE, one MoE layer: run the REAL decoder layer's attention (RoPE + causal mask recomputed exactly as
+    the un-sharded model does, mirroring shard_forward's llama path) with the expert FFN proxied to ZERO — so the
+    returned hidden is the post-attention residual (attn_hidden). Also returns the routed-FFN input (moe_in) and
+    the top-k routing (ids + weights, softmaxed in fp32 + optional norm, exactly like the reference sparse block).
+    The coordinator dispatches moe_in + routing to the expert holders and combines via moe_apply."""
+    bb = _moe_bb(payload["id"]); mm = bb["mm"]; H = bb["hidden"]
+    L = int(payload["layer"]); seq = int(payload["seq"])
+    from transformers.masking_utils import create_causal_mask
+    import inspect
+    with torch.no_grad():
+        h = b64_to_t(payload["hidden"]).reshape(1, seq, H).to(DEV)
+        cache_position = torch.arange(0, seq, dtype=torch.long, device=DEV)
+        position_ids = cache_position.unsqueeze(0)
+        pos_emb = mm.rotary_emb(h, position_ids)  # (cos, sin) — depends only on positions + head_dim
+        _msig = inspect.signature(create_causal_mask).parameters
+        _mkw = {"config": bb["config"], "attention_mask": None, "cache_position": cache_position,
+                "past_key_values": None, "position_ids": position_ids,
+                ("inputs_embeds" if "inputs_embeds" in _msig else "input_embeds"): h}
+        cmask = create_causal_mask(**{k: v for k, v in _mkw.items() if k in _msig})
+        p = bb["proxies"][L]; p.cap = None; p.router_logits = None
+        out = bb["layers"][L](h, attention_mask=cmask, position_ids=position_ids, position_embeddings=pos_emb)
+        attn_hidden = out[0]                # [1,S,H] — mlp proxy returned 0, so this IS the post-attn residual base
+        moe_in = p.cap                      # [S,H] — post_attention_layernorm output (the routed-FFN input)
+        routing = torch.softmax(p.router_logits, dim=1, dtype=torch.float)  # fp32 softmax, exactly like the ref block
+        topw, topi = torch.topk(routing, bb["topk"], dim=-1)
+        if bb["norm_topk"]:
+            topw = topw / topw.sum(dim=-1, keepdim=True)
+        topw = topw.to(moe_in.dtype)        # cast back to hidden dtype, like the reference
+    return {"ok": True, "attn_hidden": f32_to_b64(attn_hidden.flatten()), "moe_in": f32_to_b64(moe_in.flatten()),
+            "topk_i": [int(x) for x in topi.flatten().tolist()], "topk_w": f32_to_b64(topw.flatten()),
+            "seq": seq, "k": int(bb["topk"]), "n_experts": bb["n_experts"]}
+
+def expert_forward(payload: dict) -> dict:
+    """EXPERT holder, one MoE layer: run the routed FFN for ONLY this holder's resident experts (subset given in
+    `experts`) on the tokens routed to them, weighted by the router weight, and return the per-token PARTIAL sum
+    [S,H] (zero for tokens/slots not routed to a resident expert). Summing all holders' partials reconstructs the
+    layer's full routed-FFN output. This mirrors the reference sparse block's per-expert gather → weight →
+    index_add, restricted to the resident experts (index_add in ascending expert order, matching the reference)."""
+    st = MOE_EXPERTS.get(payload["id"])
+    if st is None:
+        raise RuntimeError(f"expert holder {payload['id']} not loaded — call expert_load first")
+    H = st["H"]; kept = st["experts"]
+    L = int(payload["layer"]); seq = int(payload["seq"]); k = int(payload["k"])
+    experts = sorted(int(e) for e in payload["experts"])
+    with torch.no_grad():
+        moe_in = b64_to_t(payload["hidden"]).reshape(seq, H).to(DEV)
+        topi = torch.tensor(payload["topk_i"], dtype=torch.long, device=DEV).reshape(seq, k)
+        topw = b64_to_t(payload["topk_w"]).reshape(seq, k).to(DEV)
+        partial = torch.zeros(seq, H, dtype=moe_in.dtype, device=DEV)
+        for E in experts:
+            mod = kept.get((L, E))
+            if mod is None:
+                raise RuntimeError(f"expert (layer={L}, E={E}) not resident on this holder (has {st['ids']})")
+            hit = (topi == E).nonzero(as_tuple=False)  # [(token, slot)...] routed to this expert
+            if hit.numel() == 0:
+                continue
+            t = hit[:, 0]; j = hit[:, 1]
+            out = mod(moe_in[t]) * topw[t, j, None]    # OlmoeMLP: down_proj(silu(gate_proj(x)) * up_proj(x)) · w
+            partial.index_add_(0, t, out.to(moe_in.dtype))
+    return {"ok": True, "partial": f32_to_b64(partial.flatten()), "seq": seq}
+
+def moe_apply(payload: dict) -> dict:
+    """BACKBONE, one MoE layer: COMBINE — sum the holders' routed-FFN partials (in the order sent = ascending
+    expert range, matching the reference index_add order) and add the post-attention residual, all in fp32 on the
+    worker. Returns the layer output hidden [1,S,H] for the next layer's moe_route."""
+    bb = _moe_bb(payload["id"]); H = bb["hidden"]; seq = int(payload["seq"])
+    with torch.no_grad():
+        attn_hidden = b64_to_t(payload["attn_hidden"]).reshape(1, seq, H).to(DEV)
+        moe_out = torch.zeros(seq, H, dtype=attn_hidden.dtype, device=DEV)
+        for pb in payload.get("partials", []):
+            moe_out = moe_out + b64_to_t(pb).reshape(seq, H).to(DEV)
+        h = attn_hidden + moe_out.reshape(1, seq, H)
+    return {"ok": True, "hidden": f32_to_b64(h.flatten()), "seq": seq}
+
+def moe_head(payload: dict) -> dict:
+    """BACKBONE: final RMSNorm + LM head on the last layer's hidden → last-token argmax (+ optional logits)."""
+    bb = _moe_bb(payload["id"]); H = bb["hidden"]; seq = int(payload["seq"])
+    with torch.no_grad():
+        h = b64_to_t(payload["hidden"]).reshape(1, seq, H).to(DEV)
+        h = bb["mm"].norm(h)
+        logits = bb["model"].lm_head(h)[0, -1].float()
+        res = {"ok": True, "argmax": int(logits.argmax().item())}
+        if payload.get("return_logits"):
+            res["logits"] = f32_to_b64(logits)
+    if DEV == "cuda": torch.cuda.synchronize()
+    elif DEV == "mps": torch.mps.synchronize()
+    return res
+
 def model_arch(cfg: dict) -> dict:
     """Cheap: read a model's layer count + context window from config.json (no weights) so the coordinator
     can size a shard plan correctly for any GPT-2 variant (base/medium/large/xl)."""
@@ -819,6 +1041,16 @@ def model_dispatch(op: str, payload: dict) -> dict:
     if op == "shard_tok": return shard_tok(payload)
     if op == "shard_detok": return shard_detok(payload)
     if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); SHARD_TOKS.pop(payload.get("id"), None); _kv_drop(payload.get("id")); _empty_cache(); return {"ok": True}
+    # ── EXPERT PARALLELISM (MoE) — one forward driven by the coordinator: moe_backbone_load / expert_load (place),
+    #    then moe_embed → per-layer (moe_route → holders' expert_forward → moe_apply) → moe_head. moe_unload frees.
+    if op == "moe_backbone_load": return moe_backbone_load(payload)
+    if op == "expert_load": return expert_load(payload)
+    if op == "moe_embed": return moe_embed(payload)
+    if op == "moe_route": return moe_route(payload)
+    if op == "expert_forward": return expert_forward(payload)
+    if op == "moe_apply": return moe_apply(payload)
+    if op == "moe_head": return moe_head(payload)
+    if op == "moe_unload": _push_cleanup(payload.get("id")); MOE_BB.pop(payload.get("id"), None); MOE_EXPERTS.pop(payload.get("id"), None); _empty_cache(); return {"ok": True}
     raise ValueError(f"unknown model op {op}")
 
 # ============================================================================
@@ -1104,7 +1336,7 @@ async def run():
                                 # KEEP in-progress PUSH staging, though: a stage that dropped mid-stream can then
                                 # RESUME (the coordinator re-streams only the missing bytes). A genuinely new
                                 # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
-                                resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
+                                resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); MOE_BB.clear(); MOE_EXPERTS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
                                 RING.clear()  # a fresh coordinator session re-wires the ring after (re)load
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":

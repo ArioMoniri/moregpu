@@ -95,6 +95,9 @@ jobs:
       - name: Peer transport (opt-in) — worker->worker handoff == golden, 0 coordinator relays
         run: python3 tests/e2e/peer_transport.py
 
+      - name: MoE expert parallelism — experts placed across nodes, forward == un-sharded MoE
+        run: python3 tests/e2e/moe_expert_parity.py
+
       - name: DiLoCo LoRA training — loss decreases + non-finite guard
         run: python3 tests/e2e/train_diloco.py
 
