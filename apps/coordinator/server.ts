@@ -264,7 +264,8 @@ interface Worker {
   ceil: number; // the worker's reported/administered duty CEILING (distinct from the live effective duty)
   schedule?: string; // the machine's own contribution schedule ("always" / "idle-only" / "HH:MM-HH:MM")
   nick?: string; // optional admin-set display label
-  peer?: { url: string; pub: string }; // PEER TRANSPORT (opt-in): worker's LAN activation endpoint + pubkey, advertised at register
+  peer?: { url: string; pub: string; candidates?: string[] }; // PEER TRANSPORT (opt-in): worker's activation endpoint(s) + pubkey (candidates: reachable URLs in preference order — public/forwarded first, LAN last)
+  reflexiveIp?: string; // the source IP the coordinator observed for this worker's control connection (a STUN-like hint for MOREGPU_PEER_PUBLIC)
 }
 const workers = new Map<string, Worker>();
 const removedPubkeys = new Set<string>(); // workers an admin removed — refuse their re-registration (ban by key)
@@ -291,7 +292,7 @@ const AUTO_RESUME_BEATS = Number(Deno.env.get('MOREGPU_AUTO_RESUME_BEATS') ?? 3)
 const MAX_CONCURRENT_JOBS = Number(Deno.env.get('MOREGPU_MAX_CONCURRENT_JOBS') ?? 4); // jobs the queue runs at once
 const STALE_JOB_MS = Number(Deno.env.get('MOREGPU_STALE_JOB_MS') ?? 300_000); // fail a job that can't be scheduled within this
 
-function wireWorker(ws: WebSocket) {
+function wireWorker(ws: WebSocket, reflexiveIp?: string) {
   let id = '';
   let registered = false;
   // Close a socket that connects but never authenticates, so an unauthenticated peer can't hold FDs/RAM open.
@@ -302,12 +303,14 @@ function wireWorker(ws: WebSocket) {
     if (m.t === 'register') {
       if (registered) return; // one register per socket
       if (!constEq(String(m.joinToken ?? ''), cfg.joinToken)) { ws.send(JSON.stringify({ t: 'denied', reason: 'bad join token' })); log('warn', 'worker rejected: bad join token'); ws.close(); return; }
-      const node = m.node as { id: string; backend: string; label: string; os: string; peer?: { url: string; pub: string } };
+      const node = m.node as { id: string; backend: string; label: string; os: string; peer?: { url: string; pub: string; candidates?: unknown } };
       const pubkeyB64 = typeof m.pubkey === 'string' ? m.pubkey : undefined;
       // PEER TRANSPORT (opt-in): a peer-enabled worker advertises its LAN activation endpoint; only honoured when the
       // coordinator itself has the flag on, and NEVER exposed publicly — it is handed only to same-tenant ring peers.
       const peer = (PEER_TRANSPORT && node.peer && typeof node.peer.url === 'string' && typeof node.peer.pub === 'string')
-        ? { url: node.peer.url, pub: node.peer.pub } : undefined;
+        ? { url: node.peer.url, pub: node.peer.pub,
+            candidates: Array.isArray(node.peer.candidates) ? (node.peer.candidates as unknown[]).filter((c): c is string => typeof c === 'string' && /^wss?:\/\//.test(c)).slice(0, 8) : undefined }
+        : undefined;
       // Ban list: an admin-removed worker (by key) may not re-enroll.
       if (pubkeyB64 && removedPubkeys.has(pubkeyB64)) { ws.send(JSON.stringify({ t: 'denied', reason: 'removed by admin' })); ws.close(); return; }
       const wantId = safeId(node.id); // sanitize (also prevents /metrics label injection)
@@ -318,7 +321,7 @@ function wireWorker(ws: WebSocket) {
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
       const wkey = await deriveWorkerKey(id, keyEpoch); // this worker's OWN sealing key — derived, never the master, never shared
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, key: wkey, keyEpoch, paused: false, pausedReason: null, peer });
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, key: wkey, keyEpoch, paused: false, pausedReason: null, peer, reflexiveIp });
       // welcome still carries the key under `tenantKeyB64` (wire-compatible with existing workers + the fake fleet),
       // but it is now this worker's PER-WORKER derived key, plus the key epoch it was minted at.
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(wkey), epoch: keyEpoch, duty: DUTY_HINT }));
@@ -1029,7 +1032,7 @@ async function wireRing(sid: string): Promise<Ring | null> {
     // a direct edge needs BOTH ends peer-capable + reachable + not force-relayed; otherwise the successor endpoint
     // is withheld and the predecessor bridges. Always send ring_wire (sets epoch/token even for the last stage).
     const canDirect = i + 1 < plan.stages.length && !!cur.peer && !!suc!.peer && !FORCE_RELAY.has(cur.id);
-    const succEndpoint = canDirect ? { id: suc!.id, url: suc!.peer!.url, pub: suc!.peer!.pub } : null;
+    const succEndpoint = canDirect ? { id: suc!.id, url: suc!.peer!.url, pub: suc!.peer!.pub, candidates: suc!.peer!.candidates } : null;
     // Per-edge seal key for cur->suc (needed for BOTH a direct hand-off and a bridged/relay hop — the coordinator
     // only relays ciphertext on a bridge, it never holds this key). `suc` gets the matching key as its pred_key.
     const succKey = suc ? b64e(await deriveEdgeKey(sid, epoch, cur.id, suc.id)) : undefined;
@@ -1226,14 +1229,14 @@ async function wireMoERing(sid: string): Promise<MoERing | null> {
   const bw = workers.get(plan.backbone);
   if (!bw || !bw.peer) { log('info', `moe-ring ${sid}: backbone ${plan.backbone} has no peer endpoint → relay path`); return null; }
   const epoch = Date.now(), token = tokenB64url(18);
-  const holderEps: { id: string; url: string; pub: string; experts: number[] }[] = [];
+  const holderEps: { id: string; url: string; pub: string; experts: number[]; candidates?: string[] }[] = [];
   // Per-PAIR edge key for each backbone<->holder pair: the backbone seals its expert dispatch AND opens the
   // returned partial with it; the holder does the mirror. Neither uses the master or a per-worker key.
   const holderKeys: Record<string, string> = {};
   for (const h of plan.holders) {
     const hw = workers.get(h.worker);
     if (!hw || !hw.peer) { log('info', `moe-ring ${sid}: holder ${h.worker} has no peer endpoint → relay path`); return null; }
-    holderEps.push({ id: hw.id, url: hw.peer.url, pub: hw.peer.pub, experts: h.experts });
+    holderEps.push({ id: hw.id, url: hw.peer.url, pub: hw.peer.pub, experts: h.experts, candidates: hw.peer.candidates });
     holderKeys[hw.id] = b64e(await deriveEdgeKey(sid, epoch, bw.id, hw.id));
   }
   // give each holder the backbone's pubkey (origin-verify a dispatch frame) + its per-edge key (open the dispatch, seal the partial)
@@ -1490,9 +1493,13 @@ const json = (o: unknown, status = 200) => new Response(JSON.stringify(o, null, 
 const authOk = (req: Request) => constEq((req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '') || (req.headers.get('x-admin-token') ?? ''), cfg.adminToken);
 const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu', 'softmax', 'layernorm'];
 
-async function handler(req: Request): Promise<Response> {
+async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Response> {
+  const reflexiveIp = (info && 'remoteAddr' in info && info.remoteAddr && 'hostname' in info.remoteAddr) ? (info.remoteAddr as Deno.NetAddr).hostname : undefined;
   const url = new URL(req.url);
-  if (url.pathname === '/ws') { const { socket, response } = Deno.upgradeWebSocket(req); wireWorker(socket); return response; }
+  if (url.pathname === '/ws') { const { socket, response } = Deno.upgradeWebSocket(req); wireWorker(socket, reflexiveIp); return response; }
+  // STUN-like reflexive-address hint: report the caller's observed public IP so an operator can decide whether to
+  // port-forward the peer port and advertise it via MOREGPU_PEER_PUBLIC. Public + read-only (no secrets).
+  if (url.pathname === '/whoami') return json({ ip: reflexiveIp ?? null });
   if (url.pathname === '/health') return json({ ok: true, fleet: workers.size, queue: queue.length });
   // Public leaf cert (PEM) so a joining worker's installer can fetch it and DENO_CERT-trust it AFTER checking
   // its sha256 fingerprint == the out-of-band MOREGPU_PIN (see scripts/install.sh). The cert is public; the
@@ -1560,6 +1567,7 @@ async function handler(req: Request): Promise<Response> {
       paused: w.paused, pausedReason: w.pausedReason ?? null, schedule: w.schedule ?? 'always', serving: serveWorkers.has(w.id),
       shards: w.shards, ops: w.ops, units: w.units, tokens: w.tokens, share: +(w.ops / totalOps).toFixed(3), errors: w.errors,
       avgMs: w.shards ? +(w.totalMs / w.shards).toFixed(1) : 0, uptimeS: Math.round((Date.now() - w.joinedAt) / 1000), trend: w.history,
+      peer: w.peer ? { candidates: w.peer.candidates ?? [w.peer.url] } : null, reflexiveIp: w.reflexiveIp ?? null, // NAT diagnostics: advertised endpoints + observed public IP
     })));
   }
   // Admin control of a single worker: pause/resume, cap its duty, set its schedule, relabel, or remove it.

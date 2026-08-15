@@ -358,10 +358,18 @@ joining one admin having **downloaded nothing**. This is a LAN / real-network te
 streams in seconds; a slow, churning link (e.g. a free cross-cloud tunnel) can stall it — resume helps but can't beat
 a link that keeps dropping. See **Roadmap** below for what's next.
 
-**Not built yet:** a **KV cache** on the shard path (sharded decode re-runs the growing sequence — O(n²)),
-**post-load fault tolerance** (a node dropping *after* load breaks the live request), coordinator-off-the-data-path
-**peer transport**, **MoE expert parallelism**, async DiLoCo, cross-tenant secure aggregation, and int8/tensor-core
-speed. Training is verified out-of-band (a seeded reference), not by the coordinator's exact-match check, since a
+**Built since (all verified exact-match / fail-closed, and in CI):** a **per-stage KV cache** on the shard path
+(sharded decode is now O(n), cached == uncached == golden), **post-load fault tolerance** (a stage killed
+mid-generation is re-placed onto a spare and output still matches golden), **coordinator-off-the-per-token peer
+transport** (workers hand activations worker→worker; KV-over-peer + MoE all-to-all + mixed-pipe bridging), **MoE
+expert parallelism** (experts placed across nodes), and the **deployment security trio** — signed hash-pinned
+worker releases, **TLS (`wss://`) by default** with worker cert pinning, and **per-worker sealing keys + key-epoch
+rotation**. Cross-network peer edges work via advertised reachable candidates (`MOREGPU_PEER_PUBLIC` + the
+coordinator's `/whoami`), falling back to relay.
+
+**Still not built:** async DiLoCo (no straggler barrier), cross-tenant secure aggregation, int8/tensor-core speed,
+and automatic NAT **hole-punching** (today a NAT'd edge needs a reachable advertised address or falls back to
+relay). Training is verified out-of-band (a seeded reference), not by the coordinator's exact-match check, since a
 stochastic loss can't be CPU-verified.
 
 </details>
@@ -459,15 +467,22 @@ Deployment topology — admin coordinator and outbound-only workers:
 
 Today MoreGPU does **download-free pipeline sharding** (the coordinator streams each worker only its layer slice — the fleet downloads nothing), **sharded chat** (every node contributes to each token), **churn-tolerant loading** (a node that drops mid-stream reconnects and the load resumes from where it left off, not from zero), and **DiLoCo LoRA fine-tuning** — all verified exact-match / coherent, including a live multi-GPU run.
 
-What's next, in honest order:
+**Shipped since (all exact-match / fail-closed, and covered in CI):**
 
-- **Multi-file weight loader.** The shard loader needs a single-file `model.safetensors` today; a Kimi-K2-class model ships as many files. Cheapest unlock — and it's the per-expert addressing that MoE needs.
-- **KV cache on the shard path.** Sharded decode re-runs the growing sequence each token (O(n²)); a per-stage cache makes it linear. Biggest single latency win.
-- **Post-load fault tolerance.** Churn tolerance covers *loading*; a node dropping *after* load still breaks a live request. Warm spares + failover close that gap.
-- **Coordinator off the per-token path.** Direct worker→worker activation handoff removes the throughput ceiling and the single point of failure — and is the prerequisite for MoE all-to-all.
-- **MoE expert parallelism** — the path to a ~1T sparse model like Kimi K2: experts placed across nodes, each token routed to only its active few. Experts are *resident* and *router-selected per token* (not lazily paged), so it needs the multi-file loader + peer transport first. The hard, multi-month bet.
-- **Fine-tuning at scale:** async DiLoCo (no straggler barrier), training-run checkpoint/resume, robust aggregation, and sharded-base training for models too big for one node.
-- **Deployment hardening:** per-worker keys, signed worker releases, TLS by default; fleet-scale observability and kernel-enforced resource limits.
+- **Multi-file weight loader** — the shard loader now streams from multi-file safetensors (the per-expert addressing MoE needs), not just a single `model.safetensors`.
+- **Per-stage KV cache** — sharded decode is O(n) instead of O(n²); cached == uncached == golden, 2–6× faster.
+- **Post-load fault tolerance** — a stage killed *after* load, mid-generation, is re-placed onto a spare and output still matches golden (re-prefills the KV on the new stage).
+- **Coordinator off the per-token path (peer transport)** — adjacent stages hand activations worker→worker (opt-in); includes KV-over-peer, mixed-pipe bridging, and cross-network reachability via advertised candidates (`MOREGPU_PEER_PUBLIC` + `/whoami`).
+- **MoE expert parallelism** — experts placed across nodes, routed per token, dispatched worker→worker over the peer mesh (all-to-all) with 0 coordinator relays.
+- **Deployment security trio** — signed hash-pinned worker releases (installer fails closed), **TLS (`wss://`) by default** with worker cert pinning (both worker runtimes), and **per-worker sealing keys + key-epoch rotation** (no shared fleet key on the wire).
+
+**Still ahead, in honest order:**
+
+- **A real ~1T MoE end-to-end (Kimi-K2-class).** The parts exist (multi-file loader + expert parallelism + peer mesh); putting a genuine trillion-parameter sparse model on a real multi-node fleet is the remaining integration + scale bet.
+- **Fine-tuning at scale:** async DiLoCo (no straggler barrier), training-run checkpoint/resume, robust/secure aggregation, and sharded-base training for models too big for one node.
+- **Automatic NAT hole-punching.** Cross-network peer edges work today via a *reachable advertised* address (port-forward / VPN / public IP) with relay fallback; true STUN/TURN hole-punching through arbitrary NAT is not built.
+- **Finer crypto + verification:** per-*job* key nonces, CA-cert pinning (the self-signed default is already pinned), N-of-M redundant recomputation with result quorum, short-lived enrollment tokens.
+- **Still not built:** int8/tensor-core speed, fleet-scale observability, and kernel-enforced resource limits.
 
 **Two limits no engineering removes:** a *single* request can't be made faster by adding GPUs over a WAN — per-token pipeline hops are round-trip-bound, so this is a LAN technique — and the coordinator stays the one-time weight source. The fleet's value is **capacity** (models too big for one machine), **throughput** (many concurrent requests), and **fine-tuning**, not single-request latency.
 

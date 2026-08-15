@@ -1101,7 +1101,8 @@ _KEY = None             # this worker's PER-WORKER key (from `welcome`) — coor
 _CEIL = [0.6]           # current duty ceiling, shared with the async peer handlers
 _LOOP = None            # the worker's asyncio loop (run_in_executor from peer handlers)
 _CTRL_SEND = [None]     # bound ws_send of the LIVE control connection (for complete/edge_fault frames)
-_PEER_URL = None        # ws://<lan-ip>:<port>/peer advertised to same-tenant peers at register
+_PEER_URL = None        # ws://<lan-ip>:<port>/peer — the PRIMARY (LAN) endpoint advertised to peers at register
+_PEER_CANDIDATES: list = []  # ordered reachable candidates (public/forwarded first, LAN last) — the honest NAT story
 _PEER_SERVER = None
 
 
@@ -1141,6 +1142,21 @@ async def _peer_probe(url: str, sid) -> bool:
             return p.get("nonce") == n
     except Exception:
         return False
+
+
+async def _peer_probe_first(urls, sid):
+    """Try candidate peer URLs IN ORDER; return the FIRST that answers a signed pong (or None). This is the
+    honest cross-network story: a worker advertises several reachable candidates — an operator-provided public/
+    port-forwarded/VPN address (MOREGPU_PEER_PUBLIC) first, then its raw LAN IP — and the dialing peer simply
+    uses whichever actually answers. No NAT hole-punching: an unreachable candidate just falls through, and if
+    none answer the coordinator keeps the edge on the relay/bridge path."""
+    seen = set()
+    for u in urls or []:
+        if u and u not in seen:
+            seen.add(u)
+            if await _peer_probe(u, sid):
+                return u
+    return None
 
 
 async def _run_stage(payload):
@@ -1230,13 +1246,24 @@ async def _peer_handle(ws, *_):
 
 
 async def _start_peer_listener():
-    global _PEER_URL, _PEER_SERVER
+    global _PEER_URL, _PEER_SERVER, _PEER_CANDIDATES
     port = int(os.environ.get("MOREGPU_PEER_PORT", "0") or "0")
     _PEER_SERVER = await websockets.serve(_peer_handle, "0.0.0.0", port, max_size=None)
     socks = getattr(_PEER_SERVER, "sockets", None) or getattr(getattr(_PEER_SERVER, "server", None), "sockets", None)
     bound = socks[0].getsockname()[1]
-    _PEER_URL = f"ws://{_lan_ip()}:{bound}/peer"
-    print(f"[torch-worker] peer transport ON — listening {_PEER_URL}")
+    _PEER_URL = f"ws://{_lan_ip()}:{bound}/peer"                     # primary (LAN) candidate
+    cands = []
+    # MOREGPU_PEER_PUBLIC = a host[:port] the operator has made reachable across networks (port-forward / public
+    # IP / VPN / Tailscale). Advertised FIRST so cross-network peers prefer the routable address; if it isn't
+    # reachable the dialing peer just falls through to the LAN candidate (or relays). GET /whoami on the
+    # coordinator reports your observed public IP to help set this. No automatic NAT hole-punching is attempted.
+    pub = (os.environ.get("MOREGPU_PEER_PUBLIC") or "").strip()
+    if pub:
+        host, _, p = pub.partition(":")
+        cands.append(f"ws://{host}:{p or bound}/peer")
+    cands.append(_PEER_URL)
+    seen = set(); _PEER_CANDIDATES = [u for u in cands if not (u in seen or seen.add(u))]
+    print(f"[torch-worker] peer transport ON — candidates {_PEER_CANDIDATES}")
 
 
 async def _handle_ring_wire(m):
@@ -1251,8 +1278,14 @@ async def _handle_ring_wire(m):
     r.update(epoch=m["epoch"], token=m["token"], succ=m.get("succ"), conn=None, relay=False)
     r["succ_key"] = b64d(m["succ_key"]) if m.get("succ_key") else None  # per-edge key to SEAL our outgoing act frames
     reachable = True
-    if m.get("succ"):
-        reachable = await _peer_probe(m["succ"]["url"], sid)
+    succ = m.get("succ")
+    if succ:
+        cands = succ.get("candidates") or [succ.get("url")]      # try candidates in order; use whichever answers
+        chosen = await _peer_probe_first(cands, sid)
+        if chosen:
+            succ["url"] = chosen                                  # dial this candidate for the direct hand-off (r["succ"] is this dict)
+        else:
+            reachable = False
     await _ctrl_send({"t": "ring_ack", "reqId": m.get("reqId"), "sid": sid, "reachable": reachable})
 
 
@@ -1327,7 +1360,11 @@ async def _handle_moe_wire(m):
                      "holder_keys": {hid: b64d(k) for hid, k in (m.get("holder_keys") or {}).items()}}  # per backbone<->holder edge key
     reachable = True
     for h in m["holders"]:
-        if not await _peer_probe(h["url"], sid):
+        cands = h.get("candidates") or [h.get("url")]           # try each holder's candidates in order
+        chosen = await _peer_probe_first(cands, sid)
+        if chosen:
+            h["url"] = chosen                                    # backbone dials the candidate that answered (MOE_WIRE holders is this list)
+        else:
             reachable = False; break
     await _ctrl_send({"t": "moe_wire_ack", "reqId": m.get("reqId"), "sid": sid, "reachable": reachable})
 
@@ -1447,7 +1484,7 @@ async def run():
                               f"{('sha256:' + fp[:16] + '…') if fp else '(unavailable)'} is UNPINNED; set MOREGPU_PIN to authenticate it.")
                 node = {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}
                 if PEER_TRANSPORT and _PEER_URL:  # advertise the peer endpoint so the coordinator can wire a direct ring
-                    node["peer"] = {"url": _PEER_URL, "pub": PUBKEY_B64}
+                    node["peer"] = {"url": _PEER_URL, "candidates": _PEER_CANDIDATES, "pub": PUBKEY_B64}
                 await ws.send(json.dumps({"t": "register", "joinToken": A.token, "pubkey": PUBKEY_B64, "node": node}))
                 key = None
                 # websockets requires writes to be serialized, and handlers now run concurrently (below), so

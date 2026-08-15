@@ -116,6 +116,9 @@ jobs:
       - name: MoE all-to-all over peer — expert dispatch worker->worker == golden, 0 relays
         run: python3 tests/e2e/moe_peer.py
 
+      - name: Peer NAT — multi-candidate endpoints + reflexive /whoami; dead-first candidate falls through to direct
+        run: python3 tests/e2e/peer_nat.py
+
       - name: DiLoCo LoRA training — loss decreases + non-finite guard
         run: python3 tests/e2e/train_diloco.py
 
