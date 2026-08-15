@@ -156,7 +156,23 @@ def stop(wprocs):
         except Exception: pass
 
 
+def _skip_on_tf5() -> bool:
+    """MoE EP needs the transformers 4.x OLMoE ModuleList expert layout; 5.x fuses experts. SKIP (exit 0) on 5.x
+    (CI pins transformers<5). Sharding/serving/training still work on 5.x."""
+    try:
+        import transformers
+        if int(transformers.__version__.split(".")[0]) >= 5:
+            print(f"SKIP: MoE all-to-all needs transformers <5 (have {transformers.__version__}); "
+                  f"sharding/serving/training work on 5.x. Pin transformers<5 for MoE EP.")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
+    if _skip_on_tf5():
+        return
     root = tempfile.mkdtemp(prefix="moregpu-moe-peer-")
     ok = True
     fails = []

@@ -473,7 +473,7 @@ Today MoreGPU does **download-free pipeline sharding** (the coordinator streams 
 - **Per-stage KV cache** — sharded decode is O(n) instead of O(n²); cached == uncached == golden, 2–6× faster.
 - **Post-load fault tolerance** — a stage killed *after* load, mid-generation, is re-placed onto a spare and output still matches golden (re-prefills the KV on the new stage).
 - **Coordinator off the per-token path (peer transport)** — adjacent stages hand activations worker→worker (opt-in); includes KV-over-peer, mixed-pipe bridging, and cross-network reachability via advertised candidates (`MOREGPU_PEER_PUBLIC` + `/whoami`).
-- **MoE expert parallelism** — experts placed across nodes, routed per token, dispatched worker→worker over the peer mesh (all-to-all) with 0 coordinator relays.
+- **MoE expert parallelism** — experts placed across nodes, routed per token, dispatched worker→worker over the peer mesh (all-to-all) with 0 coordinator relays. *(Needs `transformers<5` today — it addresses experts by per-expert tensor name, which transformers 5.x fuses into one batched module; sharding/serving/training work on 4.x **and** 5.x.)*
 - **Deployment security trio** — signed hash-pinned worker releases (installer fails closed), **TLS (`wss://`) by default** with worker cert pinning (both worker runtimes), and **per-worker sealing keys + key-epoch rotation** (no shared fleet key on the wire).
 
 **Still ahead, in honest order:**

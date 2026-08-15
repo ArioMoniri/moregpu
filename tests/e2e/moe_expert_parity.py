@@ -113,7 +113,24 @@ def b64_to_logits(b64):
     return np.frombuffer(base64.b64decode(b64), dtype="<f4")
 
 
+def _skip_on_tf5() -> bool:
+    """MoE expert parallelism addresses experts by per-expert tensor name (experts.<N>.…); transformers 5.x
+    fuses them into a single batched module. SKIP (exit 0) on 5.x — CI pins transformers<5, and this keeps a
+    dev on 5.x from a spurious red for a known-unsupported combo. Sharding/serving/training still run on 5.x."""
+    try:
+        import transformers
+        if int(transformers.__version__.split(".")[0]) >= 5:
+            print(f"SKIP: MoE expert parallelism needs transformers <5 (have {transformers.__version__}); "
+                  f"sharding/serving/training work on 5.x. Pin transformers<5 for MoE EP.")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
+    if _skip_on_tf5():
+        return
     root = tempfile.mkdtemp(prefix="moregpu-moe-parity-")
     ok = True
     try:

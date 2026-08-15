@@ -66,7 +66,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install cryptography websockets numpy transformers safetensors
+          # transformers pinned <5: MoE expert parallelism addresses experts by per-expert tensor name
+          # (experts.<N>.gate_proj…), which transformers 5.x fuses into a single batched `Experts` module.
+          # Sharding/serving/training work on 4.x AND 5.x; MoE EP currently needs the 4.x OLMoE ModuleList layout.
+          pip install cryptography websockets numpy 'transformers>=4.44,<5' safetensors
 
       - name: Compile-check native code
         run: python -m py_compile apps/worker/worker_torch.py examples/*.py clients/python/moregpu/__init__.py

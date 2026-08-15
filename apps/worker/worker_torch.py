@@ -625,7 +625,10 @@ def shard_load(cfg: dict) -> dict:
             from transformers.utils import logging as _tflog; _tflog.set_verbosity_error()
         except Exception:
             pass
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
+        # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
+        # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
+        # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
         # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
@@ -826,6 +829,26 @@ class _MoEBackboneProxy(nn.Module):
 def _moe_arch_ok(model) -> bool:
     return hasattr(model, "model") and hasattr(model.model, "layers") and hasattr(model.model, "rotary_emb")
 
+
+def _require_indexable_experts(model) -> None:
+    """MoE expert parallelism addresses experts BY INDEX (experts[e]) — the OLMoE `nn.ModuleList` layout.
+    transformers 5.x fuses per-layer experts into a single batched `Experts` module that isn't subscriptable,
+    which this per-expert placement can't address yet. Fail with a CLEAR, actionable message (not a cryptic
+    'object is not subscriptable') so the operator knows to pin transformers<5 for MoE EP. Sharding / serving /
+    DiLoCo training work on transformers 4.x AND 5.x — only MoE EP needs the 4.x layout."""
+    try:
+        experts = model.model.layers[0].mlp.experts
+        _ = experts[0]  # ModuleList → ok; fused 5.x `Experts` → TypeError
+    except TypeError:
+        import transformers as _tf
+        raise RuntimeError(
+            f"MoE expert parallelism needs transformers <5 (the OLMoE ModuleList expert layout); you have "
+            f"transformers {_tf.__version__}, which fuses experts into a single batched module this per-expert "
+            f"placement can't address yet. Pipeline sharding / serving / DiLoCo training DO work on 5.x — "
+            f"`pip install 'transformers<5'` to use MoE expert parallelism. See docs/ROADMAP.md.") from None
+    except Exception:
+        pass  # any other shape → let the downstream arch/slicing logic surface it
+
 def moe_backbone_load(cfg: dict) -> dict:
     """Load a routed-MoE causal LM (Llama-style: model.layers + RoPE + RMSNorm — OLMoE / Qwen2-MoE), KEEP the
     dense backbone, and swap every layer's expert block for a router-only proxy (see _MoEBackboneProxy). Loaded
@@ -841,11 +864,15 @@ def moe_backbone_load(cfg: dict) -> dict:
             from transformers.utils import logging as _tflog; _tflog.set_verbosity_error()  # quiet the partial-checkpoint report (by design)
         except Exception:
             pass
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
+        # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
+        # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
+        # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE (model.layers + rotary_emb), got {type(model).__name__}")
+    _require_indexable_experts(model)
     mm = model.model; mc = model.config
     proxies = []
     for layer in mm.layers:
@@ -884,11 +911,15 @@ def expert_load(cfg: dict) -> dict:
             from transformers.utils import logging as _tflog; _tflog.set_verbosity_error()
         except Exception:
             pass
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV).eval()
+        # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
+        # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
+        # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE, got {type(model).__name__}")
+    _require_indexable_experts(model)
     mm = model.model; mc = model.config; n_layer = int(mc.num_hidden_layers)
     kept: dict = {}
     for L in range(n_layer):
