@@ -199,13 +199,17 @@ def main() -> int:
         never = not worker_registered("https", port, ADMIN, "w-badpin", tries=8)
         check(never, "worker with a mismatched pin NEVER registered (rejected before the token crossed the wire)")
 
-        # ── (3b) NO pin on wss:// is ALSO refused (fail-closed, mirrors scripts/install.sh) ───────────────
-        print("\n(3b) a worker with NO pin on wss:// is refused (does not leak the join token)", flush=True)
+        # ── (3b) NO pin on a SELF-SIGNED wss:// is fail-closed via CA validation ──────────────────────────
+        # With no pin the worker keeps NORMAL CA verification, so a self-signed coordinator FAILS the handshake and
+        # the join token is never sent. (A real-CA cert — a tunnel / Let's Encrypt — would connect with no pin; that
+        # legitimate path isn't exercised by this self-signed harness.) This was a fail-OPEN before the fix.
+        print("\n(3b) NO pin on a self-signed wss:// is fail-closed (CA validation rejects the self-signed cert)", flush=True)
         start_worker(root, "wss", port, JOIN, "w-nopin", pin=None)
-        check(log_has(os.path.join(root, "w-nopin.log"), "REFUSED", tries=40),
-              "worker on wss:// with NO MOREGPU_PIN logs REFUSED (fail-closed — was fail-OPEN before the fix)")
-        check(not worker_registered("https", port, ADMIN, "w-nopin", tries=8),
-              "worker with no pin NEVER registers on wss:// (join token never sent to an unauthenticated coordinator)")
+        check(log_has(os.path.join(root, "w-nopin.log"), "certificate verify failed", tries=30)
+              or log_has(os.path.join(root, "w-nopin.log"), "CERTIFICATE_VERIFY", tries=1),
+              "worker on wss:// with NO pin fails CA validation of the self-signed cert (handshake rejected)")
+        check(not worker_registered("https", port, ADMIN, "w-nopin", tries=6),
+              "worker with no pin NEVER registers on a self-signed wss:// (join token not sent without a pin)")
 
         # ── (4) ws:// opt-out (MOREGPU_INSECURE=1) still works — the existing CI path ─────────────────────
         print("\n(4) MOREGPU_INSECURE=1 opt-out still serves plaintext ws:// for local/CI", flush=True)

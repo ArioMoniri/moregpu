@@ -65,16 +65,24 @@ PEER_TRANSPORT = os.environ.get("MOREGPU_PEER_TRANSPORT", "").lower() in ("1", "
 # info). We complete the TLS handshake with verification disabled, then reject any coordinator whose leaf
 # cert doesn't match the pin BEFORE sending the join token — so the token/tenant key never reach a MITM.
 PIN = "".join(c for c in A.pin.lower() if c in "0123456789abcdef")  # normalize: strip 'sha256:' prefix, colons, case
+_ALLOW_UNPINNED = os.environ.get("MOREGPU_ALLOW_UNPINNED", "").lower() in ("1", "true", "yes", "on")  # local-hacking escape hatch
 
 
 def _tls_ctx():
-    """SSL context for a wss:// coordinator (None for plaintext ws://). Verification is disabled here on
-    purpose — a self-signed cert has no chain — and replaced by the fingerprint pin check in _verify_pin()."""
+    """SSL context for a wss:// coordinator (None for plaintext ws://).
+    - MOREGPU_PIN set → verification DISABLED here (a self-signed cert has no chain); the fingerprint pin check
+      after the handshake is the trust anchor.
+    - no pin → NORMAL CA verification (check_hostname + CERT_REQUIRED): a real CA cert (a tunnel like
+      trycloudflare, or Let's Encrypt behind a reverse proxy) authenticates the coordinator so the join token is
+      safe to send; a SELF-SIGNED coordinator FAILS the handshake, so the token is never sent to an unauthenticated
+      endpoint without a pin. MOREGPU_ALLOW_UNPINNED=1 forces verification off (local hacking only)."""
     if not A.server.startswith("wss://"):
         return None
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    if PIN or _ALLOW_UNPINNED:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    # else: keep the secure defaults (check_hostname=True, verify_mode=CERT_REQUIRED) → normal CA validation.
     return ctx
 
 
@@ -1535,28 +1543,27 @@ async def run():
                 ping_timeout=float(os.environ.get("MOREGPU_WS_PING_TIMEOUT", "90")),
                 close_timeout=10,
             ) as ws:
-                # TLS PIN CHECK — before anything secret (the join token) crosses the wire. A wss:// coordinator
-                # whose cert fingerprint doesn't match MOREGPU_PIN is REFUSED (possible MITM); we retry so a
-                # legitimately rotated cert just needs the operator to update the pin.
+                # TLS AUTHENTICATION — the coordinator must be authenticated BEFORE the join token crosses the wire.
+                # With a PIN we disabled CA verification (_tls_ctx) and instead fingerprint-pin the leaf here (the
+                # self-signed default). With NO pin, _tls_ctx kept NORMAL CA verification, so reaching this point at
+                # all means the handshake already validated the cert against the system roots (a real-cert tunnel /
+                # Let's Encrypt); a self-signed coordinator would have failed to connect and we'd be retrying, never
+                # here — so the token is never sent to an unauthenticated endpoint.
                 if A.server.startswith("wss://"):
-                    fp = _peer_fp(ws)
                     if PIN:
+                        fp = _peer_fp(ws)
                         if fp != PIN:
                             print(f"[torch-worker] REFUSED: coordinator cert sha256:{fp} != pinned sha256:{PIN} — "
                                   f"possible MITM; not joining. Update MOREGPU_PIN if the coordinator cert rotated.")
                             await asyncio.sleep(5); continue
                         print(f"[torch-worker] coordinator TLS cert pinned OK · sha256:{fp[:16]}…")
-                    elif os.environ.get("MOREGPU_ALLOW_UNPINNED", "").lower() in ("1", "true", "yes", "on"):
-                        print(f"[torch-worker] !! MOREGPU_ALLOW_UNPINNED: wss:// with NO pin — coordinator cert "
-                              f"{('sha256:' + fp[:16] + '…') if fp else '(unavailable)'} is UNAUTHENTICATED. Local hacking only; never join a real pool this way.")
+                    elif _ALLOW_UNPINNED:
+                        fp = _peer_fp(ws)
+                        print(f"[torch-worker] !! MOREGPU_ALLOW_UNPINNED: wss:// with verification OFF and NO pin — "
+                              f"coordinator cert {('sha256:' + fp[:16] + '…') if fp else '(unavailable)'} is UNAUTHENTICATED. Local hacking only.")
                     else:
-                        # FAIL CLOSED (matches scripts/install.sh): a self-signed wss:// coordinator with no pin
-                        # cannot be authenticated, so we REFUSE before the join token / tenant key ever cross the
-                        # wire — otherwise a MITM that terminates TLS with its own cert would harvest them.
-                        print("[torch-worker] REFUSED: wss:// but no MOREGPU_PIN/--pin — will not send the join token to an "
-                              "unauthenticated coordinator (possible MITM). Copy MOREGPU_PIN from the coordinator's join "
-                              "banner, or set MOREGPU_ALLOW_UNPINNED=1 for LOCAL hacking only.")
-                        return
+                        print("[torch-worker] coordinator TLS cert is CA-trusted (system roots) — connected without a pin. "
+                              "For a SELF-SIGNED coordinator, set MOREGPU_PIN from its join banner to fingerprint-pin it.")
                 node = {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}
                 if PEER_TRANSPORT and _PEER_URL:  # advertise the peer endpoint so the coordinator can wire a direct ring
                     node["peer"] = {"url": _PEER_URL, "candidates": _PEER_CANDIDATES, "pub": PUBKEY_B64}
