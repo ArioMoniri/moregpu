@@ -98,6 +98,12 @@ jobs:
       - name: MoE expert parallelism — experts placed across nodes, forward == un-sharded MoE
         run: python3 tests/e2e/moe_expert_parity.py
 
+      - name: KV-over-peer + mixed-pipe — cached decode over the ring == golden, 0 relays
+        run: python3 tests/e2e/peer_kv.py
+
+      - name: MoE all-to-all over peer — expert dispatch worker->worker == golden, 0 relays
+        run: python3 tests/e2e/moe_peer.py
+
       - name: DiLoCo LoRA training — loss decreases + non-finite guard
         run: python3 tests/e2e/train_diloco.py
 

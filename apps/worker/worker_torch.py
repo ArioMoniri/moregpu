@@ -1115,38 +1115,50 @@ async def _run_stage(payload):
     return await _LOOP.run_in_executor(TORCH_POOL, _paced, shard_forward, (payload,), _CEIL[0], True)
 
 
-async def ring_send(sid, seq, epoch, out, want_logits):
-    """Seal+sign this stage's output and hand it to the successor over the peer WS — or, on the last stage,
-    deliver `complete` to the coordinator over the EXISTING control WS."""
+def _ring_last(r) -> bool:
+    """This stage is the pipe TAIL iff it has no successor AND its outgoing edge isn't a bridged relay hop."""
+    return r.get("succ") is None and not r.get("relay")
+
+
+async def ring_send(sid, seq, epoch, out, want_logits, cache=None):
+    """Hand this stage's output onward: a stage ERROR (or the pipe TAIL) delivers `complete` to the coordinator over
+    the control WS; a DIRECT edge seals+signs the hidden state to the successor's peer WS; a RELAY edge (mixed pipe)
+    BRIDGES the same sealed+signed frame through the coordinator, which routes it into the successor. `cache`, when
+    set, carries the KV session/pos so each stage runs its cached shard_forward over the ring (KV-over-peer)."""
     r = RING.get(sid)
-    if not r or r.get("succ") is None:                       # last stage → coordinator control WS
-        if out.get("ok") is False:
-            await _ctrl_send({"t": "complete", "sid": sid, "seq": seq, "epoch": epoch, "ok": False,
-                              "error": out.get("error")})
-        else:
-            frame = {"t": "complete", "sid": sid, "seq": seq, "epoch": epoch, "ok": True,
-                     "argmax": out.get("argmax")}
-            if out.get("logits") is not None:
-                frame["logits"] = out["logits"]
-            await _ctrl_send(frame)
+    if out.get("ok") is False:                               # any stage's error → straight to the coordinator
+        await _ctrl_send({"t": "complete", "sid": sid, "seq": seq, "epoch": epoch, "ok": False, "error": out.get("error")})
+        return
+    if not r or _ring_last(r):                               # pipe TAIL → coordinator control WS
+        frame = {"t": "complete", "sid": sid, "seq": seq, "epoch": epoch, "ok": True, "argmax": out.get("argmax")}
+        if out.get("logits") is not None:
+            frame["logits"] = out["logits"]
+        await _ctrl_send(frame)
         return
     sealed = seal(_KEY, json.dumps(out).encode())            # same seal() the coordinator uses — any tenant peer can open it
     sig = b64e(_sk.sign(f'{sid}|{seq}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
-    frame = {"t": "act", "sid": sid, "seq": seq, "epoch": epoch, "token": r["token"],
-             "sealed": sealed, "sig": sig, "return_logits": want_logits}
+    frame = {"sid": sid, "seq": seq, "epoch": epoch, "token": r["token"], "sealed": sealed, "sig": sig, "return_logits": want_logits}
+    if cache is not None:
+        frame.update(cached=True, session=cache["session"], pos=cache["pos"])
+    if r.get("relay"):                                       # RELAY edge → BRIDGE through the coordinator (it knows the successor)
+        frame["t"] = "bridge"; frame["from"] = NAME
+        await _ctrl_send(frame)
+        return
+    frame["t"] = "act"                                       # DIRECT edge → straight to the successor's peer listener
     try:
         if r.get("conn") is None:
             r["conn"] = await websockets.connect(r["succ"]["url"], max_size=None)
         await r["conn"].send(json.dumps(frame))
-    except Exception as e:                                    # peer unreachable mid-stream → let coordinator re-wire to relay
+    except Exception as e:                                    # peer unreachable mid-stream → let coordinator flip to bridge
         r["conn"] = None
         await _ctrl_send({"t": "edge_fault", "sid": sid, "seq": seq, "epoch": epoch,
-                          "succ": r["succ"]["id"], "error": str(e)})
+                          "succ": (r.get("succ") or {}).get("id"), "error": str(e)})
 
 
 async def _handle_act(m):
-    """Inbound activation from a predecessor: epoch/token fence → Ed25519 origin-verify → unseal → run this
-    stage's blocks → forward to the successor (or `complete` if last)."""
+    """Inbound activation from a predecessor (arriving over the peer WS, or via `bridge_in` from the coordinator on a
+    relay edge): epoch/token fence → Ed25519 origin-verify → unseal → run this stage's blocks (cached iff the frame
+    carries a KV session) → forward to the successor (or `complete` if this is the pipe tail)."""
     sid = m.get("sid"); r = RING.get(sid)
     if not r or m.get("epoch") != r.get("epoch") or m.get("token") != r.get("token"):
         return                                               # stale epoch / wrong ring token → drop
@@ -1156,15 +1168,18 @@ async def _handle_act(m):
     except Exception:
         print("[torch-worker] peer act: Ed25519 verify FAILED — dropping"); return
     inner = json.loads(unseal(_KEY, b).decode())             # {hidden, seq, hidden_dim}
-    last = r.get("succ") is None
-    payload = {"id": sid, "first": False, "last": last, "hidden": inner["hidden"], "seq": inner["seq"]}
+    payload = {"id": sid, "first": False, "last": _ring_last(r), "hidden": inner["hidden"], "seq": inner["seq"]}
+    cache = None
+    if m.get("cached"):                                      # KV-over-peer: run this stage's cached shard_forward
+        cache = {"session": m.get("session"), "pos": int(m.get("pos", 0))}
+        payload.update(cached=True, session=cache["session"], pos=cache["pos"])
     if m.get("return_logits"):
         payload["return_logits"] = True
     try:
         out = await _run_stage(payload)
     except Exception as e:
         out = {"ok": False, "error": str(e)}
-    await ring_send(sid, m["seq"], m["epoch"], out, m.get("return_logits"))
+    await ring_send(sid, m["seq"], m["epoch"], out, m.get("return_logits"), cache)
 
 
 async def _peer_handle(ws, *_):
@@ -1176,6 +1191,8 @@ async def _peer_handle(ws, *_):
                                           "sig": b64e(_sk.sign(m["nonce"].encode()))}))
             elif t == "act":
                 await _handle_act(m)
+            elif t == "moe_dispatch":                        # MoE peer: an expert dispatch from the backbone → run + reply
+                await _handle_moe_dispatch(ws, m)
         except Exception as e:
             print(f"[torch-worker] peer frame error: {e}")
 
@@ -1199,11 +1216,20 @@ async def _handle_ring_wire(m):
             await r["conn"].close()
         except Exception:
             pass
-    r.update(epoch=m["epoch"], token=m["token"], succ=m.get("succ"), conn=None)
+    r.update(epoch=m["epoch"], token=m["token"], succ=m.get("succ"), conn=None, relay=False)
     reachable = True
     if m.get("succ"):
         reachable = await _peer_probe(m["succ"]["url"], sid)
     await _ctrl_send({"t": "ring_ack", "reqId": m.get("reqId"), "sid": sid, "reachable": reachable})
+
+
+async def _handle_ring_mode(m):
+    """Coordinator's final verdict for this stage's OUTGOING edge (sent after the probe / on an edge fault): relay=True
+    → BRIDGE the hop through the coordinator (mixed pipe); relay=False → keep the direct peer hop. Arrives strictly
+    after the ring_wire ack, so it never races the wire handler."""
+    sid = m["sid"]; r = RING.setdefault(sid, {})
+    if m.get("epoch") == r.get("epoch"):
+        r["relay"] = bool(m.get("relay"))
 
 
 async def _handle_ring_pred(m):
@@ -1212,14 +1238,19 @@ async def _handle_ring_pred(m):
 
 
 async def _handle_inject(m):
-    """Stage 0 only: embed input_ids + run stage-0 blocks, then hand off to the successor. The coordinator is
-    now off the per-token data path until the last stage delivers `complete`."""
+    """Stage 0 only: embed input_ids + run stage-0 blocks (cached iff the frame carries a KV session), then hand off
+    to the successor (direct or bridged). The coordinator is now off the per-token data path until the tail delivers
+    `complete`."""
     sid = m.get("sid"); r = RING.get(sid)
     if not r or m.get("epoch") != r.get("epoch"):
         await _ctrl_send({"t": "complete", "sid": sid, "seq": m.get("seq"), "epoch": m.get("epoch"),
                           "ok": False, "error": "stage 0 not wired / epoch mismatch"})
         return
-    payload = {"id": sid, "first": True, "last": (r.get("succ") is None), "input_ids": m["input_ids"]}
+    payload = {"id": sid, "first": True, "last": _ring_last(r), "input_ids": m["input_ids"]}
+    cache = None
+    if m.get("cached"):                                      # KV-over-peer: prefill (pos 0) or a 1-token decode step
+        cache = {"session": m.get("session"), "pos": int(m.get("pos", 0))}
+        payload.update(cached=True, session=cache["session"], pos=cache["pos"])
     if m.get("return_logits"):
         payload["return_logits"] = True
     try:
@@ -1228,7 +1259,122 @@ async def _handle_inject(m):
         await _ctrl_send({"t": "complete", "sid": sid, "seq": m["seq"], "epoch": m["epoch"],
                           "ok": False, "error": str(e)})
         return
-    await ring_send(sid, m["seq"], m["epoch"], out, m.get("return_logits"))
+    await ring_send(sid, m["seq"], m["epoch"], out, m.get("return_logits"), cache)
+
+
+# ── PEER TRANSPORT (MoE all-to-all): the BACKBONE drives the whole forward and dispatches each layer's routed experts
+# DIRECTLY to their holder workers over the peer WS (sealed + Ed25519-signed), combining locally — so the coordinator
+# relays ZERO expert activations (it only injects + collects the final logits). Any peer failure → the backbone
+# reports `moe_complete ok:False` and the coordinator falls back to the unchanged relayed moePipe.
+MOE_WIRE: dict = {}     # sid -> BACKBONE side: {epoch, token, holders:[{id,url,pub,experts}], conns:{id:ws}}
+MOE_PEER: dict = {}     # sid -> HOLDER side:   {epoch, token, backbone_pub:bytes}
+
+
+async def _run_moe(fn, payload):
+    return await _LOOP.run_in_executor(TORCH_POOL, _paced, fn, (payload,), _CEIL[0], True)
+
+
+async def _moe_close_conns(mw):
+    for c in list(mw.get("conns", {}).values()):
+        try:
+            await c.close()
+        except Exception:
+            pass
+    mw["conns"] = {}
+
+
+async def _handle_moe_wire(m):
+    """BACKBONE: stash every holder's peer endpoint + probe reachability, ack so the coordinator picks peer vs relay."""
+    sid = m["sid"]
+    old = MOE_WIRE.get(sid)
+    if old:
+        await _moe_close_conns(old)
+    MOE_WIRE[sid] = {"epoch": m["epoch"], "token": m["token"], "holders": m["holders"], "conns": {}}
+    reachable = True
+    for h in m["holders"]:
+        if not await _peer_probe(h["url"], sid):
+            reachable = False; break
+    await _ctrl_send({"t": "moe_wire_ack", "reqId": m.get("reqId"), "sid": sid, "reachable": reachable})
+
+
+async def _handle_moe_wire_holder(m):
+    """HOLDER: stash the backbone's pubkey + ring token/epoch so it can origin-verify inbound dispatch frames."""
+    sid = m["sid"]
+    MOE_PEER[sid] = {"epoch": m["epoch"], "token": m["token"], "backbone_pub": b64d(m["backbone_pub"])}
+
+
+async def _moe_dispatch_to_holder(sid, L, epoch, token, seq, k, moe_in, topi, topw, experts, h, mw):
+    """BACKBONE→HOLDER over the peer WS: seal+sign the routed-FFN input + this holder's routed experts, await the
+    signed partial back, origin-verify it, and return the partial hidden. One persistent conn per holder."""
+    payload = {"layer": L, "seq": seq, "k": k, "hidden": moe_in, "topk_i": topi, "topk_w": topw, "experts": experts}
+    sealed = seal(_KEY, json.dumps(payload).encode())
+    sig = b64e(_sk.sign(f'{sid}|{L}|{epoch}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
+    frame = {"t": "moe_dispatch", "sid": sid, "layer": L, "epoch": epoch, "token": token, "sealed": sealed, "sig": sig}
+    conn = mw["conns"].get(h["id"])
+    if conn is None:
+        conn = await websockets.connect(h["url"], max_size=None); mw["conns"][h["id"]] = conn
+    await conn.send(json.dumps(frame))
+    resp = json.loads(await conn.recv())
+    if resp.get("t") != "moe_partial" or int(resp.get("layer", -1)) != L or resp.get("epoch") != epoch:
+        raise RuntimeError(f"bad moe_partial from holder {h['id']}")
+    b = resp["sealed"]; msg = f'{sid}|{L}|{epoch}|{b["iv"]}|{b["ct"]}'.encode()
+    Ed25519PublicKey.from_public_bytes(b64d(h["pub"])).verify(b64d(resp["sig"]), msg)  # origin-auth the holder
+    return json.loads(unseal(_KEY, b).decode())["partial"]
+
+
+async def _handle_moe_inject(m):
+    """BACKBONE: run one whole MoE forward — embed → per-layer (route locally → DISPATCH routed experts to holders
+    over peer, concurrently → COMBINE locally) → head — then deliver argmax/logits to the coordinator. Mirrors the
+    coordinator-relayed moePipe numerically; partials are summed in holder order (== ascending expert range)."""
+    sid = m["sid"]; epoch = m["epoch"]; seq_no = m["seq"]; mw = MOE_WIRE.get(sid)
+    if not mw or mw.get("epoch") != epoch:
+        await _ctrl_send({"t": "moe_complete", "sid": sid, "seq": seq_no, "epoch": epoch, "ok": False,
+                          "error": "backbone not wired / epoch mismatch"}); return
+    try:
+        bb = MOE_BB.get(sid)
+        if bb is None:
+            raise RuntimeError(f"moe backbone {sid} not loaded")
+        emb = await _run_moe(moe_embed, {"id": sid, "input_ids": m["input_ids"]})
+        hidden = emb["hidden"]; S = emb["seq"]; token = mw["token"]
+        for L in range(bb["n_layer"]):
+            rt = await _run_moe(moe_route, {"id": sid, "layer": L, "hidden": hidden, "seq": S})
+            moe_in = rt["moe_in"]; topi = rt["topk_i"]; topw = rt["topk_w"]; k = rt["k"]
+            used = set(topi)
+            tasks = []
+            for h in mw["holders"]:                          # holder order == ascending expert range → matches moe_apply's sum order
+                ru = [e for e in h["experts"] if e in used]
+                if not ru:
+                    continue
+                tasks.append(_moe_dispatch_to_holder(sid, L, epoch, token, S, k, moe_in, topi, topw, ru, h, mw))
+            partials = list(await asyncio.gather(*tasks)) if tasks else []   # gather preserves task (holder) order
+            ap = await _run_moe(moe_apply, {"id": sid, "layer": L, "attn_hidden": rt["attn_hidden"], "partials": partials, "seq": S})
+            hidden = ap["hidden"]
+        hd = await _run_moe(moe_head, {"id": sid, "hidden": hidden, "seq": S, "return_logits": m.get("return_logits")})
+        frame = {"t": "moe_complete", "sid": sid, "seq": seq_no, "epoch": epoch, "ok": True, "argmax": hd.get("argmax")}
+        if hd.get("logits") is not None:
+            frame["logits"] = hd["logits"]
+        await _ctrl_send(frame)
+    except Exception as e:                                   # a holder down / verify fail → coordinator falls back to relay
+        await _moe_close_conns(mw)
+        await _ctrl_send({"t": "moe_complete", "sid": sid, "seq": seq_no, "epoch": epoch, "ok": False, "error": str(e)})
+
+
+async def _handle_moe_dispatch(ws, m):
+    """HOLDER: an inbound dispatch from the backbone over the peer WS — epoch/token fence → Ed25519 origin-verify →
+    unseal → run expert_forward for this holder's routed experts → seal+sign the partial back on the same conn."""
+    sid = m.get("sid"); mp = MOE_PEER.get(sid); L = int(m.get("layer", -1)); epoch = m.get("epoch")
+    if not mp or epoch != mp.get("epoch") or m.get("token") != mp.get("token"):
+        return                                               # stale epoch / wrong token → drop
+    b = m["sealed"]; msg = f'{sid}|{L}|{epoch}|{b["iv"]}|{b["ct"]}'.encode()
+    try:
+        Ed25519PublicKey.from_public_bytes(mp["backbone_pub"]).verify(b64d(m["sig"]), msg)
+    except Exception:
+        print("[torch-worker] moe_dispatch: Ed25519 verify FAILED — dropping"); return
+    payload = json.loads(unseal(_KEY, b).decode()); payload["id"] = sid
+    out = await _run_moe(expert_forward, payload)
+    sealed = seal(_KEY, json.dumps({"partial": out["partial"]}).encode())
+    sig = b64e(_sk.sign(f'{sid}|{L}|{epoch}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
+    await ws.send(json.dumps({"t": "moe_partial", "sid": sid, "layer": L, "epoch": epoch, "sealed": sealed, "sig": sig}))
 
 
 async def run():
@@ -1337,7 +1483,7 @@ async def run():
                                 # RESUME (the coordinator re-streams only the missing bytes). A genuinely new
                                 # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
                                 resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); MOE_BB.clear(); MOE_EXPERTS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
-                                RING.clear()  # a fresh coordinator session re-wires the ring after (re)load
+                                RING.clear(); MOE_WIRE.clear(); MOE_PEER.clear()  # a fresh coordinator session re-wires the ring/mesh after (re)load
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":
                                 if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
@@ -1347,8 +1493,18 @@ async def run():
                                 spawn(_handle_ring_wire(m))
                             elif t == "ring_pred":  # PEER: coordinator hands this stage its predecessor's pubkey (origin auth)
                                 spawn(_handle_ring_pred(m))
+                            elif t == "ring_mode":  # PEER: coordinator's final edge verdict — direct hop vs bridge through it
+                                spawn(_handle_ring_mode(m))
                             elif t == "inject":     # PEER: coordinator kicks off a token at stage 0
                                 spawn(_handle_inject(m))
+                            elif t == "bridge_in":  # PEER (mixed pipe): a relay-edge activation routed in via the coordinator
+                                spawn(_handle_act(m))
+                            elif t == "moe_wire":   # PEER (MoE): backbone learns holder endpoints + probes them
+                                spawn(_handle_moe_wire(m))
+                            elif t == "moe_wire_holder":  # PEER (MoE): holder learns the backbone's pubkey (origin auth)
+                                spawn(_handle_moe_wire_holder(m))
+                            elif t == "moe_inject":  # PEER (MoE): coordinator kicks off a whole forward at the backbone
+                                spawn(_handle_moe_inject(m))
                             elif t == "uncache":
                                 resident.pop(m.get("id"), None)
                             elif t == "cache":
