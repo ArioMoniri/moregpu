@@ -80,6 +80,9 @@ jobs:
       - name: Churn-resume — mid-stream drop recovery (resume from staged bytes)
         run: python3 tests/fault/churn_resume.py
 
+      - name: Post-load failover — kill a stage mid-generation, re-place, output matches golden
+        run: python3 tests/fault/postload_failover.py
+
       - name: DiLoCo LoRA training — loss decreases + non-finite guard
         run: python3 tests/e2e/train_diloco.py
 

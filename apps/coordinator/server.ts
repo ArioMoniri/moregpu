@@ -271,8 +271,11 @@ function wireWorker(ws: WebSocket) {
     // forget any resident model / training session that lived here
     if (trainingHome === id) trainingHome = null;
     for (const [mid, wid] of modelHome) if (wid === id) modelHome.delete(mid);
-    // a pipeline stage that lived here breaks the whole pipe → drop any shard plan that used this worker
-    for (const [sid, plan] of shardPlans) if (plan.stages.some((s) => s.worker === id)) shardPlans.delete(sid);
+    // A pipeline stage that lived here breaks the LIVE request, but a POST-LOAD shard can be HEALED instead of nuked:
+    // KEEP the plan so the next shardPipe re-places this stage onto another torch worker (or waits for a reconnect).
+    // A still-LOADING plan (empty stages) is handled by the load path's own reconnect/resume, so this only affects
+    // READY plans — exactly the post-load failover case.
+    for (const [sid, plan] of shardPlans) if (plan.stages.some((s) => s.worker === id)) log('warn', `worker ${id} held a stage of ready shard ${sid} — will re-place on next forward`);
     log('info', `worker left: ${id} · fleet=${workers.size}`);
   };
   ws.onerror = () => log('warn', `socket error${id ? ' from ' + id : ''}`);
@@ -413,6 +416,10 @@ const shardLoads = new Map<string, ShardLoadState>();
 // pipes the hidden state stage→stage (only [seq×hidden] activations cross the wire, never the weights).
 interface ShardStage { worker: string; start: number; end: number; first: boolean; last: boolean }
 const shardPlans = new Map<string, { model: string; stages: ShardStage[] }>();
+// POST-LOAD failover keeps the download-free streaming inputs beside each ready plan, so ONE stage can be re-streamed
+// to a fresh worker without redoing the /model/shard preflight. push:false shards carry nulls. Lifecycle = shardPlans.
+type ShardStream = { model: string; push: boolean; configText: string | null; stPlan: STPlan | null };
+const shardStreams = new Map<string, ShardStream>();
 // Generous by default: model_load/train_load download & instantiate a model on the worker, which for a
 // heavy model or a slow link can far exceed 2min. Fine-tuning + big-model inference need this headroom.
 const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 600_000);
@@ -698,23 +705,110 @@ async function streamStageSafetensors(w: Worker, id: string, model: string, plan
 // is just the ONE new token (first stage) and the piped hidden is a single position — so decode stops re-running
 // the growing prefix (O(n) not O(n^2)). `pos` = tokens already cached; the stage rejects a pos mismatch (its KV was
 // lost to a reconnect → re-prefill needed). Uncached (no `cache`) is the original stateless full-sequence pipe.
-type ShardCache = { session: string; pos: number };
-async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean, cache?: ShardCache): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
+// `seq` is the FULL token sequence so far — carried so a POST-LOAD failover (a re-placed stage has no KV) can reset
+// the session and RE-PREFILL the whole sequence instead of feeding one token into an empty cache.
+type ShardCache = { session: string; pos: number; seq?: number[] };
+
+// (Re)stream ONE stage's slice to a worker and shard_load it. Shared by the INITIAL /model/shard load and the
+// POST-LOAD failover re-placement, so a single stage can be (re)streamed to a NEW worker through the same path.
+// `resume` keeps a worker's partial staging (a mid-stream drop on the SAME worker → re-stream only the tail); a fresh
+// replacement worker passes resume=false. Any error → {ok:false}. (Formerly the load path's `loadStage` closure.)
+async function streamStageToWorker(sid: string, model: string, push: boolean, configText: string | null, stPlan: STPlan | null, st: ShardStage, w: Worker, resume: boolean): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> {
+  if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last }); return { ...r, bytes: 0 }; }
+  try {
+    const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+    const sizes = (begin.data?.sizes ?? {}) as Record<string, number>;
+    if (resume && Number(sizes['model.safetensors']) > 0) log('info', `shard ${sid} stage ${st.worker}: resuming — ${(Number(sizes['model.safetensors']) / 1e6).toFixed(1)}MB already staged, streaming the rest`);
+    const budget = { left: PUSH_MAX_BYTES };
+    if (!(Number(sizes['config.json']) > 0)) {
+      const cb = new TextEncoder().encode(configText!);
+      const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
+    }
+    if (st.first) {
+      for (const f of ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja', 'generation_config.json']) {
+        if (Number(sizes[f]) > 0) continue;
+        const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
+      }
+    }
+    const names = stageTensors(stPlan!, st.start, st.end, st.first, st.last);
+    const bytes = await streamStageSafetensors(w, sid, model, stPlan!, names, budget, Number(sizes['model.safetensors']) || 0);
+    const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
+    return { ...r, bytes };
+  } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }
+}
+
+// POST-LOAD failover for ONE stage whose worker dropped after the shard was ready: re-place its layer range onto
+// another connected torch worker not already carrying a stage of this plan (or, if none free, bounded-wait for a
+// spare / the same id to reconnect), (re)stream it download-free via streamStageToWorker, and swap the worker in the
+// live plan. The caller (shardPipe) then restarts the forward on the healed plan.
+async function replaceStage(sid: string, failedIdx: number): Promise<{ ok: boolean; error?: string }> {
   const plan = shardPlans.get(sid);
   if (!plan || plan.stages.length === 0) return { ok: false, error: `shard ${sid} not loaded/ready` };
-  for (const st of plan.stages) if (!workers.has(st.worker)) return { ok: false, error: `stage worker ${st.worker} disconnected — re-shard with POST /model/shard`, disconnected: true };
-  let carry: Record<string, unknown> = {};
-  for (let i = 0; i < plan.stages.length; i++) {
-    const st = plan.stages[i]; const w = workers.get(st.worker)!;
-    const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
-    if (st.first) payload.input_ids = input_ids; else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
-    if (cache) { payload.cached = true; payload.session = cache.session; payload.pos = cache.pos; }
-    if (st.last && returnLogits) payload.return_logits = true;
-    const r = await modelRPC(w, 'shard_forward', payload);
-    if (!r.ok) return { ok: false, error: `shard_forward failed on ${st.worker} (stage ${i}, layers ${st.start}-${st.end}): ${r.error}` };
-    carry = r.data!;
+  const meta = shardStreams.get(sid);
+  if (!meta) return { ok: false, error: `shard ${sid}: no stream metadata — cannot re-place a stage (re-shard)` };
+  const st = plan.stages[failedIdx];
+  const others = new Set(plan.stages.filter((_, i) => i !== failedIdx).map((s) => s.worker));
+  const pick = () => torchWorkers().find((w) => !others.has(w.id));
+  let target = pick();
+  if (!target) {
+    log('info', `shard ${sid}: no spare torch worker for stage ${failedIdx} (layers ${st.start}-${st.end}) — waiting up to ${SHARD_RECONNECT_WAIT_MS}ms`);
+    const until = Date.now() + SHARD_RECONNECT_WAIT_MS;
+    while (!target && Date.now() < until && shardPlans.has(sid)) { await sleep(1500); target = pick(); }
   }
-  return { ok: true, data: carry };
+  if (!target) return { ok: false, error: `stage worker ${st.worker} (layers ${st.start}-${st.end}) gone and no torch worker to re-place it within ${SHARD_RECONNECT_WAIT_MS}ms` };
+  const old = workers.get(st.worker);
+  if (old && old.id !== target.id) await modelRPC(old, 'shard_unload', { id: sid }).catch(() => {});
+  const newStage: ShardStage = { worker: target.id, start: st.start, end: st.end, first: st.first, last: st.last };
+  const r = await streamStageToWorker(sid, meta.model, meta.push, meta.configText, meta.stPlan, newStage, target, false);
+  if (!r.ok) return { ok: false, error: `re-place stage ${failedIdx} (layers ${st.start}-${st.end}) onto ${target.id} failed: ${r.error}` };
+  const cur = shardPlans.get(sid); if (!cur) return { ok: false, error: `shard ${sid} unloaded during re-placement` };
+  cur.stages[failedIdx] = newStage;
+  log('info', `shard ${sid}: re-placed stage ${failedIdx} (layers ${st.start}-${st.end}) ${st.worker} → ${target.id} after post-load disconnect`);
+  return { ok: true };
+}
+
+async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean, cache?: ShardCache): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
+  let replaces = 0, healed = false;
+  for (;;) {
+    const plan = shardPlans.get(sid);
+    if (!plan || plan.stages.length === 0) return { ok: false, error: `shard ${sid} not loaded/ready` };
+    // 1) heal any stage whose worker already left, BEFORE firing an RPC into the void
+    const goneIdx = plan.stages.findIndex((s) => !workers.has(s.worker));
+    if (goneIdx >= 0) {
+      if (replaces++ >= SHARD_STAGE_TRIES) return { ok: false, error: `stage worker ${plan.stages[goneIdx].worker} disconnected; re-placement exhausted after ${replaces} tries`, disconnected: true };
+      const rr = await replaceStage(sid, goneIdx);
+      if (!rr.ok) return { ok: false, error: rr.error!, disconnected: true };
+      healed = true; continue; // plan changed → re-run from stage 0
+    }
+    // after a re-placement in CACHED mode the new stage has no KV → reset the session and re-prefill the FULL seq
+    // (a stateless pipe re-runs input_ids anyway; nothing to reset).
+    let ids = input_ids, epos = cache?.pos ?? 0;
+    if (healed && cache) { await shardReset(sid, cache.session); ids = cache.seq ?? input_ids; epos = 0; }
+    healed = false;
+    // 2) run the pipe stage → stage
+    let carry: Record<string, unknown> = {}; let failedIdx = -1, failErr = '';
+    for (let i = 0; i < plan.stages.length; i++) {
+      const st = plan.stages[i]; const w = workers.get(st.worker);
+      if (!w) { failedIdx = i; failErr = `stage worker ${st.worker} disconnected`; break; }
+      const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
+      if (st.first) payload.input_ids = ids; else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
+      if (cache) { payload.cached = true; payload.session = cache.session; payload.pos = epos; }
+      if (st.last && returnLogits) payload.return_logits = true;
+      const r = await modelRPC(w, 'shard_forward', payload);
+      if (!r.ok) {
+        // RPC failed: if the worker is GONE now (post-load churn) re-place + restart; a live worker's error is real.
+        if (!workers.has(st.worker)) { failedIdx = i; failErr = `shard_forward on ${st.worker} (stage ${i}) failed after disconnect: ${r.error}`; break; }
+        return { ok: false, error: `shard_forward failed on ${st.worker} (stage ${i}, layers ${st.start}-${st.end}): ${r.error}` };
+      }
+      carry = r.data!;
+    }
+    if (failedIdx < 0) return { ok: true, data: carry };
+    if (replaces++ >= SHARD_STAGE_TRIES) return { ok: false, error: `${failErr}; re-placement exhausted after ${replaces} tries`, disconnected: true };
+    log('warn', `shard ${sid}: ${failErr} — re-placing stage ${failedIdx} onto a spare and resuming generation`);
+    const rr = await replaceStage(sid, failedIdx);
+    if (!rr.ok) return { ok: false, error: rr.error!, disconnected: true };
+    healed = true; // loop → cached: reset+re-prefill; stateless: re-run input_ids
+  }
 }
 
 // Evict a shard's live KV on every stage (one session, or all sessions when `session` is omitted). Best-effort:
@@ -1318,7 +1412,7 @@ async function handler(req: Request): Promise<Response> {
     const sid = body.id ?? body.model;
     if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
     shardPlans.set(sid, { model: body.model, stages: [] }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
-    const fail = (msg: string, code: number) => { shardPlans.delete(sid); return json({ error: msg, id: sid }, code); };
+    const fail = (msg: string, code: number) => { shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: msg, id: sid }, code); };
     // DOWNLOAD-FREE: fetch config + the safetensors header ON THE COORDINATOR (no worker download), so the
     // fleet gets only its per-stage slice. Also gives the real layer count without a worker-side model_load.
     let configText: string | null = null, stPlan: STPlan | null = null, nLayer = 0;
@@ -1358,32 +1452,10 @@ async function handler(req: Request): Promise<Response> {
     const runLoad = async (): Promise<(ShardStage & { params_held?: number; bytes?: number })[]> => {
       const info: (ShardStage & { params_held?: number; bytes?: number })[] = [];
       const unloadAll = async () => { for (const d of info) { const dw = workers.get(d.worker); if (dw) await modelRPC(dw, 'shard_unload', { id: sid }).catch(() => {}); } };
-      // Stream ONE stage's slice to a worker. On `resume` (a retry after a mid-stream drop) push_begin keeps the
-      // partial staging and reports per-file sizes, so we skip files already fully staged and re-stream only the
-      // TAIL of model.safetensors — a churned stage makes progress across reconnects. Any error → {ok:false}.
-      const loadStage = async (st: ShardStage, w: Worker, resume: boolean): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> => {
-        if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last }); return { ...r, bytes: 0 }; }
-        try {
-          const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
-          const sizes = (begin.data?.sizes ?? {}) as Record<string, number>; // {} unless the worker resumed → all re-streamed
-          if (resume && Number(sizes['model.safetensors']) > 0) log('info', `shard ${sid} stage ${st.worker}: resuming — ${(Number(sizes['model.safetensors']) / 1e6).toFixed(1)}MB already staged, streaming the rest`);
-          const budget = { left: PUSH_MAX_BYTES };
-          if (!(Number(sizes['config.json']) > 0)) { // config is one chunk (last=true) → size>0 means fully staged
-            const cb = new TextEncoder().encode(configText!);
-            const cr = await modelRPC(w, 'push_chunk', { id: sid, name: 'config.json', seq: 0, data: b64e(cb), last: true }); if (!cr.ok) throw new Error(`push config: ${cr.error}`);
-          }
-          if (st.first) { // stream the tokenizer to the FIRST stage so a browser can chat this sharded model
-            for (const f of ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json', 'added_tokens.json', 'tokenizer.model', 'chat_template.jinja', 'generation_config.json']) {
-              if (Number(sizes[f]) > 0) continue; // already staged (the first stage is normally the stable/local one, so no partial-tokenizer risk)
-              const tr = await hfFetch(model, f); if (tr) await streamFileToWorker(w, sid, f, tr, budget);
-            }
-          }
-          const names = stageTensors(stPlan!, st.start, st.end, st.first, st.last);
-          const bytes = await streamStageSafetensors(w, sid, model, stPlan!, names, budget, Number(sizes['model.safetensors']) || 0);
-          const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
-          return { ...r, bytes };
-        } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }
-      };
+      // Stream ONE stage's slice to a worker (resume keeps a same-worker mid-stream drop's partial staging). The body
+      // now lives in the module-level streamStageToWorker, shared with the POST-LOAD failover re-placement path; this
+      // closure just binds this load's model/push/config/stPlan.
+      const loadStage = (st: ShardStage, w: Worker, resume: boolean) => streamStageToWorker(sid, model, push, configText, stPlan, st, w, resume);
       // Wait (bounded) for a churned-out stage worker to reconnect under the SAME id — the keepalive reconnect means
       // a transient tunnel/Colab blip no longer nukes a long load; we just re-stream that one stage.
       const waitForWorker = async (id: string): Promise<Worker | undefined> => {
@@ -1410,6 +1482,7 @@ async function handler(req: Request): Promise<Response> {
         if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); } // deadline fired → don't resurrect
       }
       if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); }
+      shardStreams.set(sid, { model, push, configText, stPlan }); // keep streaming inputs so a POST-LOAD failover can re-stream one stage to a fresh worker
       shardPlans.set(sid, { model, stages }); // finalize the reservation with the real plan (unblocks shard_forward)
       log('info', `sharded ${model} (${nLayer} layers) → ${nStages} stages${push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
       return info;
@@ -1427,14 +1500,14 @@ async function handler(req: Request): Promise<Response> {
         const s = shardLoads.get(sid);
         if (s && s.status === 'loading') {
           shardLoads.set(sid, { ...s, aborted: true, status: 'error', error: `shard load exceeded ${DEADLINE_MS}ms deadline (aborted)` });
-          shardPlans.delete(sid);
+          shardPlans.delete(sid); shardStreams.delete(sid);
           for (const st of stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }).catch(() => {}); }
           log('warn', `shard ${sid} load timed out after ${DEADLINE_MS}ms — aborted`);
         }
       }, DEADLINE_MS);
       runLoad()
         .then((info) => { clearTimeout(deadline); if (shardLoads.get(sid)?.aborted) return; shardLoads.set(sid, { status: 'ready', model, started, stagesDone: nStages, stagesTotal: nStages, info }); })
-        .catch((e) => { clearTimeout(deadline); if (shardLoads.get(sid)?.aborted) return; shardPlans.delete(sid); shardLoads.set(sid, { status: 'error', model, started, stagesDone: shardLoads.get(sid)?.stagesDone ?? 0, stagesTotal: nStages, error: e instanceof Error ? e.message : String(e) }); log('warn', `shard ${sid} failed: ${e instanceof Error ? e.message : e}`); });
+        .catch((e) => { clearTimeout(deadline); if (shardLoads.get(sid)?.aborted) return; shardPlans.delete(sid); shardStreams.delete(sid); shardLoads.set(sid, { status: 'error', model, started, stagesDone: shardLoads.get(sid)?.stagesDone ?? 0, stagesTotal: nStages, error: e instanceof Error ? e.message : String(e) }); log('warn', `shard ${sid} failed: ${e instanceof Error ? e.message : e}`); });
       return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages_total: nStages, status: 'loading', poll: `/model/shard_status?id=${encodeURIComponent(sid)}` });
     }
     try {
@@ -1457,7 +1530,7 @@ async function handler(req: Request): Promise<Response> {
     // cache step-by-step; omit it for the original stateless full-sequence forward.
     const cache = (body.cached && typeof body.session === 'string') ? { session: body.session, pos: Math.max(0, Math.floor(Number(body.pos ?? 0))) } : undefined;
     const out = await shardPipe(sid, body.input_ids, !!body.return_logits, cache);
-    if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
+    if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
     return json({ ok: true, id: sid, ...out.data });
   }
   // Coordinator-side pipelined GENERATE: run the whole greedy loop HERE (one client request), streaming one
@@ -1485,7 +1558,7 @@ async function handler(req: Request): Promise<Response> {
             // KV CACHE: k==0 PREFILLS the whole prompt (pos 0); every later step feeds ONLY the new token, and each
             // stage attends to its cached prefix — so decode no longer re-runs the growing sequence.
             const step = k === 0 ? seq.slice() : [seq[seq.length - 1]];
-            const out = await shardPipe(sid, step, false, { session, pos: k === 0 ? 0 : seq.length - 1 });
+            const out = await shardPipe(sid, step, false, { session, pos: k === 0 ? 0 : seq.length - 1, seq });
             if (!out.ok) { send({ error: out.error, at: k }); break; } // in-band terminal error (headers already sent → can't 502)
             const tok = Number(out.data.argmax); seq.push(tok);
             send({ token: tok, i: k, ms: Date.now() - t0 });
@@ -1506,7 +1579,7 @@ async function handler(req: Request): Promise<Response> {
     if (typeof body.prompt !== 'string' || !body.prompt.trim()) return json({ error: 'need {prompt}' }, 400);
     const plan = shardPlans.get(sid)!;
     const first = workers.get(plan.stages[0].worker);
-    if (!first) { shardPlans.delete(sid); return json({ error: 'first-stage worker disconnected — re-shard', id: sid }, 503); }
+    if (!first) { shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: 'first-stage worker disconnected — re-shard', id: sid }, 503); }
     const tk = await modelRPC(first, 'shard_tok', { id: sid, prompt: body.prompt.slice(0, 8000) });
     if (!tk.ok) return json({ error: `tokenize failed (re-shard — the tokenizer streams to the first stage): ${tk.error}` }, 502);
     const seq = (tk.data!.input_ids as number[]).slice();
@@ -1520,13 +1593,13 @@ async function handler(req: Request): Promise<Response> {
         // KV CACHE: prefill the whole prompt on step 0, then send ONLY the new token each step — the stages
         // attend to their cached prefix, so a sharded chat no longer re-runs the growing sequence per token.
         const step = k === 0 ? seq.slice() : [seq[seq.length - 1]];
-        const out = await shardPipe(sid, step, false, { session, pos: k === 0 ? 0 : seq.length - 1 });
+        const out = await shardPipe(sid, step, false, { session, pos: k === 0 ? 0 : seq.length - 1, seq });
         if (!out.ok) { piped = out; break; }
         const tok = Number(out.data.argmax); seq.push(tok);
         if (Number.isFinite(eos) && tok === eos) break;
       }
     } finally { await shardReset(sid, session); } // evict this request's live KV on every stage (also on error/return)
-    if (piped && !piped.ok) { if (piped.disconnected) shardPlans.delete(sid); return json({ error: piped.error, id: sid }, piped.disconnected ? 503 : 502); }
+    if (piped && !piped.ok) { if (piped.disconnected) shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: piped.error, id: sid }, piped.disconnected ? 503 : 502); }
     const newTokens = seq.slice(promptLen);
     const dt = await modelRPC(first, 'shard_detok', { id: sid, tokens: newTokens });
     if (!dt.ok) return json({ error: `decode failed: ${dt.error}` }, 502);
@@ -1546,7 +1619,7 @@ async function handler(req: Request): Promise<Response> {
     const sid = body.id ?? [...shardPlans.keys()][0];
     if (!sid || !shardPlans.has(sid)) return json({ error: 'no such sharded model' }, 404);
     const plan = shardPlans.get(sid)!;
-    shardPlans.delete(sid);
+    shardPlans.delete(sid); shardStreams.delete(sid);
     for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }); }
     log('info', `sharded model ${sid} unloaded (${plan.stages.length} stages)`);
     return json({ ok: true, id: sid, stages: plan.stages.length });
