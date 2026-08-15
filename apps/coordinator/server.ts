@@ -160,6 +160,7 @@ interface Worker {
   ceil: number; // the worker's reported/administered duty CEILING (distinct from the live effective duty)
   schedule?: string; // the machine's own contribution schedule ("always" / "idle-only" / "HH:MM-HH:MM")
   nick?: string; // optional admin-set display label
+  peer?: { url: string; pub: string }; // PEER TRANSPORT (opt-in): worker's LAN activation endpoint + pubkey, advertised at register
 }
 const workers = new Map<string, Worker>();
 const removedPubkeys = new Set<string>(); // workers an admin removed — refuse their re-registration (ban by key)
@@ -176,6 +177,10 @@ type ResultMsg = { ok: boolean; sealedOut?: { iv: string; ct: string }; error?: 
 interface Pending { resolve: (r: ResultMsg) => void; reject: (e: Error) => void; workerId: string; }
 const pending = new Map<string, Pending>();
 const SHARD_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_SHARD_TIMEOUT_MS') ?? 60_000);
+// PEER TRANSPORT (opt-in): when on, the coordinator wires a worker->worker activation ring after a shard loads
+// and routes an uncached shard_forward through it (coordinator off the per-token data path). Default OFF → the
+// relay path (shardPipe) is used unchanged. See docs/ROADMAP.md "Peer transport".
+const PEER_TRANSPORT = ['1', 'true', 'yes', 'on'].includes((Deno.env.get('MOREGPU_PEER_TRANSPORT') ?? '').toLowerCase());
 const MAX_SHARD_ATTEMPTS = Number(Deno.env.get('MOREGPU_MAX_SHARD_ATTEMPTS') ?? 3); // reassign a failed/timed-out shard to other workers
 const AUTO_PAUSE_ERRORS = Number(Deno.env.get('MOREGPU_AUTO_PAUSE_ERRORS') ?? 4); // consecutive HARD failures before a worker is auto-paused
 const AUTO_RESUME_BEATS = Number(Deno.env.get('MOREGPU_AUTO_RESUME_BEATS') ?? 3); // healthy heartbeats that auto-un-pause an errored worker
@@ -193,8 +198,12 @@ function wireWorker(ws: WebSocket) {
     if (m.t === 'register') {
       if (registered) return; // one register per socket
       if (!constEq(String(m.joinToken ?? ''), cfg.joinToken)) { ws.send(JSON.stringify({ t: 'denied', reason: 'bad join token' })); log('warn', 'worker rejected: bad join token'); ws.close(); return; }
-      const node = m.node as { id: string; backend: string; label: string; os: string };
+      const node = m.node as { id: string; backend: string; label: string; os: string; peer?: { url: string; pub: string } };
       const pubkeyB64 = typeof m.pubkey === 'string' ? m.pubkey : undefined;
+      // PEER TRANSPORT (opt-in): a peer-enabled worker advertises its LAN activation endpoint; only honoured when the
+      // coordinator itself has the flag on, and NEVER exposed publicly — it is handed only to same-tenant ring peers.
+      const peer = (PEER_TRANSPORT && node.peer && typeof node.peer.url === 'string' && typeof node.peer.pub === 'string')
+        ? { url: node.peer.url, pub: node.peer.pub } : undefined;
       // Ban list: an admin-removed worker (by key) may not re-enroll.
       if (pubkeyB64 && removedPubkeys.has(pubkeyB64)) { ws.send(JSON.stringify({ t: 'denied', reason: 'removed by admin' })); ws.close(); return; }
       const wantId = safeId(node.id); // sanitize (also prevents /metrics label injection)
@@ -204,7 +213,7 @@ function wireWorker(ws: WebSocket) {
       let pubkey: CryptoKey | undefined;
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null });
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, paused: false, pausedReason: null, peer });
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(TENANT_KEY), duty: DUTY_HINT }));
       log('info', `worker joined: ${id} (${safeId(node.label)}, ${safeId(node.os)})${pubkey ? ' · signed' : ''} · fleet=${workers.size}`);
       pumpQueue();
@@ -253,6 +262,32 @@ function wireWorker(ws: WebSocket) {
         signed = true;
       }
       p.resolve({ ok: m.ok as boolean, sealedOut: m.sealedOut as { iv: string; ct: string } | undefined, error: m.error as string | undefined, backend: m.backend as string | undefined, ms: m.ms as number | undefined, signed });
+    } else if (m.t === 'ring_ack') {
+      // PEER TRANSPORT: a stage answered ring_wire with its successor's reachability (direct vs relay for that edge).
+      if (!registered) return;
+      const e = pendingRingWire.get(String(m.reqId));
+      if (e && e.workerId === id) { pendingRingWire.delete(String(m.reqId)); e.resolve({ ok: true, reachable: !!m.reachable }); }
+    } else if (m.t === 'complete') {
+      // PEER TRANSPORT: the LAST stage delivered a finished token (sid,seq) directly — resolve the pending ring token.
+      if (!registered) return;
+      const ring = rings.get(String(m.sid));
+      if (!ring || ring.epoch !== m.epoch) return; // stale epoch (a torn/re-wired pipe) → ignore
+      const k = `${m.sid}|${m.seq}`, p = pendingRing.get(k);
+      if (!p) return;
+      pendingRing.delete(k);
+      const st = ringStats.get(String(m.sid)); if (st) st.completes++;
+      if (m.ok === false) p.reject(new Error(String(m.error ?? 'ring stage error')));
+      else p.resolve({ argmax: m.argmax as number, ...(m.logits != null ? { logits: m.logits } : {}) });
+    } else if (m.t === 'edge_fault') {
+      // PEER TRANSPORT: a direct edge died mid-token → flip it to relay so the NEXT token uses the relay fallback.
+      if (!registered) return;
+      const ring = rings.get(String(m.sid));
+      if (ring && m.epoch === ring.epoch) {
+        const e = ring.edges.find((x) => x.from === id);
+        if (e) e.mode = 'relay';
+        ring.allDirect = false;
+        log('warn', `ring ${m.sid}: edge ${id}→${m.succ} faulted (${m.error}) → relay; next token falls back to shardPipe`);
+      }
     }
   };
   ws.onclose = () => {
@@ -767,6 +802,81 @@ async function replaceStage(sid: string, failedIdx: number): Promise<{ ok: boole
   return { ok: true };
 }
 
+// ============================================================================
+// PEER TRANSPORT (opt-in via MOREGPU_PEER_TRANSPORT=1): take the coordinator OFF the per-token data path.
+// After a shard loads, wireRing hands each stage its successor's LAN endpoint + the predecessor's pubkey and
+// probes reachability. When every edge is `direct`, ringPipe injects stage 0 and awaits the last stage's
+// `complete` — the hidden state travels worker->worker (sealed with the shared tenant key, Ed25519-signed by the
+// predecessor), NEVER re-crossing the coordinator between stages. Any non-reachable edge (or a cached/KV request)
+// falls back to the unchanged relay path (shardPipe). Reuses shardPlans/ShardStage, TENANT_KEY (via the workers'
+// own seal), each worker's registered pubkey, tokenB64url, and the existing control WS.
+interface RingEdge { from: string; to: string; mode: 'direct' | 'relay' }
+interface Ring { sid: string; epoch: number; edges: RingEdge[]; token: string; allDirect: boolean }
+const rings = new Map<string, Ring>();
+const pendingRing = new Map<string, { resolve: (r: unknown) => void; reject: (e: Error) => void }>(); // `${sid}|${seq}` → token promise
+const pendingRingWire = new Map<string, { workerId: string; resolve: (r: { ok: boolean; reachable?: boolean }) => void }>();
+const ringStats = new Map<string, { injects: number; completes: number; shardForwards: number }>(); // per-sid proof counters
+let ringSeq = 0;
+const ringStat = (sid: string) => { let s = ringStats.get(sid); if (!s) { s = { injects: 0, completes: 0, shardForwards: 0 }; ringStats.set(sid, s); } return s; };
+
+// Send a stage its successor endpoint + ring token and await its reachability ack (a control-WS RPC, NOT a relay).
+function ringWireRPC(w: Worker, payload: Record<string, unknown>): Promise<{ ok: boolean; reachable?: boolean }> {
+  const reqId = tokenB64url(12);
+  return new Promise((resolve) => {
+    const to = setTimeout(() => { if (pendingRingWire.delete(reqId)) resolve({ ok: false }); }, 8000);
+    pendingRingWire.set(reqId, { workerId: w.id, resolve: (r) => { clearTimeout(to); resolve(r); } });
+    try { w.ws.send(JSON.stringify({ ...payload, t: 'ring_wire', reqId })); }
+    catch { clearTimeout(to); pendingRingWire.delete(reqId); resolve({ ok: false }); }
+  });
+}
+
+// Wire (or re-wire) the peer ring for a ready shard. Called after a load finalizes (and after an edge_fault re-wire).
+async function wireRing(sid: string): Promise<Ring | null> {
+  const plan = shardPlans.get(sid);
+  if (!plan || plan.stages.length === 0) return null;
+  const ws = plan.stages.map((s) => workers.get(s.worker));
+  if (ws.some((w) => !w)) return null; // a stage worker is gone → leave it to shardPipe's re-placement
+  const epoch = Date.now(), token = tokenB64url(18), edges: RingEdge[] = [];
+  let allDirect = plan.stages.length > 1 && ws.every((w) => !!w!.peer); // a single-stage pipe has no peer hop to win
+  for (let i = 0; i < plan.stages.length; i++) {
+    const cur = ws[i]!, suc = i + 1 < plan.stages.length ? ws[i + 1]! : null, pre = i > 0 ? ws[i - 1]! : null;
+    if (!cur.peer) { allDirect = false; continue; }
+    const succEndpoint = suc && suc.peer ? { id: suc.id, url: suc.peer.url, pub: suc.peer.pub } : null;
+    const ack = await ringWireRPC(cur, { sid, epoch, token, succ: succEndpoint });
+    const reachable = ack.ok && !!ack.reachable;
+    if (pre && pre.peer) { try { cur.ws.send(JSON.stringify({ t: 'ring_pred', sid, epoch, pred_pub: pre.peer.pub })); } catch { /* dropped socket → shardPipe covers it */ } }
+    if (suc) { const mode: RingEdge['mode'] = (succEndpoint && reachable) ? 'direct' : 'relay'; edges.push({ from: cur.id, to: suc.id, mode }); if (mode !== 'direct') allDirect = false; }
+  }
+  const ring: Ring = { sid, epoch, edges, token, allDirect };
+  rings.set(sid, ring); ringStat(sid);
+  log('info', `ring ${sid}: ${edges.map((e) => `${e.from}→${e.to}[${e.mode}]`).join(' ') || '(single stage)'} · ${allDirect ? 'DIRECT peer path' : 'relay fallback'}`);
+  return ring;
+}
+
+// Run ONE forward over the peer ring: inject stage 0, await the last stage's `complete`. Falls back to the
+// unchanged relay path (shardPipe) when peer transport is off, no direct ring is wired, a KV/cache step is
+// requested (KV-over-peer is out of scope for this increment), or a stage worker has dropped.
+async function ringPipe(sid: string, input_ids: number[], returnLogits: boolean, cache?: ShardCache): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
+  const plan = shardPlans.get(sid), ring = rings.get(sid);
+  if (!PEER_TRANSPORT || !plan || !ring || !ring.allDirect || cache) return shardPipe(sid, input_ids, returnLogits, cache);
+  // A stage worker dropped after wiring → hand THIS token to shardPipe, which re-places the stage (post-load
+  // failover) and relays it. The peer ring is left stale (relay from here) until the shard is re-loaded/re-wired.
+  for (const st of plan.stages) if (!workers.has(st.worker)) return shardPipe(sid, input_ids, returnLogits, cache);
+  const st0 = workers.get(plan.stages[0].worker)!;
+  const seq = ++ringSeq, key = `${sid}|${seq}`, stats = ringStat(sid);
+  const done = new Promise((resolve, reject) => pendingRing.set(key, { resolve, reject }));
+  const to = setTimeout(() => { const p = pendingRing.get(key); if (p) { pendingRing.delete(key); p.reject(new Error('ring token timeout — re-issue')); } }, SHARD_TIMEOUT_MS);
+  try { st0.ws.send(JSON.stringify({ t: 'inject', sid, seq, epoch: ring.epoch, token: ring.token, input_ids, return_logits: returnLogits })); stats.injects++; }
+  catch (e) { clearTimeout(to); pendingRing.delete(key); return { ok: false, error: `inject send failed on ${st0.id}: ${e instanceof Error ? e.message : e}` }; }
+  try { const data = await done as Record<string, unknown>; clearTimeout(to); return { ok: true, data }; }
+  catch (e) {
+    clearTimeout(to);
+    const r2 = rings.get(sid);
+    if (r2 && !r2.allDirect) { log('warn', `ring ${sid}: ${(e as Error).message} — falling back to relay for this token`); return shardPipe(sid, input_ids, returnLogits, cache); }
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
 async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean, cache?: ShardCache): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string; disconnected?: boolean }> {
   let replaces = 0, healed = false;
   for (;;) {
@@ -794,6 +904,7 @@ async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean
       if (st.first) payload.input_ids = ids; else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
       if (cache) { payload.cached = true; payload.session = cache.session; payload.pos = epos; }
       if (st.last && returnLogits) payload.return_logits = true;
+      ringStat(sid).shardForwards++; // PEER-TRANSPORT proof counter: one per-token activation RELAYED through the coordinator
       const r = await modelRPC(w, 'shard_forward', payload);
       if (!r.ok) {
         // RPC failed: if the worker is GONE now (post-load churn) re-place + restart; a live worker's error is real.
@@ -1400,6 +1511,16 @@ async function handler(req: Request): Promise<Response> {
     if (!s) return json({ status: shardPlans.get(id)?.stages.length ? 'ready' : 'unknown', id });
     return json({ status: s.status, id, model: s.model, stages_done: s.stagesDone, stages_total: s.stagesTotal, elapsed_ms: Date.now() - s.started, ...(s.error ? { error: s.error } : {}), ...(s.status === 'ready' && s.info ? { stages: s.info } : {}) });
   }
+  // PEER TRANSPORT introspection: the ring wiring + the proof counters. `shard_forwards` is how many per-token
+  // activations were RELAYED through the coordinator for this shard; on the direct peer path it stays flat while
+  // `injects`/`completes` climb — the observable evidence that the coordinator is off the per-token data path.
+  if (req.method === 'GET' && url.pathname === '/model/ring_stats') {
+    const id = url.searchParams.get('id') ?? [...rings.keys()].pop() ?? [...shardPlans.keys()][0];
+    if (!id) return json({ enabled: PEER_TRANSPORT, wired: false });
+    const ring = rings.get(id), st = ringStats.get(id) ?? { injects: 0, completes: 0, shardForwards: 0 };
+    return json({ enabled: PEER_TRANSPORT, id, wired: !!ring, all_direct: ring?.allDirect ?? false, epoch: ring?.epoch,
+      edges: ring?.edges ?? [], injects: st.injects, completes: st.completes, shard_forwards: st.shardForwards });
+  }
   if (req.method === 'POST' && url.pathname === '/model/shard') {
     const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean; async?: boolean };
     if (!body.model) return json({ error: 'need {model} (GPT-2 / Llama-family)' }, 400);
@@ -1485,6 +1606,7 @@ async function handler(req: Request): Promise<Response> {
       shardStreams.set(sid, { model, push, configText, stPlan }); // keep streaming inputs so a POST-LOAD failover can re-stream one stage to a fresh worker
       shardPlans.set(sid, { model, stages }); // finalize the reservation with the real plan (unblocks shard_forward)
       log('info', `sharded ${model} (${nLayer} layers) → ${nStages} stages${push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
+      if (PEER_TRANSPORT) { try { await wireRing(sid); } catch (e) { log('warn', `ring wiring failed for ${sid}: ${e instanceof Error ? e.message : e}`); } } // opt-in: wire the worker->worker ring (relay stays the fallback)
       return info;
     };
     if (body.async) {
@@ -1529,7 +1651,9 @@ async function handler(req: Request): Promise<Response> {
     // decode step feeds only the ONE new token in input_ids). Lets a client (or the parity test) drive the
     // cache step-by-step; omit it for the original stateless full-sequence forward.
     const cache = (body.cached && typeof body.session === 'string') ? { session: body.session, pos: Math.max(0, Math.floor(Number(body.pos ?? 0))) } : undefined;
-    const out = await shardPipe(sid, body.input_ids, !!body.return_logits, cache);
+    // PEER TRANSPORT (opt-in): an uncached forward goes worker->worker via ringPipe (coordinator off the data path);
+    // ringPipe itself falls back to shardPipe when no direct ring is wired or a cache step is requested.
+    const out = PEER_TRANSPORT ? await ringPipe(sid, body.input_ids, !!body.return_logits, cache) : await shardPipe(sid, body.input_ids, !!body.return_logits, cache);
     if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
     return json({ ok: true, id: sid, ...out.data });
   }
@@ -1619,7 +1743,7 @@ async function handler(req: Request): Promise<Response> {
     const sid = body.id ?? [...shardPlans.keys()][0];
     if (!sid || !shardPlans.has(sid)) return json({ error: 'no such sharded model' }, 404);
     const plan = shardPlans.get(sid)!;
-    shardPlans.delete(sid); shardStreams.delete(sid);
+    shardPlans.delete(sid); shardStreams.delete(sid); rings.delete(sid); ringStats.delete(sid); // drop any peer ring too
     for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }); }
     log('info', `sharded model ${sid} unloaded (${plan.stages.length} stages)`);
     return json({ ok: true, id: sid, stages: plan.stages.length });

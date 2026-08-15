@@ -20,12 +20,12 @@ cache{id,sealed}→cached{id,ok} ; uncache{id} ; control{...} ; ~4s heartbeat. P
 sealed with the tenant key; every result is Ed25519-signed over `${shardId}|${iv}|${ct}`.
 """
 from __future__ import annotations
-import argparse, asyncio, base64, json, os, platform, time
+import argparse, asyncio, base64, json, os, platform, socket, time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import torch.nn as nn
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import websockets
@@ -49,6 +49,9 @@ NAME = A.name
 
 _sk = Ed25519PrivateKey.generate()
 PUBKEY_B64 = base64.b64encode(_sk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+
+# OPT-IN peer worker->worker activation transport (default OFF → relay path is unchanged). See docs/ROADMAP.md.
+PEER_TRANSPORT = os.environ.get("MOREGPU_PEER_TRANSPORT", "").lower() in ("1", "true", "yes", "on")
 
 def b64e(b: bytes) -> str: return base64.b64encode(b).decode()
 def b64d(s: str) -> bytes: return base64.b64decode(s)
@@ -818,8 +821,190 @@ def model_dispatch(op: str, payload: dict) -> dict:
     if op == "shard_unload": _push_cleanup(payload.get("id")); SHARDS.pop(payload.get("id"), None); SHARD_TOKS.pop(payload.get("id"), None); _kv_drop(payload.get("id")); _empty_cache(); return {"ok": True}
     raise ValueError(f"unknown model op {op}")
 
+# ============================================================================
+# PROTOTYPE: LAN-only worker->worker peer activation transport (OPT-IN).
+# Enabled only when MOREGPU_PEER_TRANSPORT=1. Adjacent pipeline stages hand the sealed
+# hidden state DIRECTLY to their successor over a small LAN WebSocket listener instead of
+# round-tripping every per-token activation through the coordinator. Reuses seal()/unseal()
+# + the shared tenant key (confidentiality) and _sk / sign scheme (Ed25519 origin auth) — no
+# new crypto. The coordinator stays the control-plane + weight source: it wires the ring,
+# injects stage 0, and collects the last stage's `complete`. See docs/ROADMAP.md "Peer
+# transport". LAN-ONLY caveat: the advertised URL is a raw LAN IPv4 — no STUN/TURN/NAT
+# traversal; a segmented/NAT'd edge fails the probe and the coordinator keeps it on relay.
+# ============================================================================
+RING: dict = {}         # sid -> {epoch, token, succ:{id,url,pub}|None, pred_pub:bytes|None, conn}
+_KEY = None             # tenant key (set from `welcome`; the SAME key the coordinator hands every worker)
+_CEIL = [0.6]           # current duty ceiling, shared with the async peer handlers
+_LOOP = None            # the worker's asyncio loop (run_in_executor from peer handlers)
+_CTRL_SEND = [None]     # bound ws_send of the LIVE control connection (for complete/edge_fault frames)
+_PEER_URL = None        # ws://<lan-ip>:<port>/peer advertised to same-tenant peers at register
+_PEER_SERVER = None
+
+
+def _lan_ip() -> str:
+    """Best-effort primary LAN IPv4 (no packets are actually sent). MOREGPU_PEER_HOST overrides it
+    (set 127.0.0.1 for a single-host test). This is the honest LAN caveat — a raw subnet address."""
+    override = os.environ.get("MOREGPU_PEER_HOST")
+    if override:
+        return override
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9)); return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+async def _ctrl_send(obj):
+    fn = _CTRL_SEND[0]
+    if fn is None:
+        return
+    try:
+        await fn(obj)
+    except Exception as e:
+        print(f"[torch-worker] peer ctrl send failed: {e}")
+
+
+async def _peer_probe(url: str, sid) -> bool:
+    """Reachability probe: dial the successor's listener, expect a signed peer_pong. Success → the coordinator
+    marks this edge `direct`; any failure (refused/timeout/isolation) → the coordinator keeps it on relay."""
+    try:
+        async with websockets.connect(url, open_timeout=3) as ws:
+            n = b64e(os.urandom(12))
+            await ws.send(json.dumps({"t": "peer_ping", "sid": sid, "nonce": n}))
+            p = json.loads(await asyncio.wait_for(ws.recv(), 3))
+            return p.get("nonce") == n
+    except Exception:
+        return False
+
+
+async def _run_stage(payload):
+    return await _LOOP.run_in_executor(TORCH_POOL, _paced, shard_forward, (payload,), _CEIL[0], True)
+
+
+async def ring_send(sid, seq, epoch, out, want_logits):
+    """Seal+sign this stage's output and hand it to the successor over the peer WS — or, on the last stage,
+    deliver `complete` to the coordinator over the EXISTING control WS."""
+    r = RING.get(sid)
+    if not r or r.get("succ") is None:                       # last stage → coordinator control WS
+        if out.get("ok") is False:
+            await _ctrl_send({"t": "complete", "sid": sid, "seq": seq, "epoch": epoch, "ok": False,
+                              "error": out.get("error")})
+        else:
+            frame = {"t": "complete", "sid": sid, "seq": seq, "epoch": epoch, "ok": True,
+                     "argmax": out.get("argmax")}
+            if out.get("logits") is not None:
+                frame["logits"] = out["logits"]
+            await _ctrl_send(frame)
+        return
+    sealed = seal(_KEY, json.dumps(out).encode())            # same seal() the coordinator uses — any tenant peer can open it
+    sig = b64e(_sk.sign(f'{sid}|{seq}|{sealed["iv"]}|{sealed["ct"]}'.encode()))
+    frame = {"t": "act", "sid": sid, "seq": seq, "epoch": epoch, "token": r["token"],
+             "sealed": sealed, "sig": sig, "return_logits": want_logits}
+    try:
+        if r.get("conn") is None:
+            r["conn"] = await websockets.connect(r["succ"]["url"], max_size=None)
+        await r["conn"].send(json.dumps(frame))
+    except Exception as e:                                    # peer unreachable mid-stream → let coordinator re-wire to relay
+        r["conn"] = None
+        await _ctrl_send({"t": "edge_fault", "sid": sid, "seq": seq, "epoch": epoch,
+                          "succ": r["succ"]["id"], "error": str(e)})
+
+
+async def _handle_act(m):
+    """Inbound activation from a predecessor: epoch/token fence → Ed25519 origin-verify → unseal → run this
+    stage's blocks → forward to the successor (or `complete` if last)."""
+    sid = m.get("sid"); r = RING.get(sid)
+    if not r or m.get("epoch") != r.get("epoch") or m.get("token") != r.get("token"):
+        return                                               # stale epoch / wrong ring token → drop
+    b = m["sealed"]; msg = f'{sid}|{m["seq"]}|{b["iv"]}|{b["ct"]}'.encode()
+    try:
+        Ed25519PublicKey.from_public_bytes(r["pred_pub"]).verify(b64d(m["sig"]), msg)
+    except Exception:
+        print("[torch-worker] peer act: Ed25519 verify FAILED — dropping"); return
+    inner = json.loads(unseal(_KEY, b).decode())             # {hidden, seq, hidden_dim}
+    last = r.get("succ") is None
+    payload = {"id": sid, "first": False, "last": last, "hidden": inner["hidden"], "seq": inner["seq"]}
+    if m.get("return_logits"):
+        payload["return_logits"] = True
+    try:
+        out = await _run_stage(payload)
+    except Exception as e:
+        out = {"ok": False, "error": str(e)}
+    await ring_send(sid, m["seq"], m["epoch"], out, m.get("return_logits"))
+
+
+async def _peer_handle(ws, *_):
+    async for raw in ws:
+        try:
+            m = json.loads(raw); t = m.get("t")
+            if t == "peer_ping":                             # reachability probe → signed pong
+                await ws.send(json.dumps({"t": "peer_pong", "nonce": m["nonce"],
+                                          "sig": b64e(_sk.sign(m["nonce"].encode()))}))
+            elif t == "act":
+                await _handle_act(m)
+        except Exception as e:
+            print(f"[torch-worker] peer frame error: {e}")
+
+
+async def _start_peer_listener():
+    global _PEER_URL, _PEER_SERVER
+    port = int(os.environ.get("MOREGPU_PEER_PORT", "0") or "0")
+    _PEER_SERVER = await websockets.serve(_peer_handle, "0.0.0.0", port, max_size=None)
+    socks = getattr(_PEER_SERVER, "sockets", None) or getattr(getattr(_PEER_SERVER, "server", None), "sockets", None)
+    bound = socks[0].getsockname()[1]
+    _PEER_URL = f"ws://{_lan_ip()}:{bound}/peer"
+    print(f"[torch-worker] peer transport ON — listening {_PEER_URL}")
+
+
+async def _handle_ring_wire(m):
+    """Coordinator wires this stage: stash successor endpoint + ring token/epoch, probe the successor, ack back
+    with reachability so the coordinator can pick `direct` vs `relay` for this edge."""
+    sid = m["sid"]; r = RING.setdefault(sid, {})
+    if r.get("conn") is not None:
+        try:
+            await r["conn"].close()
+        except Exception:
+            pass
+    r.update(epoch=m["epoch"], token=m["token"], succ=m.get("succ"), conn=None)
+    reachable = True
+    if m.get("succ"):
+        reachable = await _peer_probe(m["succ"]["url"], sid)
+    await _ctrl_send({"t": "ring_ack", "reqId": m.get("reqId"), "sid": sid, "reachable": reachable})
+
+
+async def _handle_ring_pred(m):
+    sid = m["sid"]; r = RING.setdefault(sid, {})
+    r["pred_pub"] = b64d(m["pred_pub"]); r["epoch"] = m.get("epoch", r.get("epoch"))
+
+
+async def _handle_inject(m):
+    """Stage 0 only: embed input_ids + run stage-0 blocks, then hand off to the successor. The coordinator is
+    now off the per-token data path until the last stage delivers `complete`."""
+    sid = m.get("sid"); r = RING.get(sid)
+    if not r or m.get("epoch") != r.get("epoch"):
+        await _ctrl_send({"t": "complete", "sid": sid, "seq": m.get("seq"), "epoch": m.get("epoch"),
+                          "ok": False, "error": "stage 0 not wired / epoch mismatch"})
+        return
+    payload = {"id": sid, "first": True, "last": (r.get("succ") is None), "input_ids": m["input_ids"]}
+    if m.get("return_logits"):
+        payload["return_logits"] = True
+    try:
+        out = await _run_stage(payload)
+    except Exception as e:
+        await _ctrl_send({"t": "complete", "sid": sid, "seq": m["seq"], "epoch": m["epoch"],
+                          "ok": False, "error": str(e)})
+        return
+    await ring_send(sid, m["seq"], m["epoch"], out, m.get("return_logits"))
+
+
 async def run():
+    global _LOOP, _KEY
     loop = asyncio.get_event_loop()
+    _LOOP = loop
+    if PEER_TRANSPORT:
+        await _start_peer_listener()
     paused = False; pause_reason = ""; ceil = 0.6
     while True:
         try:
@@ -831,8 +1016,10 @@ async def run():
                 ping_timeout=float(os.environ.get("MOREGPU_WS_PING_TIMEOUT", "90")),
                 close_timeout=10,
             ) as ws:
-                await ws.send(json.dumps({"t": "register", "joinToken": A.token, "pubkey": PUBKEY_B64,
-                                          "node": {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}}))
+                node = {"id": NAME, "backend": NODE_BACKEND, "label": BACKEND, "os": platform.system().lower()}
+                if PEER_TRANSPORT and _PEER_URL:  # advertise the peer endpoint so the coordinator can wire a direct ring
+                    node["peer"] = {"url": _PEER_URL, "pub": PUBKEY_B64}
+                await ws.send(json.dumps({"t": "register", "joinToken": A.token, "pubkey": PUBKEY_B64, "node": node}))
                 key = None
                 # websockets requires writes to be serialized, and handlers now run concurrently (below), so
                 # every send goes through this lock.
@@ -841,6 +1028,7 @@ async def run():
                 async def ws_send(obj):
                     async with send_lock:
                         await ws.send(json.dumps(obj))
+                _CTRL_SEND[0] = ws_send  # peer handlers deliver complete/edge_fault over the live control WS
                 def spawn(coro):
                     # Dispatch a handler OFF the read loop so one long generate/train can't head-of-line-block
                     # frame reception or heartbeats. Compute still funnels through the single-thread TORCH_POOL,
@@ -910,17 +1098,25 @@ async def run():
                                 print(f"[torch-worker] rejected: {reason} — retrying in 5s"); await asyncio.sleep(5); break
                             elif t == "welcome":
                                 key = b64d(m["tenantKeyB64"]); ceil = float(m.get("duty", 0.6))
+                                _KEY = key; _CEIL[0] = ceil  # peer handlers seal/unseal with the same tenant key
                                 # fresh session: the coordinator forgets our resident state on disconnect, so a
                                 # reconnecting worker starts clean too (no stale models/weights pinned in VRAM).
                                 # KEEP in-progress PUSH staging, though: a stage that dropped mid-stream can then
                                 # RESUME (the coordinator re-streams only the missing bytes). A genuinely new
                                 # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
                                 resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
+                                RING.clear()  # a fresh coordinator session re-wires the ring after (re)load
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}%")
                             elif t == "control":
                                 if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
-                                if "ceil" in m and m["ceil"] is not None: ceil = float(m["ceil"])
+                                if "ceil" in m and m["ceil"] is not None: ceil = float(m["ceil"]); _CEIL[0] = ceil
                                 print(f"[torch-worker] admin control → {'PAUSED' if paused else 'active'} · ceiling {int(ceil*100)}%")
+                            elif t == "ring_wire":  # PEER: coordinator hands this stage its successor endpoint + probes reachability
+                                spawn(_handle_ring_wire(m))
+                            elif t == "ring_pred":  # PEER: coordinator hands this stage its predecessor's pubkey (origin auth)
+                                spawn(_handle_ring_pred(m))
+                            elif t == "inject":     # PEER: coordinator kicks off a token at stage 0
+                                spawn(_handle_inject(m))
                             elif t == "uncache":
                                 resident.pop(m.get("id"), None)
                             elif t == "cache":

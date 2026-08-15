@@ -92,6 +92,9 @@ jobs:
       - name: Fake-WS fleet scale — 150 no-torch nodes, connect storm + churn, control plane holds
         run: python3 tests/scale/fake_fleet.py
 
+      - name: Peer transport (opt-in) — worker->worker handoff == golden, 0 coordinator relays
+        run: python3 tests/e2e/peer_transport.py
+
       - name: DiLoCo LoRA training — loss decreases + non-finite guard
         run: python3 tests/e2e/train_diloco.py
 
