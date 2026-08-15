@@ -343,10 +343,23 @@ MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
   python3 examples/llm_shard.py            # GPT-2 split 6+6 across 2 workers; exact match, activations-only on the wire
 ```
 
-**Honest scope:** the torch worker makes small models fast, LoRA fine-tunes (single-worker *and*
-distributed via DiLoCo), and pipeline-shards a model across workers (GPT-2-family, exact match). Not built:
-**async DiLoCo**, **cross-tenant secure aggregation**, non-GPT-2 sharding, and int8/tensor-core speed.
-Training is verified out-of-band (a seeded reference), not by the coordinator's exact-match check, since a
+**Honest scope:** the torch worker runs small models fast, LoRA fine-tunes (single-worker *and* distributed via
+DiLoCo), and **pipeline-shards a model across machines download-free** — the coordinator streams each worker only
+its layer slice (GPT-2 **and** Llama-family: Llama / Qwen / SmolLM / TinyLlama; **single-file and multi-file**
+checkpoints), exact-match vs the un-sharded model, and a worker that drops mid-stream **resumes** from where it left
+off. Only activations cross the wire per token.
+
+**Multi-machine / multi-infrastructure.** Because it's *download-free*, **only the admin holds weights on disk** —
+every worker computes on a streamed slice and keeps nothing. So a fleet can be any mix of machines and backends
+(CUDA + MPS + CPU) across several boxes or notebook sessions; verified live with a second GPU box **and** a Mac both
+joining one admin having **downloaded nothing**. This is a LAN / real-network technique: on a fast link a stage
+streams in seconds; a slow, churning link (e.g. a free cross-cloud tunnel) can stall it — resume helps but can't beat
+a link that keeps dropping. See **Roadmap** below for what's next.
+
+**Not built yet:** a **KV cache** on the shard path (sharded decode re-runs the growing sequence — O(n²)),
+**post-load fault tolerance** (a node dropping *after* load breaks the live request), coordinator-off-the-data-path
+**peer transport**, **MoE expert parallelism**, async DiLoCo, cross-tenant secure aggregation, and int8/tensor-core
+speed. Training is verified out-of-band (a seeded reference), not by the coordinator's exact-match check, since a
 stochastic loss can't be CPU-verified.
 
 </details>
