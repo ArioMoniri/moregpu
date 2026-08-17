@@ -291,7 +291,18 @@ def train_load(cfg: dict) -> dict:
     # Free the previous training model BEFORE allocating the replacement so we never transiently hold two
     # full models in VRAM (a single global TRAIN slot; loading first would double-allocate).
     TRAIN.update(model=None, opt=None, trainable={}); _empty_cache()
-    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV)
+    if cfg.get("push"):
+        # DOWNLOAD-FREE TRAINING: the coordinator streamed the base (config + safetensors + tokenizer) into
+        # PUSH[id]'s staging dir, so THIS worker never touches the HF hub — it fine-tunes a model it never
+        # downloaded. Load fp32 from the staged files (LoRA needs an fp32 base for stable AdamW), then drop
+        # staging. This is what lets a no-download node (e.g. a laptop worker) join distributed fine-tuning.
+        st = PUSH.get(cfg.get("id"))
+        if st is None:
+            raise RuntimeError("training weights not staged — the coordinator must push the base before a push train_load")
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV)
+        _push_cleanup(cfg.get("id"))
+    else:
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV)
     if cfg.get("no_dropout"):  # deterministic training (e.g. DiLoCo) → reproducible against a reference
         for mod in model.modules():
             if isinstance(mod, nn.Dropout):

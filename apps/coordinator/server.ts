@@ -742,7 +742,10 @@ async function streamFileToWorker(w: Worker, id: string, name: string, resp: Res
   return total;
 }
 
-async function pushModelToWorker(w: Worker, model: string, id: string, fp16: boolean): Promise<Record<string, unknown>> {
+// finalize=true (default): push_end assembles a RESIDENT serving model + drops staging. finalize=false: stage
+// the files ONLY and leave them for the caller's own loader (download-free TRAINING reads the staged dir in
+// train_load, then cleans up) — the difference between "serve this" and "fine-tune this without downloading".
+async function pushModelToWorker(w: Worker, model: string, id: string, fp16: boolean, finalize = true): Promise<Record<string, unknown>> {
   if (!HF_REPO_RE.test(model)) throw new Error(`bad model ref "${model}" — expected an HF repo id like "gpt2" or "Qwen/Qwen2.5-0.5B"`);
   const guard = `${w.id}:${id}`;
   if (pushInFlight.has(guard)) throw new Error(`a download-free push for "${id}" is already in progress on ${w.id} — wait for it to finish`);
@@ -779,7 +782,8 @@ async function pushModelToWorker(w: Worker, model: string, id: string, fp16: boo
         bytes += await streamFileToWorker(w, id, f, resp, budget); sentWeights++;
       }
       if (sentWeights === 0) throw new Error(`${model}: no weight files found`);
-      log('info', `weight-push ${model} → ${w.id}: streamed ${(bytes / 1e6).toFixed(1)} MB (${weightFiles.length} shard(s)), assembling…`);
+      log('info', `weight-push ${model} → ${w.id}: streamed ${(bytes / 1e6).toFixed(1)} MB (${weightFiles.length} shard(s))${finalize ? ', assembling…' : ' (staged for training)'}`);
+      if (!finalize) return { staged: true, id, bytes };  // stage-only: the caller (train_load push) loads the staged dir
       const end = await modelRPC(w, 'push_end', { id, model, fp16 });
       if (!end.ok) throw new Error(`push_end failed: ${end.error}`);
       return end.data ?? {};
@@ -1644,8 +1648,9 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   //   POST /train/step  { input_ids:[...], labels?:[...], lr? }  → { loss, step }
   //   POST /train/adapter                                        → { step, tensors:{name:{data,shape}} }
   if (req.method === 'POST' && url.pathname === '/train/load') {
-    const body = await req.json().catch(() => ({})) as { model?: string; worker?: string; rank?: number; alpha?: number; lr?: number; seed?: number; targets?: string[]; force?: boolean };
+    const body = await req.json().catch(() => ({})) as { model?: string; worker?: string; rank?: number; alpha?: number; lr?: number; seed?: number; targets?: string[]; force?: boolean; push?: boolean };
     if (!body.model) return json({ error: 'need {model}' }, 400);
+    if (body.push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for a download-free training push` }, 400);
     // refuse to clobber a live single-worker session unless {force:true} (would silently reset its adapter/optimizer/step)
     if (trainingHome && workers.has(trainingHome) && !body.force) return json({ error: `a training session is already live on ${trainingHome} — pass {force:true} to replace it`, worker: trainingHome }, 409);
     const cands = torchWorkers();
@@ -1656,7 +1661,13 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     // once. TODO(review): full fix is to key training sessions by id on the worker; this guard prevents the
     // silent cross-session corruption until then.
     if (diloco && diloco.workers.includes(w.id)) return json({ error: `worker ${w.id} is part of a live DiLoCo group — it shares the single global TRAIN slot, so it can't also host a /train session; unload the DiLoCo group or pick another worker`, worker: w.id }, 409);
-    const r = await trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets });
+    // DOWNLOAD-FREE: stage the base on the worker (fp32 for LoRA) WITHOUT push_end, so train_load reads the
+    // staged dir and this worker never touches the hub — a no-download node can fine-tune.
+    if (body.push) {
+      try { await pushModelToWorker(w, body.model, body.model, false, false); }
+      catch (e) { return json({ error: `download-free training push failed: ${e instanceof Error ? e.message : e}` }, 502); }
+    }
+    const r = await trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets, push: body.push, id: body.model });
     if (!r.ok) return json({ error: r.error }, 502);
     trainingHome = w.id;
     log('info', `train session loaded ${body.model} on ${w.id} · trainable=${r.data?.trainable_params}`);

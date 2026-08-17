@@ -81,11 +81,13 @@ class Pool:
         w = self._req("/workers")
         return w if isinstance(w, list) else []
 
-    def train_load(self, model, rank=8, alpha=16, lr=1e-3, seed=0):
+    def train_load(self, model, rank=8, alpha=16, lr=1e-3, seed=0, push=False):
         # force: a fresh `finetune` replaces any prior session (the user asked to fine-tune THIS now).
+        # push: download-free — the coordinator streams the base so THIS worker never touches HF (a
+        # no-download node can fine-tune). Needs a model.safetensors on HF.
         return self._req("/train/load", "POST",
                          {"model": model, "rank": rank, "alpha": alpha, "lr": lr, "seed": seed,
-                          "targets": TARGETS, "force": True})
+                          "targets": TARGETS, "force": True, "push": push})
 
     def train_step(self, ids):
         return self._req("/train/step", "POST", {"input_ids": list(ids), "labels": list(ids)})
@@ -211,7 +213,7 @@ def cmd_finetune(args) -> int:
     print(f"== fine-tune {args.model} ==  data: {src}  ·  {len(ids)} tokens  ·  "
           f"{args.steps} steps × window {args.window}  ·  rank {args.rank}", flush=True)
 
-    info = pool.train_load(args.model, rank=args.rank, alpha=args.alpha, lr=args.lr, seed=0)
+    info = pool.train_load(args.model, rank=args.rank, alpha=args.alpha, lr=args.lr, seed=0, push=args.push)
     if not info.get("ok"):
         sys.exit(f"train/load failed: {info.get('error', info)}")
     print(f"   loaded on {info.get('worker', '?')} · trainable params "
@@ -324,6 +326,8 @@ def main(argv=None) -> int:
     f.add_argument("--lr", type=float, default=1e-3)
     f.add_argument("--out", help="where to save the adapter (default <model>-lora.json)")
     f.add_argument("--sample", help="a prompt to show before/after the fine-tune")
+    f.add_argument("--push", action="store_true", help="download-free: the coordinator streams the base to the "
+                   "worker, so a no-download node (e.g. a laptop worker) fine-tunes a model it never fetched")
     f.set_defaults(fn=cmd_finetune)
 
     g = sub.add_parser("generate", help="run the model and print its continuation")

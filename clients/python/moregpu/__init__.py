@@ -179,14 +179,19 @@ class MoreGPU:
 
     # ---- on-pool fine-tuning (needs a native torch worker; the whole train step runs locally on it) ----
     def train_load(self, model: str, rank: int = 8, alpha: float = 16, lr: float = 1e-3,
-                   seed: int = 0, targets: Sequence[str] | None = None, worker: str | None = None) -> dict:
+                   seed: int = 0, targets: Sequence[str] | None = None, worker: str | None = None,
+                   push: bool = False) -> dict:
         """Pin `model` on a torch worker, freeze it, attach a LoRA adapter (the only trainable tensor).
-        Requires a worker started via `apps/worker/worker_torch.py`; WebGPU workers cannot train."""
+        Requires a worker started via `apps/worker/worker_torch.py`; WebGPU workers cannot train.
+        push=True → DOWNLOAD-FREE: the coordinator streams the base to the worker, which never touches the HF
+        hub — so a no-download node (e.g. a laptop worker on a tunnel) can fine-tune a model it never fetched."""
         body: dict[str, Any] = {"model": model, "rank": rank, "alpha": alpha, "lr": lr, "seed": seed}
         if targets:
             body["targets"] = list(targets)
         if worker:
             body["worker"] = worker
+        if push:
+            body["push"] = True
         return self._req("/train/load", "POST", body)
 
     def train_step(self, input_ids: Sequence[int], labels: Sequence[int] | None = None, lr: float | None = None) -> dict:
