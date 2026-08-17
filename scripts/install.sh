@@ -185,34 +185,37 @@ CERT_FILE=""
 case "$SERVER" in
   wss://*)
     if [ -z "$PIN" ]; then
-      echo "[moregpu] ERROR: $SERVER is wss:// but no MOREGPU_PIN was given — a self-signed coordinator cert"
-      echo "          cannot be trusted without its pinned fingerprint. Copy MOREGPU_PIN from the coordinator's"
-      echo "          join banner, or use MOREGPU_SERVER=ws://… with the coordinator started MOREGPU_INSECURE=1."
-      exit 1
+      # No pin → trust the SYSTEM CA store (parity with the torch worker's ssl.create_default_context). Leaving
+      # CERT_FILE empty means no DENO_CERT, so Deno's WebSocket does normal CA verification: a real-cert coordinator
+      # (a tunnel like trycloudflare, or Let's Encrypt behind a reverse proxy) validates and connects; a SELF-SIGNED
+      # coordinator FAILS the handshake (fail-closed) — copy MOREGPU_PIN from its join banner to pin that.
+      echo "[moregpu] wss:// with no MOREGPU_PIN — trusting the system CA store (works for a real-cert tunnel;"
+      echo "          a self-signed coordinator will fail the TLS handshake — copy MOREGPU_PIN from its banner for that)."
+    else
+      base="${SERVER#wss://}"; base="${base%/ws}"; base="${base%/}"
+      CERT_URL="https://${base}/cert.pem"
+      echo "[moregpu] fetching coordinator TLS cert ($CERT_URL) to pin against sha256:${PIN}…"
+      # -k: the fetch itself is unauthenticated; the sha256==PIN check below is what makes it trustworthy.
+      if ! curl -fsSLk "$CERT_URL" -o "$MG_DIR/moregpu-cert.pem.new"; then
+        echo "[moregpu] ERROR: could not fetch $CERT_URL — is the coordinator reachable and serving TLS?"; exit 1
+      fi
+      GOT_FP="$(CERTF="$MG_DIR/moregpu-cert.pem.new" "$DENO_BIN" eval '
+        const pem = await Deno.readTextFile(Deno.env.get("CERTF"));
+        const m = pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+        if (!m) { console.error("no CERTIFICATE block in fetched PEM"); Deno.exit(2); }
+        const der = Uint8Array.from(atob(m[1].replace(/\s+/g, "")), (c) => c.charCodeAt(0));
+        const dig = new Uint8Array(await crypto.subtle.digest("SHA-256", der));
+        console.log([...dig].map((x) => x.toString(16).padStart(2, "0")).join(""));
+      ' 2>/dev/null)"
+      if [ "$GOT_FP" != "$PIN" ]; then
+        echo "[moregpu] ERROR: coordinator cert fingerprint sha256:${GOT_FP:-<none>} != pinned sha256:${PIN}"
+        echo "          REFUSING to join (possible MITM, or the coordinator cert rotated — re-copy MOREGPU_PIN)."
+        rm -f "$MG_DIR/moregpu-cert.pem.new"; exit 1
+      fi
+      mv "$MG_DIR/moregpu-cert.pem.new" "$MG_DIR/moregpu-cert.pem"
+      CERT_FILE="$MG_DIR/moregpu-cert.pem"
+      echo "[moregpu] coordinator TLS cert pinned OK · sha256:$(printf '%s' "$PIN" | cut -c1-16)… — trusting via DENO_CERT"
     fi
-    base="${SERVER#wss://}"; base="${base%/ws}"; base="${base%/}"
-    CERT_URL="https://${base}/cert.pem"
-    echo "[moregpu] fetching coordinator TLS cert ($CERT_URL) to pin against sha256:${PIN}…"
-    # -k: the fetch itself is unauthenticated; the sha256==PIN check below is what makes it trustworthy.
-    if ! curl -fsSLk "$CERT_URL" -o "$MG_DIR/moregpu-cert.pem.new"; then
-      echo "[moregpu] ERROR: could not fetch $CERT_URL — is the coordinator reachable and serving TLS?"; exit 1
-    fi
-    GOT_FP="$(CERTF="$MG_DIR/moregpu-cert.pem.new" "$DENO_BIN" eval '
-      const pem = await Deno.readTextFile(Deno.env.get("CERTF"));
-      const m = pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
-      if (!m) { console.error("no CERTIFICATE block in fetched PEM"); Deno.exit(2); }
-      const der = Uint8Array.from(atob(m[1].replace(/\s+/g, "")), (c) => c.charCodeAt(0));
-      const dig = new Uint8Array(await crypto.subtle.digest("SHA-256", der));
-      console.log([...dig].map((x) => x.toString(16).padStart(2, "0")).join(""));
-    ' 2>/dev/null)"
-    if [ "$GOT_FP" != "$PIN" ]; then
-      echo "[moregpu] ERROR: coordinator cert fingerprint sha256:${GOT_FP:-<none>} != pinned sha256:${PIN}"
-      echo "          REFUSING to join (possible MITM, or the coordinator cert rotated — re-copy MOREGPU_PIN)."
-      rm -f "$MG_DIR/moregpu-cert.pem.new"; exit 1
-    fi
-    mv "$MG_DIR/moregpu-cert.pem.new" "$MG_DIR/moregpu-cert.pem"
-    CERT_FILE="$MG_DIR/moregpu-cert.pem"
-    echo "[moregpu] coordinator TLS cert pinned OK · sha256:$(printf '%s' "$PIN" | cut -c1-16)… — trusting via DENO_CERT"
     ;;
 esac
 

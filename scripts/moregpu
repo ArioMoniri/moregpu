@@ -115,12 +115,66 @@ mg_ctl()  { # <worker-id> <json-body> — POST an admin control frame
     -H "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}" -H 'content-type: application/json' -d "$2"; echo
 }
 
+# serve, with optional --host (advertise a reachable name) and --tunnel (auto-expose over a real-cert tunnel so
+# REMOTE machines can join with NO pin — the whole no-code "start a pool anyone can join" path in one command).
+cmd_serve() {
+  need_deno
+  local host="" tunnel=0; local pass=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) host="$2"; shift 2 ;;
+      --host=*) host="${1#--host=}"; shift ;;
+      --tunnel) tunnel=1; shift ;;
+      --port) export PORT="$2"; shift 2 ;;
+      --port=*) export PORT="${1#--port=}"; shift ;;
+      *) pass+=("$1"); shift ;;
+    esac
+  done
+  [ -n "$host" ] && export MOREGPU_HOST="$host"
+  local port="${PORT:-8787}"
+  if [ "$tunnel" != "1" ]; then
+    exec deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys "$SERVER_TS" ${pass[@]+"${pass[@]}"}
+  fi
+  local tun=""
+  command -v cloudflared >/dev/null 2>&1 && tun=cloudflared
+  [ -z "$tun" ] && command -v ngrok >/dev/null 2>&1 && tun=ngrok
+  [ -z "$tun" ] && { echo "[moregpu] --tunnel needs cloudflared (preferred) or ngrok on PATH." >&2
+    echo "           macOS: brew install cloudflared  ·  Linux: https://developers.cloudflare.com/cloudflared/" >&2; exit 1; }
+  local cfg="${MOREGPU_CONFIG:-./.moregpu-server.json}"
+  echo "[moregpu] starting coordinator behind $tun on :$port (plaintext ws:// — the tunnel terminates TLS)…"
+  MOREGPU_INSECURE=1 MOREGPU_BIND=127.0.0.1 PORT="$port" MOREGPU_CONFIG="$cfg" \
+    deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys "$SERVER_TS" --worker ${pass[@]+"${pass[@]}"} &
+  local coord=$! i
+  for i in $(seq 1 60); do curl -fsS "http://localhost:$port/health" >/dev/null 2>&1 && break; sleep 0.5; done
+  local tlog; tlog="$(mktemp)"
+  if [ "$tun" = cloudflared ]; then cloudflared tunnel --url "http://localhost:$port" --no-autoupdate >"$tlog" 2>&1 &
+  else ngrok http "$port" --log=stdout >"$tlog" 2>&1 & fi
+  local tunpid=$! url=""
+  for i in $(seq 1 40); do
+    url="$(grep -oE 'https://[a-z0-9._-]+\.(trycloudflare\.com|ngrok[-a-z.]*)' "$tlog" 2>/dev/null | head -1)"
+    [ -n "$url" ] && break; sleep 1
+  done
+  trap "kill $coord $tunpid 2>/dev/null; rm -f $tlog; exit 0" INT TERM
+  [ -z "$url" ] && { echo "[moregpu] tunnel did not come up — see $tlog" >&2; wait "$coord"; return; }
+  local join; join="$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$cfg')).joinToken)" 2>/dev/null)"
+  local wss="${url/https:/wss:}"
+  echo ""
+  echo "  ============================================================================"
+  echo "  MoreGPU pool is LIVE behind a tunnel — public URL: $url"
+  echo "  Add a worker on ANY machine (no pin — the tunnel presents a real cert):"
+  echo "     curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVER=$wss/ws MOREGPU_TOKEN=$join sh"
+  echo "  Dashboard: open $url   (admin token is in $cfg)"
+  echo "  Ctrl-C to stop the pool + tunnel."
+  echo "  ============================================================================"
+  wait "$coord"
+}
+
 cmd="${1:-__menu__}"; [ $# -gt 0 ] && shift || true
 
 case "$cmd" in
   __menu__) if [ -t 0 ] && [ -t 1 ]; then interactive_menu; else "$0" help; fi ;;
 
-  serve)   need_deno; exec deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys "$SERVER_TS" "$@" ;;
+  serve)   cmd_serve "$@" ;;
   join)    need_deno; exec deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
   install) exec sh -c "curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVICE=1 sh" ;;
 
@@ -172,7 +226,11 @@ case "$cmd" in
     banner
     cat <<EOF
   RUN A POOL
-    moregpu serve [--worker] [--port N]        run the admin server (prints the setup wizard)
+    moregpu serve [--worker] [--tunnel] [--host H] [--port N]
+                                               run the admin server (prints the setup wizard)
+                                               --tunnel: auto-expose over cloudflared/ngrok so REMOTE machines
+                                                         join with no pin (prints the ready worker one-liner)
+                                               --host H: advertise a reachable hostname/IP (not localhost)
     moregpu join --server wss://HOST:8787/ws --token TOK [--cpu] [--schedule 22:00-07:00]
     moregpu isolate --server … --token …       Linux: run pinned to bounded, isolated hardware
     moregpu install | stop | status | logs     the local worker service
