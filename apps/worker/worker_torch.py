@@ -197,6 +197,14 @@ def _empty_cache():
     except Exception:
         pass
 
+def _load_dtype(cfg: dict) -> torch.dtype:
+    """The dtype to load a (shard / MoE) model in. fp16 halves VRAM+bandwidth on a GPU worker — the difference
+    between a real MoE / big model fitting the fleet or not — but there is NO half matmul kernel on CPU
+    ("not implemented for 'Half'"), so a CPU worker stays fp32. Activations still cross the wire as fp32
+    (f32_to_b64); each forward casts the incoming hidden to this dtype at the boundary. Default fp32 → the
+    exact-match parity path is byte-for-byte unchanged."""
+    return torch.float16 if (bool(cfg.get("fp16")) and DEV != "cpu") else torch.float32
+
 def _check_ids(vocab, *seqs):
     """Reject out-of-range token ids BEFORE the embedding lookup — an out-of-vocab index is a device-side
     assert on CUDA that poisons the whole process context (bricks TORCH_POOL), so fail cleanly instead."""
@@ -683,10 +691,10 @@ def shard_load(cfg: dict) -> dict:
         # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
         # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     arch = _shard_arch(model)
     mc = model.config
     # REJECT sliding-window / mixed-attention models: a middle stage recomputes ONE full-causal mask for all its
@@ -744,6 +752,7 @@ def shard_load(cfg: dict) -> dict:
         SHARDS.pop(next(iter(SHARDS)), None)
     del base, model
     _empty_cache()
+    shard["dtype"] = _load_dtype(cfg)  # fp16 (GPU) or fp32; shard_forward casts the piped-in fp32 hidden to this
     SHARDS[sid] = shard
     tok_ok = False
     if first:
@@ -802,7 +811,8 @@ def shard_forward(payload: dict) -> dict:
             seq = ids.shape[1]
         else:
             seq = int(payload["seq"])
-            h = b64_to_t(payload["hidden"]).reshape(1, seq, hidden_dim).to(DEV)
+            # the wire carries fp32 activations; cast to THIS stage's dtype (fp16 on a GPU worker) before its layers
+            h = b64_to_t(payload["hidden"]).reshape(1, seq, hidden_dim).to(DEV).to(shard.get("dtype", torch.float32))
         # absolute positions of THIS call's tokens: [past_len .. past_len+seq). For an uncached call past_len==0,
         # so cache_position == arange(seq) and every path below reduces to the original stateless numerics.
         cache_position = torch.arange(past_len, past_len + seq, dtype=torch.long, device=DEV)
@@ -956,9 +966,9 @@ def moe_backbone_load(cfg: dict) -> dict:
         # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE (model.layers + rotary_emb), got {type(model).__name__}")
     _require_indexable_experts(model)
@@ -978,7 +988,8 @@ def moe_backbone_load(cfg: dict) -> dict:
         MOE_BB.pop(next(iter(MOE_BB)), None)
     MOE_BB[sid] = {"model": model, "mm": mm, "layers": mm.layers, "proxies": proxies, "config": mc,
                    "n_layer": int(mc.num_hidden_layers), "hidden": int(mc.hidden_size), "vocab": int(mc.vocab_size),
-                   "n_experts": n_experts, "topk": topk, "norm_topk": bool(getattr(mc, "norm_topk_prob", False))}
+                   "n_experts": n_experts, "topk": topk, "norm_topk": bool(getattr(mc, "norm_topk_prob", False)),
+                   "dtype": _load_dtype(cfg)}  # fp16 (GPU) or fp32; moe_route/moe_head cast the piped-in fp32 hidden to this
     if cfg.get("push"):
         _push_cleanup(sid)
     _empty_cache()
@@ -1004,9 +1015,9 @@ def expert_load(cfg: dict) -> dict:
         # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32, low_cpu_mem_usage=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE, got {type(model).__name__}")
     _require_indexable_experts(model)
@@ -1021,7 +1032,7 @@ def expert_load(cfg: dict) -> dict:
     if len(MOE_EXPERTS) >= MAX_RESIDENT_MODELS:
         MOE_EXPERTS.pop(next(iter(MOE_EXPERTS)), None)
     params = sum(p.numel() for m in kept.values() for p in m.parameters())
-    MOE_EXPERTS[sid] = {"H": int(mc.hidden_size), "experts": kept, "ids": experts}
+    MOE_EXPERTS[sid] = {"H": int(mc.hidden_size), "experts": kept, "ids": experts, "dtype": _load_dtype(cfg)}
     del model, mm  # our `kept` references keep only the resident experts alive; the rest (attn/embed/other experts) is freed
     if cfg.get("push"):
         _push_cleanup(sid)
@@ -1056,7 +1067,7 @@ def moe_route(payload: dict) -> dict:
     from transformers.masking_utils import create_causal_mask
     import inspect
     with torch.no_grad():
-        h = b64_to_t(payload["hidden"]).reshape(1, seq, H).to(DEV)
+        h = b64_to_t(payload["hidden"]).reshape(1, seq, H).to(DEV).to(bb.get("dtype", torch.float32))  # wire is fp32 → backbone dtype
         cache_position = torch.arange(0, seq, dtype=torch.long, device=DEV)
         position_ids = cache_position.unsqueeze(0)
         pos_emb = mm.rotary_emb(h, position_ids)  # (cos, sin) — depends only on positions + head_dim
@@ -1090,10 +1101,11 @@ def expert_forward(payload: dict) -> dict:
     H = st["H"]; kept = st["experts"]
     L = int(payload["layer"]); seq = int(payload["seq"]); k = int(payload["k"])
     experts = sorted(int(e) for e in payload["experts"])
+    edt = st.get("dtype", torch.float32)  # this holder's expert dtype (fp16 on a GPU worker) — cast the fp32 wire in
     with torch.no_grad():
-        moe_in = b64_to_t(payload["hidden"]).reshape(seq, H).to(DEV)
+        moe_in = b64_to_t(payload["hidden"]).reshape(seq, H).to(DEV).to(edt)
         topi = torch.tensor(payload["topk_i"], dtype=torch.long, device=DEV).reshape(seq, k)
-        topw = b64_to_t(payload["topk_w"]).reshape(seq, k).to(DEV)
+        topw = b64_to_t(payload["topk_w"]).reshape(seq, k).to(DEV).to(edt)
         partial = torch.zeros(seq, H, dtype=moe_in.dtype, device=DEV)
         for E in experts:
             mod = kept.get((L, E))
@@ -1124,7 +1136,7 @@ def moe_head(payload: dict) -> dict:
     """BACKBONE: final RMSNorm + LM head on the last layer's hidden → last-token argmax (+ optional logits)."""
     bb = _moe_bb(payload["id"]); H = bb["hidden"]; seq = int(payload["seq"])
     with torch.no_grad():
-        h = b64_to_t(payload["hidden"]).reshape(1, seq, H).to(DEV)
+        h = b64_to_t(payload["hidden"]).reshape(1, seq, H).to(DEV).to(bb.get("dtype", torch.float32))  # wire fp32 → backbone dtype
         h = bb["mm"].norm(h)
         logits = bb["model"].lm_head(h)[0, -1].float()
         res = {"ok": True, "argmax": int(logits.argmax().item())}

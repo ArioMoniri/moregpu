@@ -278,13 +278,15 @@ class MoreGPU:
     # ---- pipeline-parallel sharding (GPT-2 family only): split the layers into contiguous STAGES,
     # one per torch worker; each worker holds ONLY its stage. Needs apps/worker/worker_torch.py (≥2 for a real split). ----
     def shard_load(self, model: str, layers: int | None = None, workers: Sequence[str] | None = None,
-                   id: str | None = None, push: bool = False, async_: bool = False) -> dict:
+                   id: str | None = None, push: bool = False, async_: bool = False, fp16: bool = False) -> dict:
         """Split `model`'s transformer layers into contiguous stages across the torch workers (or the listed
         `workers`) and load each stage on its worker. GPT-2 and Llama-family (RMSNorm/RoPE).
 
         push=True → DOWNLOAD-FREE: the coordinator fetches the model once and streams each worker ONLY its
         stage's weights (its layer slice + embeddings on the first stage / final norm+head on the last), so the
         fleet never touches the HF hub. Needs a single-file model.safetensors source.
+        fp16=True → each stage loads in fp16 on a GPU worker (half the VRAM per stage → a bigger model fits the
+        fleet); activations still pipe as fp32 so it stays token-close to the fp32 shard. CPU workers stay fp32.
         async_=True → return immediately {status:'loading'} and stream the stages in the background; poll
         shard_status() / call shard_wait(). Use this over a slow or tunneled link where a long synchronous
         load would exceed the request timeout.
@@ -300,6 +302,8 @@ class MoreGPU:
             body["push"] = True
         if async_:
             body["async"] = True
+        if fp16:
+            body["fp16"] = True
         return self._req("/model/shard", "POST", body)
 
     def shard_status(self, id: str | None = None) -> dict:

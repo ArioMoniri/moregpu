@@ -615,7 +615,7 @@ const shardLoads = new Map<string, ShardLoadState>();
 // the ordered stages (which worker owns which layer range + which is first/last); /model/shard_forward
 // pipes the hidden state stage→stage (only [seq×hidden] activations cross the wire, never the weights).
 interface ShardStage { worker: string; start: number; end: number; first: boolean; last: boolean }
-const shardPlans = new Map<string, { model: string; stages: ShardStage[] }>();
+const shardPlans = new Map<string, { model: string; stages: ShardStage[]; fp16?: boolean }>();
 // POST-LOAD failover keeps the download-free streaming inputs beside each ready plan, so ONE stage can be re-streamed
 // to a fresh worker without redoing the /model/shard preflight. push:false shards carry nulls. Lifecycle = shardPlans.
 type ShardStream = { model: string; push: boolean; configText: string | null; stPlan: STPlan | null };
@@ -943,7 +943,8 @@ type ShardCache = { session: string; pos: number; seq?: number[] };
 // `resume` keeps a worker's partial staging (a mid-stream drop on the SAME worker → re-stream only the tail); a fresh
 // replacement worker passes resume=false. Any error → {ok:false}. (Formerly the load path's `loadStage` closure.)
 async function streamStageToWorker(sid: string, model: string, push: boolean, configText: string | null, stPlan: STPlan | null, st: ShardStage, w: Worker, resume: boolean): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> {
-  if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last }); return { ...r, bytes: 0 }; }
+  const fp16 = !!shardPlans.get(sid)?.fp16;  // fp16 halves each stage's footprint on a GPU worker (plan-wide; failover reads it too)
+  if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, fp16 }); return { ...r, bytes: 0 }; }
   try {
     const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
     const sizes = (begin.data?.sizes ?? {}) as Record<string, number>;
@@ -961,7 +962,7 @@ async function streamStageToWorker(sid: string, model: string, push: boolean, co
     }
     const names = stageTensors(stPlan!, st.start, st.end, st.first, st.last);
     const bytes = await streamStageSafetensors(w, sid, model, stPlan!, names, budget, Number(sizes['model.safetensors']) || 0);
-    const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true });
+    const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, push: true, fp16 });
     return { ...r, bytes };
   } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e), bytes: 0 }; }
 }
@@ -1916,7 +1917,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       backbone: plan?.backbone, holders: plan?.holders.map((h) => h.worker) ?? [], injects: st.injects, completes: st.completes, dispatches: st.dispatches });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean; async?: boolean };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean; async?: boolean; fp16?: boolean };
     if (!body.model) return json({ error: 'need {model} (GPT-2 / Llama-family)' }, 400);
     if (body.push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free shard` }, 400);
     // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
@@ -1926,7 +1927,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; pipeline sharding needs ≥1 (≥2 for a real split)' }, 503);
     const sid = body.id ?? body.model;
     if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
-    shardPlans.set(sid, { model: body.model, stages: [] }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
+    shardPlans.set(sid, { model: body.model, stages: [], fp16: !!body.fp16 }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
     const fail = (msg: string, code: number) => { shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: msg, id: sid }, code); };
     // DOWNLOAD-FREE: fetch config + the safetensors header ON THE COORDINATOR (no worker download), so the
     // fleet gets only its per-stage slice. Also gives the real layer count without a worker-side model_load.
@@ -1998,7 +1999,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       }
       if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); }
       shardStreams.set(sid, { model, push, configText, stPlan }); // keep streaming inputs so a POST-LOAD failover can re-stream one stage to a fresh worker
-      shardPlans.set(sid, { model, stages }); // finalize the reservation with the real plan (unblocks shard_forward)
+      shardPlans.set(sid, { model, stages, fp16: !!body.fp16 }); // finalize the reservation with the real plan (unblocks shard_forward)
       log('info', `sharded ${model} (${nLayer} layers) → ${nStages} stages${push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
       if (PEER_TRANSPORT) { try { await wireRing(sid); } catch (e) { log('warn', `ring wiring failed for ${sid}: ${e instanceof Error ? e.message : e}`); } } // opt-in: wire the worker->worker ring (relay stays the fallback)
       return info;
@@ -2149,7 +2150,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   //   POST /model/moe_forward  { id?, input_ids:[...], return_logits?} → { argmax, logits? }  (coordinator-relayed EP)
   //   POST /model/moe_unload   { id? }                               → free backbone + every holder
   if (req.method === 'POST' && url.pathname === '/model/moe_shard') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; push?: boolean };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; push?: boolean; fp16?: boolean };
     if (!body.model) return json({ error: 'need {model} (a pure routed-MoE — OLMoE / Qwen3-MoE; shared-expert families like Qwen2-MoE / DeepSeek are not supported yet)' }, 400);
     const push = body.push !== false;   // download-free by default (the coordinator is the one-time weight source)
     if (push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free MoE shard` }, 400);
@@ -2185,14 +2186,14 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     try {
       // stream the DENSE backbone (every tensor that is NOT a routed expert — attn, router gate, embed, norm, head)
       const bbNames = stageBackboneTensors(stPlan);
-      const br = await streamMoERole(sid, body.model, configText, stPlan, bbNames, backboneW, 'moe_backbone_load', {});
+      const br = await streamMoERole(sid, body.model, configText, stPlan, bbNames, backboneW, 'moe_backbone_load', { fp16: !!body.fp16 });
       if (!br.ok) return await fail(`backbone load on ${backboneW.id} failed: ${br.error}`, 502);
       // stream each holder ONLY its routed-expert subset (selected across all layers, merged from the right files)
       const holderInfo: Record<string, unknown>[] = [];
       for (const h of holders) {
         const hw = workers.get(h.worker); if (!hw) return await fail(`holder worker ${h.worker} disconnected during load`, 503);
         const enames = stageExpertTensors(stPlan, new Set(h.experts));
-        const hr = await streamMoERole(sid, body.model, configText, stPlan, enames, hw, 'expert_load', { experts: h.experts });
+        const hr = await streamMoERole(sid, body.model, configText, stPlan, enames, hw, 'expert_load', { experts: h.experts, fp16: !!body.fp16 });
         if (!hr.ok) return await fail(`expert holder ${h.worker} (experts ${h.experts.join(',')}) load failed: ${hr.error}`, 502);
         holderInfo.push({ worker: h.worker, experts: h.experts, params_held: hr.data?.params_held, bytes: hr.bytes });
       }
