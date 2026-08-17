@@ -1613,12 +1613,15 @@ async def run():
 
                 async def handle_cache(mm):
                     try:
-                        w = json.loads(unseal(key, mm["sealed"]).decode())
-                        rows, cols = int(w["rows"]), int(w["cols"])
-                        if w.get("dtype") == "f16":
-                            ten = torch.from_numpy(np.frombuffer(b64d(w["data"]), dtype="<f2").copy()).reshape(rows, cols).to(DEV)
-                        else:
-                            ten = b64_to_t(w["data"]).reshape(rows, cols).to(DEV)
+                        w = json.loads(unseal(key, mm["sealed"]).decode())  # crypto only — safe on the event loop
+                        def _build():
+                            rows, cols = int(w["rows"]), int(w["cols"])
+                            if w.get("dtype") == "f16":
+                                return torch.from_numpy(np.frombuffer(b64d(w["data"]), dtype="<f2").copy()).reshape(rows, cols).to(DEV)
+                            return b64_to_t(w["data"]).reshape(rows, cols).to(DEV)
+                        # Build the tensor + .to(DEV) on the SINGLE compute thread — device ops (esp. MPS, which is not
+                        # thread-safe) must never run on the event-loop thread while a kernel/shard/generate is live.
+                        ten = await loop.run_in_executor(TORCH_POOL, _build)
                         resident[mm["id"]] = ten
                         await ws_send({"t": "cached", "id": mm["id"], "ok": True})
                     except Exception as e:
