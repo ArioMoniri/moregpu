@@ -212,6 +212,16 @@ function wizardBanner() {
     console.log(`\n  ${C.red}${C.b}⚠ MOREGPU_INSECURE=1 and bound to ${BIND}${C.reset}${C.red} — the join handshake (including the tenant key) travels in plaintext.${C.reset}`);
     console.log(`  ${C.dim}Drop MOREGPU_INSECURE for the default wss://, or bind MOREGPU_BIND=127.0.0.1 behind a VPN/tunnel.${C.reset}`);
   }
+  // The install line advertises ADVERTISE_HOST. If that is loopback but the server is bound wide, a worker on
+  // ANOTHER machine that pastes it would connect to its OWN localhost — flag the mismatch and point at the fix.
+  if ((ADVERTISE_HOST === 'localhost' || ADVERTISE_HOST === '127.0.0.1') && BIND !== '127.0.0.1' && BIND !== 'localhost') {
+    console.log(`\n  ${C.dim}The add-a-machine command above uses ${C.reset}localhost${C.dim} — that only resolves on THIS machine.`);
+    console.log(`  For workers elsewhere, set ${C.reset}MOREGPU_HOST${C.dim}=<a hostname/IP they can reach>, or expose a tunnel (${C.reset}moregpu serve --tunnel${C.dim}).${C.reset}`);
+  }
+  // No built-in worker → the fleet is empty until something joins; nudge toward the one-flag fix.
+  if (!(Deno.args.includes('--worker') || Deno.env.get('MOREGPU_SELF_WORKER') === '1')) {
+    console.log(`\n  ${C.dim}No worker in this pool yet — the fleet stays empty until one joins. Add ${C.reset}--worker${C.dim} to contribute THIS machine, or run the command above on another machine.${C.reset}`);
+  }
   console.log('');
 }
 function printHelp() {
