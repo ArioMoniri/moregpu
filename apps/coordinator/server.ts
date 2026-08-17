@@ -2291,160 +2291,572 @@ function dashboard(): string {
 }
 const DASHBOARD_HTML = `<!doctype html><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><title>MoreGPU · admin</title>
 <style>
-:root{--bg:#0b0f17;--card:#121826;--line:#1f2937;--ink:#e5e7eb;--mut:#8b98ad;--acc:#6366f1;--grn:#34d399;--red:#f87171;--yel:#fbbf24}
-*{box-sizing:border-box}body{margin:0;font:14px ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--ink)}
-.wrap{max-width:1080px;margin:0 auto;padding:28px 22px}
-h1{font-size:20px;letter-spacing:-.3px;margin:0}.sub{color:var(--mut);font-size:13px;margin:2px 0 18px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
-.card h3{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);font-weight:600}
-.big{font-size:30px;font-weight:700;letter-spacing:-1px}.mut{color:var(--mut)}
-.gpu{background:linear-gradient(135deg,#1e213a,#141828);border:1px solid #2a2f52}
-.bar{height:7px;border-radius:6px;background:#1f2637;overflow:hidden;margin-top:8px}.bar>i{display:block;height:100%;background:var(--acc)}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
-.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
-.gpuP{background:#132a22;color:var(--grn)}.cpuP{background:#2a2413;color:var(--yel)}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
-input,select{background:#0e1420;border:1px solid var(--line);color:var(--ink);border-radius:9px;padding:9px}
-button{background:var(--acc);color:#fff;border:0;border-radius:9px;padding:9px 16px;font-weight:600;cursor:pointer}
-button.ghost{background:#1a2133;color:#c7d2fe}
-button.mini{padding:4px 8px;font-size:11px;border-radius:7px;background:#26304a;color:#c7d2fe;margin:0 2px}
-button.mini.danger{background:#3a1d24;color:#fca5a5}
-.dutyin{width:50px;padding:4px 6px;font-size:11px}
-.dutyslider{width:96px;vertical-align:middle;accent-color:#818cf8;cursor:pointer}.dutyval{display:inline-block;width:34px;font-size:11px;color:var(--mut);text-align:right}
-.schedin{width:92px;padding:3px 6px;font-size:11px}
-td.ctl{white-space:nowrap}
-.logo{font-size:9px;line-height:1.05;margin:0 0 10px;font-family:ui-monospace,Menlo,monospace;overflow:auto;white-space:pre;background:linear-gradient(90deg,#5f5fff,#875fff,#af5fff,#d75fff,#ff5faf,#ff5f5f);-webkit-background-clip:text;background-clip:text;color:transparent}
-pre{background:#0e1420;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;max-height:260px;font-size:12px;margin:0}
-.lvl-error{color:var(--red)}.lvl-warn{color:var(--yel)}.lvl-info{color:#93c5fd}.lvl-debug{color:var(--mut)}
-a{color:#a5b4fc}.sp{margin-top:16px}.k{display:inline-block;background:#1a2133;color:#c7d2fe;border-radius:7px;padding:3px 9px;margin:3px 4px 0 0;font-size:12px;font-family:ui-monospace,monospace}
+:root{
+  --bg:#070a12;--bg2:#0b0f1a;--card:#0f1523;--card2:#131a2b;--line:#1e2740;--line2:#28324f;
+  --ink:#e8ecf5;--mut:#8a96b0;--dim:#5c6885;
+  --acc:#6366f1;--acc2:#a855f7;--pink:#ec4899;--red:#f43f5e;
+  --grn:#34d399;--yel:#fbbf24;--blu:#60a5fa;
+  --grad:linear-gradient(100deg,#6366f1,#a855f7 42%,#ec4899 72%,#f43f5e);
+  --shadow:0 10px 40px -12px rgba(0,0,0,.6);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  color:var(--ink);background:var(--bg);
+  background-image:radial-gradient(1200px 600px at 12% -8%,rgba(99,102,241,.16),transparent 60%),radial-gradient(1000px 560px at 92% -4%,rgba(236,72,153,.13),transparent 62%);
+  -webkit-font-smoothing:antialiased;min-height:100vh;
+}
+.wrap{max-width:1180px;margin:0 auto;padding:20px 18px 60px}
+a{color:#a5b4fc;text-decoration:none}a:hover{text-decoration:underline}
+.mut{color:var(--mut)}.dim{color:var(--dim)}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,monospace}
+
+/* ---- top bar ---- */
+.top{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.mark{width:38px;height:38px;flex:0 0 auto;border-radius:11px;background:var(--grad);display:grid;place-items:center;box-shadow:0 6px 22px -6px rgba(124,58,237,.6)}
+.mark svg{width:22px;height:22px;display:block}
+.brand .name{font-size:19px;font-weight:750;letter-spacing:-.4px;line-height:1;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand .tag{font-size:11.5px;color:var(--mut);margin-top:3px}
+.top .spacer{flex:1}
+.hstat{display:flex;gap:9px;align-items:stretch;flex-wrap:wrap}
+.chip{display:flex;flex-direction:column;justify-content:center;padding:7px 13px;border:1px solid var(--line);border-radius:11px;background:rgba(15,21,35,.7);min-width:76px}
+.chip .n{font-size:17px;font-weight:700;letter-spacing:-.4px;line-height:1.1}
+.chip .l{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin-top:2px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim);margin-right:6px;vertical-align:middle}
+.dot.on{background:var(--grn);box-shadow:0 0 0 3px rgba(52,211,153,.18)}
+.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(244,63,94,.18)}
+
+/* ---- generic ---- */
+.card{background:linear-gradient(180deg,rgba(19,26,43,.55),rgba(15,21,35,.85));border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:var(--shadow)}
+.card+.card,.sp{margin-top:16px}
+.card h2{margin:0 0 3px;font-size:15px;font-weight:700;letter-spacing:-.2px;display:flex;align-items:center;gap:8px}
+.card .hint{font-size:12px;color:var(--mut);margin:0 0 14px}
+.card h2 .badge{font-size:10px;font-weight:600;color:var(--mut)}
+.grid{display:grid;gap:14px}
+.g-kpi{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.g-fleet{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.section-title{display:flex;align-items:center;gap:10px;margin:26px 2px 12px}
+.section-title h2{margin:0;font-size:16px;font-weight:750;letter-spacing:-.3px}
+.section-title .ln{flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}
+
+.kpi{position:relative;overflow:hidden;padding:16px 17px}
+.kpi.accent{background:linear-gradient(150deg,rgba(99,102,241,.16),rgba(168,85,247,.06) 55%,transparent),var(--card)}
+.kpi .kl{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);font-weight:600}
+.kpi .kv{font-size:30px;font-weight:750;letter-spacing:-1.2px;margin-top:5px;line-height:1}
+.kpi .ks{font-size:12px;color:var(--mut);margin-top:4px}
+.bar{height:7px;border-radius:6px;background:#0b1120;border:1px solid var(--line);overflow:hidden;margin-top:9px}
+.bar>i{display:block;height:100%;background:var(--grad);transition:width .5s ease}
+.bar>i.grn{background:linear-gradient(90deg,#10b981,#34d399)}
+
+button{font:inherit;background:var(--acc);color:#fff;border:0;border-radius:10px;padding:9px 15px;font-weight:600;cursor:pointer;transition:filter .15s,opacity .15s}
+button:hover{filter:brightness(1.08)}button:active{filter:brightness(.94)}button:disabled{opacity:.5;cursor:not-allowed;filter:none}
+button.grad{background:var(--grad)}
+button.ghost{background:rgba(99,102,241,.12);color:#c7d2fe;border:1px solid var(--line2)}
+button.ghost:hover{background:rgba(99,102,241,.2)}
+button.mini{padding:5px 9px;font-size:12px;border-radius:8px;background:rgba(99,102,241,.15);color:#c7d2fe;border:1px solid var(--line2)}
+button.mini.danger{background:rgba(244,63,94,.12);color:#fca5a5;border-color:rgba(244,63,94,.3)}
+button.mini.danger:hover{background:rgba(244,63,94,.22)}
+input,select,textarea{font:inherit;background:#0a0f1b;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:9px 11px;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(99,102,241,.18)}
+input::placeholder{color:var(--dim)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+label.f{font-size:12px;color:var(--mut);display:inline-flex;align-items:center;gap:6px}
+
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid transparent}
+.pill.gpu{background:rgba(52,211,153,.13);color:#6ee7b7;border-color:rgba(52,211,153,.25)}
+.pill.cpu{background:rgba(251,191,36,.12);color:#fcd34d;border-color:rgba(251,191,36,.25)}
+.state{font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:5px}
+.state .sd{width:7px;height:7px;border-radius:50%;background:currentColor}
+.s-work{color:var(--blu)}.s-serve{color:var(--grn)}.s-idle{color:var(--dim)}.s-pause{color:var(--yel)}.s-auto{color:var(--red)}.s-sched{color:var(--mut)}
+
+/* ---- worker card ---- */
+.wk{padding:15px 16px;display:flex;flex-direction:column;gap:11px}
+.wk .wkh{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.wk .wkname{font-weight:700;font-size:14.5px;letter-spacing:-.2px;word-break:break-word;line-height:1.25}
+.wk .wksub{font-size:11px;color:var(--dim);margin-top:2px;display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.wk .spark{width:100%;height:34px;display:block}
+.wk .grid3{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.wk .cellv{font-size:15px;font-weight:700;letter-spacing:-.3px}
+.wk .celll{font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin-top:1px}
+.wk .util{display:flex;gap:12px;font-size:11px;color:var(--mut)}
+.wk .util b{color:var(--ink);font-weight:600}
+.wk .ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;border-top:1px solid var(--line);padding-top:11px}
+.wk .duty{display:flex;align-items:center;gap:7px;flex:1;min-width:150px}
+.duty input[type=range]{flex:1;min-width:70px;accent-color:#a855f7;cursor:pointer;height:4px}
+.duty .dv{font-size:11px;color:var(--mut);width:38px;text-align:right;font-variant-numeric:tabular-nums}
+.wk .schedin,.wk .nickin{font-size:11px;padding:5px 8px;border-radius:8px}
+.wk .schedin{width:118px}.wk .nickin{flex:1;min-width:90px}
+.err{color:var(--red);font-size:11px;font-weight:600}
+
+/* ---- net + model ---- */
+.nettbl{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+.nettbl th,.nettbl td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+.nettbl th{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:600}
+.nettbl td.mono{font-variant-numeric:tabular-nums}
+.verdict{margin-top:14px;display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.vbox{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:rgba(10,15,27,.5)}
+.vbox h4{margin:0 0 8px;font-size:12px;display:flex;align-items:center;gap:7px}
+.vbox ul{margin:0;padding-left:17px;font-size:12px;color:var(--mut);line-height:1.55}
+.vbox.ok h4{color:#6ee7b7}.vbox.warn h4{color:#fcd34d}
+.note{margin-top:12px;font-size:12.5px;color:var(--mut);border-left:2px solid var(--acc2);padding:2px 0 2px 12px}
+
+.chatbox{display:flex;flex-direction:column;gap:10px;background:#0a0f1b;border:1px solid var(--line);border-radius:12px;padding:12px;min-height:120px;max-height:44vh;overflow:auto;margin-top:12px}
+.msg{padding:9px 12px;border-radius:12px;max-width:86%;white-space:pre-wrap;word-wrap:break-word;font-size:13.5px;line-height:1.5}
+.msg.u{align-self:flex-end;background:linear-gradient(135deg,#4338ca,#6d28d9);color:#fff;border-bottom-right-radius:4px}
+.msg.b{align-self:flex-start;background:#131a2b;border:1px solid var(--line2);border-bottom-left-radius:4px}
+.msg .meta{display:block;font-size:10.5px;color:var(--dim);margin-top:5px}
+.mstatus{font-size:12.5px;color:var(--mut);display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.mstatus.ok{color:#6ee7b7}.mstatus.err{color:#fca5a5}
+
+pre.logs{background:#0a0f1b;border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto;max-height:280px;font-size:12px;margin:12px 0 0;line-height:1.55}
+.lg-error{color:var(--red)}.lg-warn{color:var(--yel)}.lg-info{color:#93c5fd}.lg-debug{color:var(--dim)}
+.k{display:inline-block;background:rgba(99,102,241,.12);color:#c7d2fe;border:1px solid var(--line2);border-radius:8px;padding:3px 10px;margin:0 5px 5px 0;font-size:12px;font-family:ui-monospace,monospace}
+.empty{color:var(--dim);font-size:13px;padding:8px 2px}
+
+/* ---- toast + gate ---- */
+.toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:9px;z-index:60;max-width:min(360px,92vw)}
+.toast{background:#131a2b;border:1px solid var(--line2);border-left:3px solid var(--acc);border-radius:11px;padding:11px 14px;font-size:13px;box-shadow:var(--shadow);animation:tin .25s ease}
+.toast.err{border-left-color:var(--red)}.toast.ok{border-left-color:var(--grn)}
+@keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.gate{position:fixed;inset:0;background:rgba(5,8,14,.82);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;z-index:80;padding:20px}
+.gate.show{display:flex}
+.gate .box{background:var(--card);border:1px solid var(--line2);border-radius:18px;padding:26px;max-width:420px;width:100%;box-shadow:var(--shadow)}
+.gate .box .mark{margin:0 auto 14px}
+.gate h3{margin:0 0 6px;text-align:center;font-size:18px}
+.gate p{margin:0 0 16px;text-align:center;color:var(--mut);font-size:13px}
+.gate .row2{display:flex;gap:9px}
+.gate input{flex:1}
+.tokbar{display:flex;align-items:center;gap:8px}
+.tokbar input{width:150px}
+@media(max-width:640px){
+  .wrap{padding:16px 13px 50px}
+  .top .spacer{display:none}
+  .hstat{width:100%}
+  .tokbar input{width:120px}
+  .g-fleet{grid-template-columns:1fr}
+}
 </style>
-<div class=wrap>
-<pre class=logo>███╗   ███╗ ██████╗ ██████╗ ███████╗ ██████╗ ██████╗ ██╗   ██╗
-████╗ ████║██╔═══██╗██╔══██╗██╔════╝██╔════╝ ██╔══██╗██║   ██║
-██╔████╔██║██║   ██║██████╔╝█████╗  ██║  ███╗██████╔╝██║   ██║
-██║╚██╔╝██║██║   ██║██╔══██╗██╔══╝  ██║   ██║██╔═══╝ ██║   ██║
-██║ ╚═╝ ██║╚██████╔╝██║  ██║███████╗╚██████╔╝██║     ╚██████╔╝
-╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝      ╚═════╝</pre>
-<h1>MoreGPU · admin</h1><div class=sub>Your worker fleet, presented as one virtual GPU. No cap on how many machines can join.</div>
-<div class=card style="margin-bottom:14px"><div class=row><b>Admin token</b><input id=tok type=password placeholder="paste from the server console wizard" style="flex:1;min-width:220px"><button class=ghost onclick=save()>Save</button><span id=authmsg class=mut></span></div></div>
-<div class="grid">
-  <div class="card gpu"><h3>Virtual GPU</h3><div class=big id=slots>—</div><div class=mut id=slotsub>slots</div>
-    <div class=mut style="margin-top:10px">user load <span id=uu>–</span></div><div class=bar><i id=uubar style=width:0%></i></div>
-    <div class=mut style="margin-top:6px">pool duty <span id=pd>–</span></div><div class=bar><i id=pdbar style="width:0%;background:var(--grn)"></i></div>
-    <div class=mut style="margin-top:10px">throughput · <span id=ops>0</span> ops · <span id=toks>0</span> tokens · <span id=units>0</span> kernel-elts</div><div id=tpspark style="margin-top:4px"></div>
+
+<div class="wrap">
+  <div class="top">
+    <div class="brand">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="3" stroke="#fff" stroke-width="1.7"/><rect x="8.5" y="8.5" width="7" height="7" rx="1.3" fill="#fff"/><path d="M9 1.5v3M12 1.5v3M15 1.5v3M9 19.5v3M12 19.5v3M15 19.5v3M1.5 9h3M1.5 12h3M1.5 15h3M19.5 9h3M19.5 12h3M19.5 15h3" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </div>
+      <div>
+        <div class="name">MoreGPU</div>
+        <div class="tag">every worker, one virtual GPU</div>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="hstat" id="hstat">
+      <div class="chip"><span class="n" id="hFleet">—</span><span class="l"><span class="dot" id="hDot"></span>fleet</span></div>
+      <div class="chip"><span class="n" id="hQueue">—</span><span class="l">queue</span></div>
+      <div class="chip tokbar" style="flex-direction:row;align-items:center">
+        <input id="tokTop" type="password" placeholder="admin token" autocomplete="off">
+        <button class="mini" id="signout" title="clear the stored token">sign out</button>
+      </div>
+    </div>
   </div>
-  <div class=card><h3>Queue</h3><div class=big id=q>0</div><div class=mut>waiting jobs</div>
-    <div class=sp><span class=mut>done</span> <b id=jd>0</b> · <span class=mut>failed</span> <b id=jf>0</b></div></div>
-  <div class=card><h3>Sealing</h3><div class=big style=font-size:20px>AES-256-GCM</div><div class=mut>every work unit, on the wire</div>
-    <div class=sp><a href=/metrics target=_blank>/metrics</a> <span class=mut>· wire to Grafana</span></div></div>
+
+  <!-- KPI overview -->
+  <div class="grid g-kpi">
+    <div class="card kpi accent">
+      <div class="kl">Virtual GPU</div>
+      <div class="kv" id="kSlots">—</div>
+      <div class="ks" id="kSlotsub">connect a worker…</div>
+      <div class="ks" style="margin-top:9px">user load <span id="kUU" class="mut">–</span></div>
+      <div class="bar"><i id="kUUbar" style="width:0"></i></div>
+      <div class="ks" style="margin-top:7px">pool duty <span id="kPD" class="mut">–</span></div>
+      <div class="bar"><i id="kPDbar" class="grn" style="width:0"></i></div>
+    </div>
+    <div class="card kpi">
+      <div class="kl">Throughput</div>
+      <div class="kv" id="kOps">0</div>
+      <div class="ks"><span id="kToks">0</span> tokens · <span id="kUnits">0</span> kernel-elts</div>
+      <div id="kSpark" style="margin-top:12px"></div>
+    </div>
+    <div class="card kpi">
+      <div class="kl">Queue</div>
+      <div class="kv" id="kQueue">0</div>
+      <div class="ks">waiting jobs</div>
+      <div class="ks" style="margin-top:10px"><span class="mut">done</span> <b id="kDone">0</b> &nbsp;·&nbsp; <span class="mut">failed</span> <b id="kFail" class="err" style="font-weight:700">0</b></div>
+    </div>
+    <div class="card kpi">
+      <div class="kl">On-wire sealing</div>
+      <div class="kv" style="font-size:21px;letter-spacing:-.5px">AES-256-GCM</div>
+      <div class="ks">every work unit, encrypted</div>
+      <div class="ks" style="margin-top:12px"><a href="/metrics" target="_blank" rel="noopener">/metrics</a> <span class="mut">· wire to Grafana</span></div>
+    </div>
+  </div>
+
+  <!-- FLEET -->
+  <div class="section-title">
+    <h2>Fleet</h2><span class="badge mut" id="fCount"></span><div class="ln"></div>
+    <input id="fSearch" placeholder="filter name / type / OS" style="width:200px;max-width:44vw">
+    <button class="ghost mini" id="pauseAll">Pause all</button>
+    <button class="ghost mini" id="resumeAll">Resume all</button>
+  </div>
+  <div class="grid g-fleet" id="fleet"><div class="empty">connect a worker to see it here…</div></div>
+
+  <!-- MODEL SERVING -->
+  <div class="section-title"><h2>Model serving</h2><div class="ln"></div></div>
+  <div class="card">
+    <div class="row">
+      <input id="mModel" value="gpt2" placeholder="HF model id (gpt2 · Qwen/Qwen2.5-0.5B …)" style="flex:1;min-width:200px">
+      <input id="mWorker" placeholder="worker (optional)" style="width:150px">
+      <label class="f"><input id="mPush" type="checkbox">download-free</label>
+      <button class="grad" id="mLoad">Load</button>
+    </div>
+    <div class="mstatus" id="mStatus" style="margin-top:12px">No model loaded. Enter an id and press Load.</div>
+    <div class="chatbox" id="mChat" style="display:none"></div>
+    <div class="row" id="mChatBar" style="margin-top:12px;display:none">
+      <input id="mPrompt" placeholder="message…  (Enter to send)" style="flex:1;min-width:200px">
+      <label class="f">max <input id="mMax" type="number" value="96" style="width:66px"></label>
+      <label class="f"><input id="mSamp" type="checkbox">sample</label>
+      <button id="mSend" disabled>Send</button>
+    </div>
+  </div>
+
+  <!-- NETWORK SELF-TEST -->
+  <div class="section-title"><h2>Network self-test</h2><div class="ln"></div></div>
+  <div class="card">
+    <p class="hint">RTT gates single-request sharded decode (needs a LAN); bandwidth gates weight transfer &amp; throughput. Run it to see which workloads THIS fleet can actually host.</p>
+    <div class="row">
+      <button class="grad" id="netBtn">Run self-test</button>
+      <span class="mstatus" id="netNote"></span>
+    </div>
+    <div id="netOut"></div>
+  </div>
+
+  <!-- KERNELS + LOGS -->
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-top:26px">
+    <div class="card">
+      <h2>Per-kernel jobs</h2>
+      <div id="kernels" style="margin-top:10px"><span class="empty">no jobs yet</span></div>
+    </div>
+    <div class="card">
+      <h2>Errors &amp; debug log</h2>
+      <pre class="logs" id="logs">—</pre>
+    </div>
+  </div>
 </div>
-<div class="card sp"><h3>Run a job</h3><div class=row>
-  <select id=kernel><option>matmul</option><option>vector_add</option><option>vector_mul</option><option>saxpy</option><option>relu</option><option>scale</option><option>softmax</option><option>layernorm</option></select>
-  <label class=mut>size <input id=size value=512 style=width:110px></label><button onclick=submit()>Submit</button><span id=jobmsg class=mut></span></div></div>
-<div class="card sp"><h3>Fleet — live contribution &amp; control</h3>
-  <div class=row><input id=fsearch placeholder="filter by name / type / OS" style="flex:1;min-width:200px" oninput=renderFleet()><button class=ghost onclick=pauseAll(true)>Pause all</button><button class=ghost onclick=pauseAll(false)>Resume all</button><span id=fcount class=mut></span></div>
-  <div style="overflow:auto"><table><thead><tr><th>worker</th><th>type</th><th title="share of compute OPERATIONS (kernel shards + serving calls + training rounds — one consistent unit; not tokens-vs-elements)">activity</th><th title="ops/interval: kernel shards + LLM serving calls + training rounds">trend</th><th>shards</th><th title="kernel output-elements (matmul/etc.)">units</th><th title="LLM tokens generated on this node">tokens</th><th>user load</th><th>pool duty</th><th>state</th><th>control</th></tr></thead><tbody id=fleet><tr><td class=mut colspan=11>connect a worker…</td></tr></tbody></table></div></div>
-<div class="card sp"><h3>Network self-test <span class=mut>— what your fleet's link can actually do</span></h3>
-  <div class=row><button onclick=netTest() id=netbtn class=g>Run self-test</button> <span id=netnote class=mut></span></div>
-  <div id=nettable class=mut style="margin-top:8px">Latency gates single-request sharded decode (needs a LAN); bandwidth gates weight transfer + throughput. Run it to see which workloads THIS fleet supports.</div></div>
-<div class="card sp"><h3>Per-kernel jobs</h3><div id=kernels class=mut>—</div></div>
-<div class="card sp"><h3>Errors &amp; debug log</h3><pre id=logs>—</pre></div>
+
+<div class="toasts" id="toasts"></div>
+
+<div class="gate" id="gate">
+  <div class="box">
+    <div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="3" stroke="#fff" stroke-width="1.7"/><rect x="8.5" y="8.5" width="7" height="7" rx="1.3" fill="#fff"/></svg></div>
+    <h3>Admin token required</h3>
+    <p>Paste the token minted by the coordinator's setup wizard. It is stored only in this browser.</p>
+    <div class="row2">
+      <input id="tokGate" type="password" placeholder="paste admin token" autocomplete="off">
+      <button class="grad" id="tokGateBtn">Unlock</button>
+    </div>
+  </div>
 </div>
+
 <script>
-const K='moregpu_admin_token';document.getElementById('tok').value=localStorage.getItem(K)||'';
-const H=()=>({'content-type':'application/json','authorization':'Bearer '+(localStorage.getItem(K)||'')});
-function save(){localStorage.setItem(K,document.getElementById('tok').value.trim());refresh();}
-function pct(x){return Math.round((x||0)*100)+'%';}
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function fmt(n){n=n||0;return n>=1e9?(n/1e9).toFixed(1)+'G':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n;}
-// ---- fleet control (pause/resume/duty/remove) + high-worker-count rendering ----
-let FLEET=[];
-function ctl(id,body,silent){return fetch('/workers/'+encodeURIComponent(id)+'/control',{method:'POST',headers:H(),body:JSON.stringify(body)}).then(function(){if(!silent)refresh();}).catch(function(){});}
-function pauseAll(p){Promise.all((FLEET||[]).map(function(x){return ctl(x.id,{action:p?'pause':'resume'},true);})).then(refresh);}
-function netTest(){var b=document.getElementById('netbtn');b.disabled=true;b.textContent='probing…';document.getElementById('netnote').textContent='';
- fetch('/net',{headers:H()}).then(function(r){return r.json();}).then(function(d){
-  b.disabled=false;b.textContent='Run self-test';
-  if(d.error){document.getElementById('netnote').textContent='✗ '+d.error;return;}
-  document.getElementById('netnote').textContent='median RTT '+(d.median_rtt_ms==null?'–':d.median_rtt_ms+' ms')+(d.median_up_mbps!=null?' · '+d.median_up_mbps+' Mbps up':'');
-  var rows=(d.workers||[]).map(function(w){return '<tr><td>'+esc(w.id)+'</td><td>'+(w.rtt_ms==null?'–':w.rtt_ms+' ms')+'</td><td>'+(w.up_mbps==null?esc(w.up_note||'–'):w.up_mbps+' Mbps')+'</td></tr>';}).join('');
-  var li=function(a){return (a||[]).map(function(x){return '<li>'+esc(x)+'</li>';}).join('');};
-  document.getElementById('nettable').innerHTML=
-    '<table><thead><tr><th>worker</th><th>RTT</th><th>up</th></tr></thead><tbody>'+rows+'</tbody></table>'+
-    '<div style="margin-top:8px;color:var(--fg)">'+esc(d.note||'')+'</div>'+
-    '<div style="margin-top:6px"><b>✓ works anywhere (latency-tolerant):</b><ul>'+li(d.latency_tolerant_anywhere)+'</ul>'+
-    '<b>needs low RTT (single-request sharded decode):</b><ul>'+li(d.latency_bound_needs_low_rtt)+'</ul></div>';
- }).catch(function(e){b.disabled=false;b.textContent='Run self-test';document.getElementById('netnote').textContent='✗ '+e;});}
+"use strict";
+var K="moregpu_admin_token";
+
+/* ---------- helpers ---------- */
+function $(id){return document.getElementById(id);}
+function tok(){return (localStorage.getItem(K)||"").trim();}
+function H(){return {"content-type":"application/json","authorization":"Bearer "+tok()};}
+function pct(x){return Math.round((x||0)*100)+"%";}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function fmt(n){n=n||0;return n>=1e9?(n/1e9).toFixed(1)+"G":n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":""+Math.round(n);}
+function updn(s){if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m";if(s<86400)return Math.floor(s/3600)+"h";return Math.floor(s/86400)+"d";}
+
+var TOAST_SEEN=0;
+function toast(msg,kind){
+  var wrap=$("toasts"),t=document.createElement("div");
+  t.className="toast"+(kind?" "+kind:"");t.textContent=msg;wrap.appendChild(t);
+  setTimeout(function(){t.style.transition="opacity .4s";t.style.opacity="0";setTimeout(function(){t.remove();},400);},4200);
+}
+function showGate(show){$("gate").classList.toggle("show",!!show);if(show){var g=$("tokGate");g.value=tok();setTimeout(function(){g.focus();},60);}}
+
+/* ---------- fetch wrappers ---------- */
+function jget(path){
+  return fetch(path,{headers:H()}).then(function(r){
+    if(r.status===401){throw {auth:true};}
+    return r.json();
+  });
+}
+function jpost(path,body){
+  return fetch(path,{method:"POST",headers:H(),body:JSON.stringify(body||{})}).then(function(r){
+    if(r.status===401){throw {auth:true};}
+    return r.json();
+  });
+}
+var AUTH_BAD=false;
+function onAuthErr(){
+  if(AUTH_BAD)return;AUTH_BAD=true;
+  toast("Unauthorized — the admin token is missing or wrong.","err");
+  showGate(true);
+}
+
+/* ---------- sparkline ---------- */
+function spark(arr,w,h,col){
+  arr=arr||[];
+  if(!arr.length)return '<svg width="'+w+'" height="'+h+'"></svg>';
+  var mx=1;for(var i=0;i<arr.length;i++)if(arr[i]>mx)mx=arr[i];
+  var step=w/Math.max(1,arr.length-1),pts=[],area=[];
+  for(var j=0;j<arr.length;j++){
+    var x=(j*step).toFixed(1),y=(h-2-((arr[j]||0)/mx)*(h-4)).toFixed(1);
+    pts.push(x+","+y);area.push(x+","+y);
+  }
+  var uid="g"+Math.random().toString(36).slice(2,8);
+  var poly=pts.join(" ");
+  var fill="0,"+h+" "+area.join(" ")+" "+w+","+h;
+  return '<svg class="spark" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none">'
+    +'<defs><linearGradient id="'+uid+'" x1="0" y1="0" x2="0" y2="1">'
+    +'<stop offset="0" stop-color="'+col+'" stop-opacity="0.32"/><stop offset="1" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs>'
+    +'<polygon points="'+fill+'" fill="url(#'+uid+')"/>'
+    +'<polyline points="'+poly+'" fill="none" stroke="'+col+'" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+}
+
+/* ---------- worker control ---------- */
+function ctl(id,body,silent){
+  return fetch("/workers/"+encodeURIComponent(id)+"/control",{method:"POST",headers:H(),body:JSON.stringify(body)})
+    .then(function(r){if(r.status===401){onAuthErr();return;}if(!silent)refresh();})
+    .catch(function(){toast("Control request failed for "+id,"err");});
+}
+var FLEET=[];
+function pauseAll(p){
+  Promise.all((FLEET||[]).map(function(x){return ctl(x.id,{action:p?"pause":"resume"},true);}))
+    .then(function(){toast((p?"Paused":"Resumed")+" "+((FLEET||[]).length)+" workers","ok");refresh();});
+}
+
+/* ---------- fleet render ---------- */
+var DRAGGING=false;
+function stateChip(x){
+  if(x.paused){
+    if(x.pausedReason==="schedule")return '<span class="state s-sched"><span class="sd"></span>scheduled-off</span>';
+    if(x.pausedReason==="errors")return '<span class="state s-auto"><span class="sd"></span>auto-paused</span>';
+    return '<span class="state s-pause"><span class="sd"></span>paused</span>';
+  }
+  if(x.busy)return '<span class="state s-work"><span class="sd"></span>working</span>';
+  if(x.serving)return '<span class="state s-serve"><span class="sd"></span>serving</span>';
+  return '<span class="state s-idle"><span class="sd"></span>idle</span>';
+}
 function renderFleet(){
- var el=document.getElementById('fleet');if(!el)return;
- var ae=document.activeElement;if(ae&&ae.classList&&(ae.classList.contains('dutyin')||ae.classList.contains('dutyslider')||ae.classList.contains('schedin')))return; // don't clobber a duty field/slider/schedule mid-edit
- var q=(document.getElementById('fsearch').value||'').toLowerCase();
- var list=(FLEET||[]).filter(function(x){return !q||((x.nick||'')+' '+x.id+' '+x.backend+' '+(x.os||'')+' '+(x.label||'')).toLowerCase().indexOf(q)>=0;});
- list.sort(function(a,b){return (b.share||0)-(a.share||0);});
- var shown=list.slice(0,200);
- document.getElementById('fcount').textContent=(FLEET||[]).length?('showing '+shown.length+' of '+FLEET.length+(q?' matched':'')+' workers'):'';
- el.innerHTML=shown.length?shown.map(function(x){var paused=x.paused;return '<tr>'+
-   '<td>'+esc(x.nick||x.id)+(x.errors?' <span class=lvl-error>('+(x.errors|0)+' err)</span>':'')+(x.schedule&&x.schedule!=='always'?' <span class=mut>· '+esc(x.schedule)+'</span>':'')+'</td>'+
-   '<td><span class="pill '+(x.backend==='gpu'?'gpuP':'cpuP')+'">'+esc(x.backend)+'</span></td>'+
-   '<td><b>'+pct(x.share)+'</b></td>'+
-   '<td>'+spark(x.trend,72,20,x.backend==='gpu'?'#34d399':'#fbbf24')+'</td>'+
-   '<td>'+(x.shards|0)+'</td><td class=mut>'+fmt(x.units)+'</td><td class=mut>'+fmt(x.tokens||0)+'</td>'+
-   '<td>'+pct(x.userUtil)+'</td><td>'+pct(x.poolDuty)+'</td>'+
-   '<td>'+(paused?(x.pausedReason==='schedule'?'<span class=mut>scheduled-off</span>':(x.pausedReason==='errors'?'<span class=lvl-error>auto-paused</span>':'<span class=lvl-warn>paused</span>')):(x.busy?'working':(x.serving?'<span style="color:#34d399">serving</span>':'idle')))+'</td>'+
-   '<td class=ctl>'+
-     '<button class=mini data-act="'+(paused?'resume':'pause')+'" data-id="'+esc(x.id)+'" title="'+(paused?'resume':'pause')+'">'+(paused?'▶':'⏸')+'</button>'+
-     '<input type=range class=dutyslider min=0.05 max=1 step=0.05 value='+(x.ceil!=null?x.ceil:(x.poolDuty||0.6))+' data-id="'+esc(x.id)+'" title="usage ceiling — drag to change live">'+
-     '<span class=dutyval>'+Math.round((x.ceil!=null?x.ceil:(x.poolDuty||0.6))*100)+'%</span>'+
-     '<input class=schedin value="'+esc(x.schedule||'always')+'" data-id="'+esc(x.id)+'" title="when this worker contributes — always · idle-only · a window like 22:00-07:00 (its off-hours). Applied on Enter/blur.">'+
-     '<button class="mini danger" data-act=remove data-id="'+esc(x.id)+'">✕</button>'+
-   '</td></tr>';}).join(''):'<tr><td class=mut colspan=10>connect a worker…</td></tr>';
+  var el=$("fleet");if(!el)return;
+  var ae=document.activeElement;
+  if(DRAGGING)return;
+  /* don't clobber an in-flight edit: a slider being dragged, or a schedule/nick field being typed into */
+  if(ae&&ae.classList&&(ae.classList.contains("dutyslider")||ae.classList.contains("schedin")||ae.classList.contains("nickin")))return;
+  var q=($("fSearch").value||"").toLowerCase();
+  var list=(FLEET||[]).filter(function(x){
+    return !q||((x.nick||"")+" "+x.id+" "+x.backend+" "+(x.os||"")+" "+(x.label||"")).toLowerCase().indexOf(q)>=0;
+  });
+  list.sort(function(a,b){return (b.share||0)-(a.share||0);});
+  var shown=list.slice(0,200);
+  $("fCount").textContent=(FLEET||[]).length?("showing "+shown.length+" of "+FLEET.length+(q?" matched":"")):"";
+  if(!shown.length){el.innerHTML='<div class="empty">'+(FLEET.length?"no workers match that filter":"connect a worker to see it here…")+'</div>';return;}
+  el.innerHTML=shown.map(function(x){
+    var isGpu=x.backend==="gpu";
+    var col=isGpu?"#34d399":"#fbbf24";
+    var ceil=(x.ceil!=null?x.ceil:(x.poolDuty||0.6));
+    var label=x.label?esc(x.label):esc(x.backend);
+    var os=x.os?'<span>'+esc(x.os)+'</span>':"";
+    var sched=(x.schedule&&x.schedule!=="always")?'<span>· '+esc(x.schedule)+'</span>':"";
+    return '<div class="card wk">'
+      +'<div class="wkh"><div style="min-width:0">'
+        +'<div class="wkname">'+esc(x.nick||x.id)+(x.errors?' <span class="err">('+(x.errors|0)+' err)</span>':"")+'</div>'
+        +'<div class="wksub"><span class="pill '+(isGpu?"gpu":"cpu")+'">'+(isGpu?"GPU":"CPU")+' · '+label+'</span>'+os+sched+'<span>up '+updn(x.uptimeS||0)+'</span></div>'
+      +'</div>'+stateChip(x)+'</div>'
+      +spark(x.trend,300,34,col)
+      +'<div class="grid3">'
+        +'<div><div class="cellv">'+pct(x.share)+'</div><div class="celll">share</div></div>'
+        +'<div><div class="cellv">'+fmt(x.ops||0)+'</div><div class="celll">ops</div></div>'
+        +'<div><div class="cellv">'+fmt(x.tokens||0)+'</div><div class="celll">tokens</div></div>'
+        +'<div><div class="cellv">'+fmt(x.units||0)+'</div><div class="celll">kernel-elts</div></div>'
+      +'</div>'
+      +'<div class="util"><span>shards <b>'+(x.shards|0)+'</b></span><span>avg <b>'+(x.avgMs||0)+'ms</b></span><span>user <b>'+pct(x.userUtil)+'</b></span><span>duty <b>'+pct(x.poolDuty)+'</b></span></div>'
+      +'<div class="ctl">'
+        +'<button class="mini" data-act="'+(x.paused?"resume":"pause")+'" data-id="'+esc(x.id)+'" title="'+(x.paused?"resume":"pause")+'">'+(x.paused?"▶ resume":"⏸ pause")+'</button>'
+        +'<div class="duty" title="usage ceiling — drag to change live"><input type="range" class="dutyslider" min="0.05" max="1" step="0.05" value="'+ceil+'" data-id="'+esc(x.id)+'"><span class="dv">'+Math.round(ceil*100)+'%</span></div>'
+        +'<input class="schedin" value="'+esc(x.schedule||"always")+'" data-id="'+esc(x.id)+'" title="always · idle-only · a window like 22:00-07:00. Applied on Enter/blur.">'
+        +'<input class="nickin" value="'+esc(x.nick||"")+'" placeholder="'+esc(x.id)+'" data-id="'+esc(x.id)+'" title="rename this worker — applied on Enter/blur">'
+        +'<button class="mini danger" data-act="remove" data-id="'+esc(x.id)+'" title="remove worker">✕</button>'
+      +'</div>'
+    +'</div>';
+  }).join("");
 }
-// inline SVG sparkline from an array of values
-function spark(arr,w,h,col){arr=arr||[];if(!arr.length)return '<svg width='+w+' height='+h+'></svg>';
- const mx=Math.max(1,...arr);const step=w/Math.max(1,arr.length-1);
- const pts=arr.map((v,i)=>(i*step).toFixed(1)+','+(h-2-(v/mx)*(h-4)).toFixed(1)).join(' ');
- return '<svg width='+w+' height='+h+' viewBox="0 0 '+w+' '+h+'" preserveAspectRatio=none><polyline points="'+pts+'" fill=none stroke="'+col+'" stroke-width=1.5 stroke-linejoin=round stroke-linecap=round/></svg>';}
-async function refresh(){
- try{
-  const g=await (await fetch('/gpu',{headers:H()})).json();
-  if(g.error){document.getElementById('authmsg').textContent='enter admin token';return;}
-  document.getElementById('authmsg').textContent='';
-  document.getElementById('slots').textContent=g.slots;
-  document.getElementById('slotsub').textContent=g.gpuSlots+' GPU · '+g.cpuSlots+' CPU · '+g.busy+' busy';
-  document.getElementById('uu').textContent=pct(g.avgUserUtil);document.getElementById('uubar').style.width=pct(g.avgUserUtil);
-  document.getElementById('pd').textContent=pct(g.avgPoolDuty);document.getElementById('pdbar').style.width=pct(g.avgPoolDuty);
-  document.getElementById('ops').textContent=fmt(g.totalOps||0);
-  document.getElementById('toks').textContent=fmt(g.totalTokens||0);
-  document.getElementById('units').textContent=fmt(g.totalUnits);
-  document.getElementById('tpspark').innerHTML=spark(g.poolTrend,190,30,'#6366f1');
-  document.getElementById('q').textContent=g.queueDepth;
-  const pk=g.perKernel||{};const ks=Object.keys(pk);
-  document.getElementById('kernels').innerHTML=ks.length?ks.map(k=>'<span class=k>'+k+' · '+pk[k]+'</span>').join(' '):'no jobs yet';
-  FLEET=await (await fetch('/workers',{headers:H()})).json();
-  renderFleet();
-  const j=await (await fetch('/jobs',{headers:H()})).json();
-  document.getElementById('jd').textContent=j.filter(x=>x.status==='done').length;
-  document.getElementById('jf').textContent=j.filter(x=>x.status==='failed').length;
-  const L=await (await fetch('/logs',{headers:H()})).json();
-  document.getElementById('logs').innerHTML=L.slice(0,80).map(e=>'<span class=lvl-'+esc(e.level)+'>'+new Date(e.ts).toLocaleTimeString()+' ['+esc(e.level)+'] '+esc(e.msg)+(e.ctx?' · '+esc(e.ctx):'')+'</span>').join('\\n');
- }catch(e){}
+
+/* ---------- main refresh ---------- */
+function refresh(){
+  /* health is public — always try it so the header stays alive even without a token */
+  fetch("/health").then(function(r){return r.json();}).then(function(h){
+    $("hFleet").textContent=(h.fleet==null?"—":h.fleet);
+    $("hQueue").textContent=(h.queue==null?"—":h.queue);
+    $("hDot").className="dot "+(h.ok?"on":"off");
+  }).catch(function(){$("hDot").className="dot off";});
+
+  if(!tok()){showGate(true);return;}
+
+  jget("/gpu").then(function(g){
+    AUTH_BAD=false;$("gate").classList.remove("show");
+    $("kSlots").textContent=(g.slots==null?"—":g.slots);
+    $("kSlotsub").textContent=(g.gpuSlots||0)+" GPU · "+(g.cpuSlots||0)+" CPU · "+(g.busy||0)+" busy";
+    $("kUU").textContent=pct(g.avgUserUtil);$("kUUbar").style.width=pct(g.avgUserUtil);
+    $("kPD").textContent=pct(g.avgPoolDuty);$("kPDbar").style.width=pct(g.avgPoolDuty);
+    $("kOps").textContent=fmt(g.totalOps||0);
+    $("kToks").textContent=fmt(g.totalTokens||0);
+    $("kUnits").textContent=fmt(g.totalUnits||0);
+    $("kQueue").textContent=(g.queueDepth||0);
+    $("kSpark").innerHTML=spark(g.poolTrend,300,40,"#818cf8");
+    var pk=g.perKernel||{},ks=Object.keys(pk);
+    $("kernels").innerHTML=ks.length?ks.map(function(k){return '<span class="k">'+esc(k)+' · '+(pk[k]|0)+'</span>';}).join(""):'<span class="empty">no jobs yet</span>';
+  }).catch(function(e){if(e&&e.auth)onAuthErr();});
+
+  jget("/workers").then(function(w){
+    FLEET=Array.isArray(w)?w:[];renderFleet();
+  }).catch(function(e){if(e&&e.auth)onAuthErr();});
+
+  jget("/jobs").then(function(j){
+    if(!Array.isArray(j))return;
+    $("kDone").textContent=j.filter(function(x){return x.status==="done";}).length;
+    $("kFail").textContent=j.filter(function(x){return x.status==="failed";}).length;
+  }).catch(function(){});
+
+  jget("/logs").then(function(L){
+    if(!Array.isArray(L)){$("logs").textContent="—";return;}
+    $("logs").innerHTML=L.slice(0,80).map(function(e){
+      return '<span class="lg-'+esc(e.level)+'">'+new Date(e.ts).toLocaleTimeString()+" ["+esc(e.level)+"] "+esc(e.msg)+(e.ctx?" · "+esc(e.ctx):"")+'</span>';
+    }).join("\\n")||"—";
+  }).catch(function(){});
 }
-async function submit(){const m=document.getElementById('jobmsg');m.textContent='running…';
- const r=await fetch('/submit',{method:'POST',headers:H(),body:JSON.stringify({kernel:document.getElementById('kernel').value,size:+document.getElementById('size').value})});
- const j=await r.json();m.textContent=j.status==='done'?('done · '+(j.gflops?j.gflops.toFixed(1)+' GFLOP/s · ':'')+'verified='+j.verified):(j.note||j.error||j.status);refresh();}
-document.getElementById('fleet').addEventListener('click',function(ev){
- var b=ev.target.closest&&ev.target.closest('button[data-act]');if(!b)return;
- var id=b.getAttribute('data-id'),act=b.getAttribute('data-act');
- if(act==='remove'){if(!confirm('Remove worker '+id+'?'))return;ctl(id,{action:'remove'});}
- else ctl(id,{action:act});
+
+/* ---------- fleet events (delegated) ---------- */
+$("fleet").addEventListener("click",function(ev){
+  var b=ev.target.closest&&ev.target.closest("button[data-act]");if(!b)return;
+  var id=b.getAttribute("data-id"),act=b.getAttribute("data-act");
+  if(act==="remove"){if(!confirm("Remove worker "+id+"? It will be banned by key if signed."))return;ctl(id,{action:"remove"});}
+  else ctl(id,{action:act});
 });
-// usage slider: live label while dragging, apply the ceiling on release (no full refresh, so it stays smooth)
-document.getElementById('fleet').addEventListener('input',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('dutyslider'))return;var v=s.parentNode.querySelector('.dutyval');if(v)v.textContent=Math.round(s.value*100)+'%';});
-document.getElementById('fleet').addEventListener('change',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('dutyslider'))return;ctl(s.getAttribute('data-id'),{ceil:parseFloat(s.value)},true);});
-// schedule: apply on blur/Enter (always · idle-only · HH:MM-HH:MM). Blank → always.
-document.getElementById('fleet').addEventListener('change',function(ev){var s=ev.target;if(!s.classList||!s.classList.contains('schedin'))return;ctl(s.getAttribute('data-id'),{schedule:(s.value||'always').trim()});});
-document.getElementById('fleet').addEventListener('keydown',function(ev){if(ev.key==='Enter'&&ev.target.classList&&ev.target.classList.contains('schedin'))ev.target.blur();});
-refresh();setInterval(refresh,2500);
+$("fleet").addEventListener("pointerdown",function(ev){if(ev.target.classList&&ev.target.classList.contains("dutyslider"))DRAGGING=true;});
+window.addEventListener("pointerup",function(){if(DRAGGING){DRAGGING=false;}});
+$("fleet").addEventListener("input",function(ev){
+  var s=ev.target;if(!s.classList||!s.classList.contains("dutyslider"))return;
+  DRAGGING=true;
+  var v=s.parentNode.querySelector(".dv");if(v)v.textContent=Math.round(s.value*100)+"%";
+});
+$("fleet").addEventListener("change",function(ev){
+  var s=ev.target;if(!s.classList)return;
+  if(s.classList.contains("dutyslider")){DRAGGING=false;ctl(s.getAttribute("data-id"),{ceil:parseFloat(s.value)},true);}
+  else if(s.classList.contains("schedin")){ctl(s.getAttribute("data-id"),{schedule:(s.value||"always").trim()});}
+  else if(s.classList.contains("nickin")){ctl(s.getAttribute("data-id"),{nick:s.value.trim()});}
+});
+$("fleet").addEventListener("keydown",function(ev){
+  if(ev.key==="Enter"&&ev.target.classList&&(ev.target.classList.contains("schedin")||ev.target.classList.contains("nickin")))ev.target.blur();
+});
+$("fSearch").addEventListener("input",renderFleet);
+$("pauseAll").addEventListener("click",function(){pauseAll(true);});
+$("resumeAll").addEventListener("click",function(){pauseAll(false);});
+
+/* ---------- token bar / gate ---------- */
+function setToken(v){localStorage.setItem(K,(v||"").trim());$("tokTop").value=tok();AUTH_BAD=false;}
+$("tokTop").value=tok();
+$("tokTop").addEventListener("change",function(){setToken($("tokTop").value);toast("Token saved","ok");refresh();});
+$("signout").addEventListener("click",function(){localStorage.removeItem(K);$("tokTop").value="";toast("Signed out");showGate(true);});
+$("tokGateBtn").addEventListener("click",function(){setToken($("tokGate").value);showGate(false);toast("Token saved","ok");refresh();});
+$("tokGate").addEventListener("keydown",function(ev){if(ev.key==="Enter")$("tokGateBtn").click();});
+
+/* ---------- model serving ---------- */
+var MID=null,POLLING=false;
+function mstat(text,cls){var e=$("mStatus");e.className="mstatus"+(cls?" "+cls:"");e.innerHTML=text;}
+function addMsg(role,text){
+  var box=$("mChat");box.style.display="flex";
+  var el=document.createElement("div");el.className="msg "+role;el.textContent=text;box.appendChild(el);box.scrollTop=box.scrollHeight;return el;
+}
+function modelReady(r){
+  MID=(r&&r.id)||$("mModel").value.trim();
+  $("mChatBar").style.display="flex";$("mChat").style.display="flex";$("mSend").disabled=false;
+  var parts=[];
+  if(r&&r.worker)parts.push("on "+esc(r.worker));
+  if(r&&r.device)parts.push(esc(r.device));
+  if(r&&r.n_params)parts.push(Number(r.n_params).toLocaleString()+" params");
+  if(r&&r.mode==="download-free")parts.push("download-free"+(r.staging?" ("+esc(r.staging)+")":""));
+  mstat("✓ ready — <b>"+esc(MID)+"</b>"+(parts.length?" · "+parts.join(" · "):"")+" — type a message below.","ok");
+}
+function pollStatus(id,t0){
+  if(POLLING)return;POLLING=true;
+  var tick=function(){
+    jget("/model/status?id="+encodeURIComponent(id)).then(function(r){
+      if(r.status==="ready"){POLLING=false;modelReady(r);return;}
+      if(r.status==="error"){POLLING=false;mstat("✗ "+esc(r.error||"load failed"),"err");return;}
+      if(r.status==="unknown"){POLLING=false;mstat("✗ model not found — try loading again","err");return;}
+      mstat("streaming <b>"+esc(id)+"</b>… "+Math.round((Date.now()-t0)/1000)+"s (weights → worker)");
+      setTimeout(tick,2000);
+    }).catch(function(e){if(e&&e.auth){POLLING=false;onAuthErr();return;}setTimeout(tick,2500);});
+  };
+  tick();
+}
+$("mLoad").addEventListener("click",function(){
+  if(!tok()){onAuthErr();return;}
+  MID=null;$("mSend").disabled=true;
+  var m=$("mModel").value.trim();if(!m){toast("Enter a model id","err");return;}
+  var wk=$("mWorker").value.trim(),push=$("mPush").checked;
+  mstat((push?"streaming ":"loading ")+"<b>"+esc(m)+"</b>… (this may take a moment)");
+  var body={model:m,id:m,push:push};if(wk)body.worker=wk;if(push)body.async=true;
+  jpost("/model/load",body).then(function(r){
+    if(r.error){mstat("✗ "+esc(r.error),"err");return;}
+    if(r.status==="loading"){pollStatus(m,Date.now());return;}
+    modelReady(r);
+  }).catch(function(e){if(e&&e.auth){onAuthErr();return;}mstat("✗ "+esc(e&&e.message||e),"err");});
+});
+function sendChat(){
+  var p=$("mPrompt"),text=p.value.trim();if(!text)return;
+  if(!MID){toast("Load a model first","err");return;}
+  addMsg("u",text);p.value="";
+  var rep=addMsg("b","…"),sb=$("mSend");sb.disabled=true;
+  var max=(+$("mMax").value)||96;
+  jpost("/model/chat",{id:MID,prompt:text,max_new_tokens:max,do_sample:$("mSamp").checked}).then(function(r){
+    if(r.error){rep.textContent="✗ "+r.error;rep.className="msg b";sb.disabled=false;return;}
+    rep.textContent=r.text||"(empty)";
+    if(r.ms||r.worker){var m=document.createElement("span");m.className="meta";m.textContent=(r.ms?(r.ms/1000).toFixed(1)+"s":"")+(r.worker?" · "+r.worker:"");rep.appendChild(m);}
+    sb.disabled=false;$("mChat").scrollTop=$("mChat").scrollHeight;
+  }).catch(function(e){if(e&&e.auth){onAuthErr();}rep.textContent="✗ "+(e&&e.message||e);sb.disabled=false;});
+}
+$("mSend").addEventListener("click",sendChat);
+$("mPrompt").addEventListener("keydown",function(ev){if(ev.key==="Enter")sendChat();});
+
+/* ---------- network self-test ---------- */
+$("netBtn").addEventListener("click",function(){
+  if(!tok()){onAuthErr();return;}
+  var b=$("netBtn");b.disabled=true;b.textContent="probing…";$("netNote").textContent="";$("netNote").className="mstatus";
+  jget("/net").then(function(d){
+    b.disabled=false;b.textContent="Run self-test";
+    if(d.error){$("netNote").textContent="✗ "+d.error;$("netNote").className="mstatus err";$("netOut").innerHTML="";return;}
+    $("netNote").className="mstatus ok";
+    $("netNote").textContent="median RTT "+(d.median_rtt_ms==null?"–":d.median_rtt_ms+" ms")+(d.median_up_mbps!=null?" · "+d.median_up_mbps+" Mbps up":"");
+    var rows=(d.workers||[]).map(function(w){
+      return '<tr><td>'+esc(w.id)+'</td><td class="mono">'+esc(w.backend||"")+'</td><td class="mono">'+(w.rtt_ms==null?"–":w.rtt_ms+" ms")+'</td><td class="mono">'+(w.up_mbps==null?esc(w.up_note||"–"):w.up_mbps+" Mbps")+'</td></tr>';
+    }).join("");
+    var li=function(a){return (a||[]).map(function(x){return "<li>"+esc(x)+"</li>";}).join("");};
+    var out='<table class="nettbl"><thead><tr><th>worker</th><th>type</th><th>RTT</th><th>up</th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="empty">no torch workers to probe</td></tr>')+'</tbody></table>';
+    out+='<div class="verdict">'
+      +'<div class="vbox ok"><h4>✓ works anywhere (latency-tolerant)</h4><ul>'+li(d.latency_tolerant_anywhere)+'</ul></div>'
+      +'<div class="vbox warn"><h4>needs low RTT (single-request sharded decode)</h4><ul>'+li(d.latency_bound_needs_low_rtt)+'</ul></div>'
+      +'</div>';
+    if(d.note)out+='<div class="note">'+esc(d.note)+'</div>';
+    $("netOut").innerHTML=out;
+  }).catch(function(e){
+    b.disabled=false;b.textContent="Run self-test";
+    if(e&&e.auth){onAuthErr();return;}
+    $("netNote").className="mstatus err";$("netNote").textContent="✗ "+(e&&e.message||e);
+  });
+});
+
+/* ---------- boot ---------- */
+if(!tok())showGate(true);
+refresh();
+setInterval(refresh,2000);
 </script>`;
 
 // ---- /chat : a minimal chatbot page to test a served model (text↔text via the worker's tokenizer) ----
