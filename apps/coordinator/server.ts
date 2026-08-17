@@ -2297,8 +2297,14 @@ if (SELF_WORKER) {
     // Under the default TLS the built-in worker connects over wss:// to `localhost` (a cert SAN) and trusts the
     // freshly minted cert via DENO_CERT (Deno's CA-file env) — no separate pin needed on this loopback hop.
     const wsUrl = TLS_CERT ? `wss://localhost:${PORT}/ws` : `ws://127.0.0.1:${PORT}/ws`;
+    // When the coordinator itself was launched from a URL (the `moregpu serve` / raw-URL path), the built-in
+    // worker resolves to the REMOTE worker.ts, which Deno serves from its module cache. A cache holding an
+    // OLDER worker.ts (e.g. from before a registration-protocol change) would desync from THIS coordinator and
+    // self-reject with "bad join token". Force-refresh just that one module in the remote case so the built-in
+    // worker always matches the coordinator; a local file:// worker is always read fresh, so skip it there.
+    const reload = workerUrl.startsWith('http') ? [`--reload=${workerUrl}`] : [];
     new Deno.Command(Deno.execPath(), {
-      args: ['run', '--unstable-webgpu', '--allow-net', '--allow-env', '--allow-sys', workerUrl,
+      args: ['run', '--unstable-webgpu', ...reload, '--allow-net', '--allow-env', '--allow-sys', workerUrl,
         '--server', wsUrl, '--token', cfg.joinToken, '--name', Deno.env.get('MOREGPU_NAME') ?? 'admin-slot'],
       env: TLS_CERT_FILE ? { DENO_CERT: TLS_CERT_FILE } : {}, // merged onto the inherited env; trusts our self-signed cert
       stdout: 'inherit', stderr: 'inherit',
