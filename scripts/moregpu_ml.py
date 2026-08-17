@@ -19,7 +19,10 @@ Connection (auto-discovered, override with flags/env):
   --token  admin token            (env MOREGPU_ADMIN_TOKEN, else adminToken from ./.moregpu-server.json)
 
 Example (one machine):
-  moregpu serve --worker                 # start a pool with a built-in torch worker
+  moregpu serve                          # start a pool (prints the join + admin tokens)
+  MOREGPU_SERVER=ws://localhost:8787/ws MOREGPU_TOKEN=<join> \
+    python3 apps/worker/worker_torch.py  # a NATIVE TORCH worker (serve --worker gives a WebGPU slot, which
+                                         # cannot train/serve models — fine-tuning needs autograd, i.e. torch)
   moregpu finetune gpt2 --data notes.txt # LoRA fine-tune on notes.txt, saves gpt2-lora.json
   moregpu chat gpt2 --from-training      # chat with the fine-tuned model
 """
@@ -30,6 +33,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 DEMO_TEXT = (
@@ -60,11 +64,18 @@ class Pool:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 return json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:  # surface the coordinator's JSON error, not a bare 502
+        except urllib.error.HTTPError as e:  # server answered 4xx/5xx — surface its JSON error, not a bare 502
             try:
                 return json.loads(e.read().decode())
             except Exception:
                 raise RuntimeError(f"{method} {path} → HTTP {e.code}") from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            # Never reached the coordinator: connection refused / DNS / timeout / TLS-verify. Exit clean (this
+            # is a no-code CLI — a raw traceback would be user-hostile). Note the self-signed-https limit.
+            reason = getattr(e, "reason", e)
+            sys.exit(f"cannot reach the coordinator at {self.url} ({reason}).\n"
+                     f"  Is it running, and is the URL right? Set MOREGPU_SERVER or pass --url.\n"
+                     f"  (A self-signed https:// coordinator isn't supported here — use a real-cert tunnel or ws://.)")
 
     def workers(self) -> list:
         w = self._req("/workers")
@@ -150,8 +161,11 @@ def read_corpus(path: str | None, tok) -> str:
             out.append(r)
         elif "text" in r:
             out.append(str(r["text"]))
-        elif "messages" in r and getattr(tok, "chat_template", None):
-            out.append(tok.apply_chat_template(r["messages"], tokenize=False))
+        elif "messages" in r:
+            if getattr(tok, "chat_template", None):
+                out.append(tok.apply_chat_template(r["messages"], tokenize=False))
+            else:  # no chat template on this base model → train on the raw turn TEXT, not the JSON envelope
+                out.append("\n".join(str(m.get("content", "")) for m in r["messages"] if isinstance(m, dict)))
         elif "prompt" in r or "completion" in r:
             out.append(str(r.get("prompt", "")) + str(r.get("completion", "")))
         else:
@@ -184,6 +198,8 @@ def slope(ys: list[float]) -> float:
 
 # ----------------------------------------------------------------------------- commands
 def cmd_finetune(args) -> int:
+    if args.steps < 1:  # else windows() yields no batches, losses stays empty → IndexError below
+        sys.exit("--steps must be >= 1")
     pool = discover(args)
     tok = load_tokenizer(args.model)
     text = read_corpus(args.data, tok)
@@ -314,7 +330,7 @@ def main(argv=None) -> int:
     g.add_argument("--max-new", dest="max_new", type=int, default=40)
     g.add_argument("--from-training", action="store_true", help="use the live just-fine-tuned model")
     g.add_argument("--push", action="store_true", help="download-free: coordinator streams weights to the "
-                   "worker (needs a model.safetensors on HF; zero SSD on the worker)")
+                   "worker (needs a model.safetensors on HF; RAM-staged where /dev/shm exists, else a transient disk dir)")
     g.set_defaults(fn=cmd_generate)
 
     c = sub.add_parser("chat", help="interactive chat (one turn per line)")

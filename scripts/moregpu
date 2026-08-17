@@ -144,19 +144,23 @@ cmd_serve() {
   echo "[moregpu] starting coordinator behind $tun on :$port (plaintext ws:// — the tunnel terminates TLS)…"
   MOREGPU_INSECURE=1 MOREGPU_BIND=127.0.0.1 PORT="$port" MOREGPU_CONFIG="$cfg" \
     deno run --allow-net --allow-env --allow-read --allow-write --allow-run --allow-sys "$SERVER_TS" --worker ${pass[@]+"${pass[@]}"} &
-  local coord=$! i
+  local coord=$! i tlog="" tunpid=""
+  # Arm cleanup BEFORE the waits/polls below so a Ctrl-C during startup tears down the coordinator + tunnel
+  # instead of orphaning them on the bound port. (${var:-} because tunpid/tlog aren't set yet at this point.)
+  trap 'kill ${coord:-} ${tunpid:-} 2>/dev/null; [ -n "${tlog:-}" ] && rm -f "$tlog"; exit 0' INT TERM
   for i in $(seq 1 60); do curl -fsS "http://localhost:$port/health" >/dev/null 2>&1 && break; sleep 0.5; done
-  local tlog; tlog="$(mktemp)"
+  tlog="$(mktemp)"
   if [ "$tun" = cloudflared ]; then cloudflared tunnel --url "http://localhost:$port" --no-autoupdate >"$tlog" 2>&1 &
   else ngrok http "$port" --log=stdout >"$tlog" 2>&1 & fi
-  local tunpid=$! url=""
+  tunpid=$!; local url=""
   for i in $(seq 1 40); do
-    url="$(grep -oE 'https://[a-z0-9._-]+\.(trycloudflare\.com|ngrok[-a-z.]*)' "$tlog" 2>/dev/null | head -1)"
+    # `|| true`: under `set -euo pipefail` a no-match grep exits 1 and pipefail would abort the whole
+    # command (killing the poll + orphaning coord/tunnel) — a not-yet-published URL is expected, not fatal.
+    url="$(grep -oE 'https://[a-z0-9._-]+\.(trycloudflare\.com|ngrok[-a-z.]*)' "$tlog" 2>/dev/null | head -1 || true)"
     [ -n "$url" ] && break; sleep 1
   done
-  trap "kill $coord $tunpid 2>/dev/null; rm -f $tlog; exit 0" INT TERM
   [ -z "$url" ] && { echo "[moregpu] tunnel did not come up — see $tlog" >&2; wait "$coord"; return; }
-  local join; join="$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$cfg')).joinToken)" 2>/dev/null)"
+  local join; join="$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('$cfg')).joinToken)" 2>/dev/null || true)"
   local wss="${url/https:/wss:}"
   echo ""
   echo "  ============================================================================"
@@ -170,15 +174,16 @@ cmd_serve() {
 }
 
 # no-code fine-tune / inference (finetune|generate|chat) — drives the pool's train + serve API so users
-# never hand-write a training loop. Runs the local driver in a clone, else fetches it from the repo. The
-# connection (URL from mg_base, admin token from env) is injected BEFORE the subcommand (argparse needs the
-# top-level flags first); the driver also auto-reads the admin token from ./.moregpu-server.json.
+# never hand-write a training loop. Runs the local driver in a clone, else fetches it from the repo. Only
+# the URL is injected on argv (BEFORE the subcommand — argparse needs the top-level flag first); the admin
+# token is passed via the INHERITED ENVIRONMENT (not argv, which is world-readable via ps/proc) — the driver
+# reads MOREGPU_ADMIN_TOKEN from env, or the adminToken from ./.moregpu-server.json.
 ml_run() {
   command -v python3 >/dev/null 2>&1 || { echo "[moregpu] fine-tuning/inference needs python3 (+ torch & transformers on the worker)." >&2; exit 1; }
   local self_dir local_py conn=(--url "$(mg_base)")
   self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
   local_py="$self_dir/moregpu_ml.py"
-  [ -n "${MOREGPU_ADMIN_TOKEN:-}" ] && conn+=(--token "$MOREGPU_ADMIN_TOKEN")
+  [ -n "${MOREGPU_ADMIN_TOKEN:-}" ] && export MOREGPU_ADMIN_TOKEN   # ensure the driver inherits it, off argv
   if [ -f "$local_py" ]; then exec python3 "$local_py" ${conn[@]+"${conn[@]}"} "$@"; fi
   local f; f="$(mktemp)"; trap 'rm -f "$f"' EXIT
   curl -fsSL "$RAW/scripts/moregpu_ml.py" -o "$f" || { echo "[moregpu] failed to fetch moregpu_ml.py" >&2; exit 1; }
