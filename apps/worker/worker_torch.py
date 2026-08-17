@@ -171,7 +171,18 @@ def _paced(fn, args, ceil_val, pace_it=True):
     at most `ceil_val` of the time — a real duty-cycle throttle. Since the pool is single-threaded, sleeping here
     genuinely paces ALL of this node's compute (kernels + serving + sharding), so the admin slider now DOES
     something: a lower ceiling → the node contributes more slowly, leaving the rest of its time to its owner."""
-    t0 = time.perf_counter(); r = fn(*args); dt = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    try:
+        r = fn(*args)
+    except RuntimeError as e:
+        # The op ran out of device memory (CUDA raises OutOfMemoryError, MPS a RuntimeError — both carry
+        # "out of memory"). Return the caching allocator's cached blocks to the driver so the NEXT request on
+        # this SHARED node isn't starved by fragmentation, then re-raise unchanged. We're on the compute thread,
+        # so empty_cache is serialized with all other device work (never races a kernel/generate).
+        if "out of memory" in str(e).lower():
+            _empty_cache()
+        raise
+    dt = time.perf_counter() - t0
     if pace_it and ceil_val < 0.999:
         pace = min(10.0, dt * (1.0 / max(0.05, ceil_val) - 1.0))  # idle time to hold busy-fraction ≈ ceil (capped 10s)
         if pace > 0.001:
@@ -408,9 +419,13 @@ def model_load(cfg: dict) -> dict:
     # report the effective dtype so the caller knows the request was downgraded.
     fp16_requested = bool(cfg.get("fp16"))
     fp16_effective = fp16_requested and DEV != "cpu"
-    # Evict the LRU victim (MODELS is kept most-recent-last) and free VRAM BEFORE allocating the replacement,
-    # so peak residency never exceeds the cap (loading first would briefly hold MAX+1 models on-device).
-    if mid not in MODELS and len(MODELS) >= MAX_RESIDENT_MODELS:
+    # Free VRAM BEFORE allocating the replacement so peak residency never exceeds the cap (loading first would
+    # briefly hold one model too many on-device). Two cases: reloading the SAME id must drop its old model first
+    # (else the new .to(DEV) transiently doubles that id's residency); otherwise, if at the cap, evict the LRU
+    # victim (MODELS is kept most-recent-last).
+    if mid in MODELS:
+        MODELS.pop(mid, None); _empty_cache()
+    elif len(MODELS) >= MAX_RESIDENT_MODELS:
         MODELS.pop(next(iter(MODELS)), None); _empty_cache()
     model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float16 if fp16_effective else torch.float32).to(DEV).eval()
     MODELS.pop(mid, None); MODELS[mid] = model  # (re)insert as most-recent
@@ -1690,8 +1705,17 @@ async def run():
                                 # KEEP in-progress PUSH staging, though: a stage that dropped mid-stream can then
                                 # RESUME (the coordinator re-streams only the missing bytes). A genuinely new
                                 # coordinator wipes it anyway via push_begin (resume=false) before its first chunk.
-                                resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear(); MOE_BB.clear(); MOE_EXPERTS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={}); _empty_cache()
-                                RING.clear(); MOE_WIRE.clear(); MOE_PEER.clear()  # a fresh coordinator session re-wires the ring/mesh after (re)load
+                                # Drop the resident tensors + empty_cache ON THE COMPUTE THREAD: freeing device
+                                # memory (and empty_cache itself) is a device op, and MPS is not thread-safe — doing
+                                # it on the event loop could race a kernel/generate still finishing on TORCH_POOL.
+                                # Awaiting serializes the reset AFTER any in-flight compute; heartbeats run on their
+                                # own task, so the connection stays live meanwhile.
+                                def _reset_session():
+                                    resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear()
+                                    MOE_BB.clear(); MOE_EXPERTS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={})
+                                    RING.clear(); MOE_WIRE.clear(); MOE_PEER.clear()  # a fresh coordinator session re-wires the ring/mesh after (re)load
+                                    _empty_cache()
+                                await loop.run_in_executor(TORCH_POOL, _reset_session)
                                 print(f"[torch-worker] joined pool on {DEV} · duty ceiling {int(ceil*100)}% · key epoch {epoch} (per-worker key)")
                             elif t == "control":
                                 if "pause" in m: paused = bool(m["pause"]); pause_reason = "admin" if paused else ""
