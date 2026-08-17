@@ -97,8 +97,10 @@ class Pool:
         return self._req("/train/generate", "POST",
                          {"input_ids": list(ids), "max_new_tokens": max_new_tokens}).get("tokens", [])
 
-    def model_load(self, model, push=False):
-        return self._req("/model/load", "POST", {"model": model, "push": push})
+    def model_load(self, model, push=False, fp16=False):
+        # fp16 halves VRAM/bandwidth on a GPU worker (CUDA/MPS) — the difference between a multi-B model
+        # fitting a single GPU or not; a CPU worker downgrades to fp32 (no half GEMM) and says so.
+        return self._req("/model/load", "POST", {"model": model, "push": push, "fp16": fp16})
 
     def generate(self, ids, max_new_tokens=40):
         return self._req("/model/generate", "POST",
@@ -260,7 +262,7 @@ def cmd_generate(args) -> int:
     pool = discover(args)
     tok = load_tokenizer(args.model)
     if not args.from_training:
-        info = pool.model_load(args.model, push=args.push)
+        info = pool.model_load(args.model, push=args.push, fp16=args.fp16)
         if not info.get("ok"):
             sys.exit(f"model/load failed: {info.get('error', info)}")
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
@@ -274,7 +276,7 @@ def cmd_chat(args) -> int:
     pool = discover(args)
     tok = load_tokenizer(args.model)
     if not args.from_training:
-        info = pool.model_load(args.model, push=args.push)
+        info = pool.model_load(args.model, push=args.push, fp16=args.fp16)
         if not info.get("ok"):
             sys.exit(f"model/load failed: {info.get('error', info)}")
     where = "fine-tuned (live)" if args.from_training else "base"
@@ -331,6 +333,8 @@ def main(argv=None) -> int:
     g.add_argument("--from-training", action="store_true", help="use the live just-fine-tuned model")
     g.add_argument("--push", action="store_true", help="download-free: coordinator streams weights to the "
                    "worker (needs a model.safetensors on HF; RAM-staged where /dev/shm exists, else a transient disk dir)")
+    g.add_argument("--fp16", action="store_true", help="load in fp16 on a GPU worker — halves VRAM so a bigger "
+                   "model fits (CPU workers downgrade to fp32)")
     g.set_defaults(fn=cmd_generate)
 
     c = sub.add_parser("chat", help="interactive chat (one turn per line)")
@@ -339,6 +343,7 @@ def main(argv=None) -> int:
     c.add_argument("--max-new", dest="max_new", type=int, default=40)
     c.add_argument("--from-training", action="store_true", help="chat with the live just-fine-tuned model")
     c.add_argument("--push", action="store_true", help="download-free: coordinator streams weights to the worker")
+    c.add_argument("--fp16", action="store_true", help="load in fp16 on a GPU worker — halves VRAM (CPU downgrades to fp32)")
     c.set_defaults(fn=cmd_chat)
 
     args = p.parse_args(argv)
