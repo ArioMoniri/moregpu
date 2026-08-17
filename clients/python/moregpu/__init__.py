@@ -203,6 +203,12 @@ class MoreGPU:
         """Pull the small trained LoRA adapter back (name → {data:b64 f32, shape})."""
         return self._req("/train/adapter", "POST", {})
 
+    def train_generate(self, input_ids: Sequence[int], max_new_tokens: int = 32) -> list[int]:
+        """Greedy-generate from the LIVE fine-tuned model (frozen base + the adapter trained so far) — chat
+        with what you just trained, no separate load. Returns the new token ids."""
+        return self._req("/train/generate", "POST",
+                         {"input_ids": list(input_ids), "max_new_tokens": max_new_tokens}).get("tokens", [])
+
     # ---- DiLoCo: distributed LoRA across many torch workers (coordinator = parameter server) ----
     def diloco_load(self, model: str, rank: int = 8, alpha: float = 16, lr: float = 1e-3,
                     seed: int = 0, targets: Sequence[str] | None = None, workers: Sequence[str] | None = None) -> dict:

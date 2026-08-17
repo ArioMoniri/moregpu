@@ -128,6 +128,12 @@ deno run --allow-net --allow-env --allow-read --allow-write \
 >   https://raw.githubusercontent.com/ArioMoniri/moregpu/main/apps/coordinator/server.ts --worker
 > ```
 
+> [!TIP]
+> ☁️ **Want machines on other networks to join?** With the [`moregpu`](scripts/moregpu) CLI, one command starts the pool **and** exposes it over a real-cert tunnel, then prints the ready-to-paste worker line (remote workers join with **no pin** — the tunnel presents a real certificate):
+> ```sh
+> moregpu serve --tunnel        # needs cloudflared (or ngrok) on PATH
+> ```
+
 <details>
 <summary><b>▶ What to expect · verify it's up · monitor · stop</b></summary>
 
@@ -308,6 +314,21 @@ MOREGPU_BASE=http://localhost:8787 MOREGPU_ADMIN_TOKEN=<admin-token> \
 The **native torch worker** is an opt-in, admin-installed peer of the WebGPU worker (same sealed protocol,
 same join token). It computes with PyTorch on the best local device (CUDA → Apple MPS → CPU), which unlocks
 device-resident serving and — via autograd — on-pool fine-tuning.
+
+**No code — the whole lifecycle from the CLI.** Once a torch worker is in the pool, the `moregpu` CLI drives
+fine-tuning and inference for you (it talks to the pool's train + serve API — you never write a training loop
+or touch a tokenizer):
+
+```sh
+moregpu finetune gpt2 --data notes.txt    # LoRA fine-tune on your text; saves the adapter, prints before/after
+moregpu chat     gpt2 --from-training      # chat with the model you just fine-tuned (its adapter is still live)
+moregpu generate gpt2 --prompt "Hello, "   # or just run a model and print its continuation
+```
+
+`finetune` takes a `.txt`/`.md` file, or a `.jsonl`/`.json` of `{text}` | `{prompt,completion}` | `{messages}`
+(omit `--data` for a built-in demo text); it saves a portable `<model>-lora.json` adapter. Verified end-to-end
+across two architectures — GPT-2 (fused-QKV `c_attn`) and Llama-family (`q_proj`/`v_proj`). Needs `python3` with
+`torch`+`transformers` on the machine you run it from. Everything below is the same thing, spelled out by hand:
 
 ```sh
 pip install torch transformers cryptography websockets     # the torch worker's deps

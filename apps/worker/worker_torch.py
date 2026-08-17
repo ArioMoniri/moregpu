@@ -353,10 +353,38 @@ def train_set_adapter(payload: dict) -> dict:
                 p.copy_(b64_to_t(t["data"]).reshape(p.shape).to(DEV))
     return {"ok": True, "step": TRAIN["step"]}
 
+def train_generate(payload: dict) -> dict:
+    """Greedy generation from the LIVE training model — frozen base + the LoRA adapter as trained SO FAR.
+    Lets you chat with the model you just fine-tuned without a separate load (the adapter is already resident).
+    Read-only: flips to eval() for the decode, then restores train() so the next /train/step is unaffected."""
+    model = TRAIN["model"]
+    if model is None:
+        raise RuntimeError("no training session — call train_load first")
+    _check_ids(getattr(model.config, "vocab_size", 1 << 30), payload["input_ids"])
+    n = max(1, min(int(payload.get("max_new_tokens", 32)), 1024))     # cap → one bounded round-trip
+    _check_ctx(model, len(payload["input_ids"]), extra=n)             # prompt + decode must fit the context
+    ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=DEV).unsqueeze(0)
+    kw = {"max_new_tokens": n, "do_sample": False, "use_cache": True, "attention_mask": torch.ones_like(ids)}
+    eos = getattr(model.config, "eos_token_id", None)
+    if eos is not None:
+        kw["pad_token_id"] = eos[0] if isinstance(eos, (list, tuple)) else eos
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            out = model.generate(ids, **kw)
+    finally:
+        if was_training: model.train()   # leave the session exactly as training left it
+    if DEV == "mps": torch.mps.synchronize()
+    elif DEV == "cuda": torch.cuda.synchronize()
+    new = out[0, ids.shape[1]:].tolist()
+    return {"ok": True, "tokens": new, "n": len(new), "step": TRAIN["step"]}
+
 def train_dispatch(op: str, payload: dict) -> dict:
     if op == "load": return train_load(payload)
     if op == "step": return train_step(payload)
     if op == "adapter": return train_adapter()
+    if op == "generate": return train_generate(payload)
     if op == "inner": return train_inner(payload)
     if op == "set_adapter": return train_set_adapter(payload)
     raise ValueError(f"unknown train op {op}")

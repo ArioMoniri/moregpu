@@ -169,6 +169,23 @@ cmd_serve() {
   wait "$coord"
 }
 
+# no-code fine-tune / inference (finetune|generate|chat) — drives the pool's train + serve API so users
+# never hand-write a training loop. Runs the local driver in a clone, else fetches it from the repo. The
+# connection (URL from mg_base, admin token from env) is injected BEFORE the subcommand (argparse needs the
+# top-level flags first); the driver also auto-reads the admin token from ./.moregpu-server.json.
+ml_run() {
+  command -v python3 >/dev/null 2>&1 || { echo "[moregpu] fine-tuning/inference needs python3 (+ torch & transformers on the worker)." >&2; exit 1; }
+  local self_dir local_py conn=(--url "$(mg_base)")
+  self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
+  local_py="$self_dir/moregpu_ml.py"
+  [ -n "${MOREGPU_ADMIN_TOKEN:-}" ] && conn+=(--token "$MOREGPU_ADMIN_TOKEN")
+  if [ -f "$local_py" ]; then exec python3 "$local_py" ${conn[@]+"${conn[@]}"} "$@"; fi
+  local f; f="$(mktemp)"; trap 'rm -f "$f"' EXIT
+  curl -fsSL "$RAW/scripts/moregpu_ml.py" -o "$f" || { echo "[moregpu] failed to fetch moregpu_ml.py" >&2; exit 1; }
+  [ -s "$f" ] || { echo "[moregpu] fetched moregpu_ml.py is empty" >&2; exit 1; }
+  exec python3 "$f" ${conn[@]+"${conn[@]}"} "$@"
+}
+
 cmd="${1:-__menu__}"; [ $# -gt 0 ] && shift || true
 
 case "$cmd" in
@@ -177,6 +194,8 @@ case "$cmd" in
   serve)   cmd_serve "$@" ;;
   join)    need_deno; exec deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
   install) exec sh -c "curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVICE=1 sh" ;;
+
+  finetune|generate|chat) ml_run "$cmd" "$@" ;;
 
   isolate) need_deno
     command -v bash >/dev/null 2>&1 || { echo "[moregpu] isolate needs bash (Linux, systemd + cgroups v2)"; exit 1; }
@@ -234,6 +253,13 @@ case "$cmd" in
     moregpu join --server wss://HOST:8787/ws --token TOK [--cpu] [--schedule 22:00-07:00]
     moregpu isolate --server … --token …       Linux: run pinned to bounded, isolated hardware
     moregpu install | stop | status | logs     the local worker service
+
+  FINE-TUNE & RUN MODELS   (no code; needs a torch worker + python3 with torch/transformers)
+    moregpu finetune MODEL [--data FILE] [--steps N] [--out FILE]
+                                               LoRA fine-tune on your text; saves the adapter, shows before/after
+    moregpu generate MODEL --prompt "…" [--from-training]
+                                               run the model; --from-training uses the just-fine-tuned one
+    moregpu chat MODEL [--from-training]        interactive chat (one turn per line)
 
   ADMIN FLEET CONTROL   (env: MOREGPU_SERVER, MOREGPU_ADMIN_TOKEN)
     moregpu workers | monitor                  list workers / pool device

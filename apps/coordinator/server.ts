@@ -1669,6 +1669,19 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     if (!r.ok) return json({ error: r.error }, 502);
     return json({ ok: true, ...r.data });
   }
+  // Generate from the LIVE fine-tuned model (base + adapter-so-far) — "chat with what you just trained",
+  // no separate load. Read-only on the worker (eval for the decode, then restores train()).
+  if (req.method === 'POST' && url.pathname === '/train/generate') {
+    if (!trainingHome) return json({ error: 'no training session — POST /train/load first' }, 409);
+    const w = workers.get(trainingHome);
+    if (!w) { trainingHome = null; return json({ error: 'training worker disconnected — reload the session' }, 503); }
+    const body = await req.json().catch(() => ({})) as { input_ids?: number[]; max_new_tokens?: number };
+    if (!Array.isArray(body.input_ids) || body.input_ids.length === 0) return json({ error: 'need {input_ids:[...]}' }, 400);
+    if (body.input_ids.length > 100_000 || !body.input_ids.every((x) => Number.isInteger(x) && x >= 0)) return json({ error: 'input_ids must be non-negative ints ≤100000' }, 400);
+    const r = await trainRPC(w, 'generate', { input_ids: body.input_ids, max_new_tokens: body.max_new_tokens });
+    if (!r.ok) return json({ error: r.error }, 502);
+    return json({ ok: true, ...r.data });
+  }
   // DiLoCo distributed LoRA: load the same seeded adapter on N workers, then run rounds (each worker does
   // H local steps on its shard; the coordinator averages + outer-Nesterov-steps + broadcasts the global).
   if (req.method === 'POST' && url.pathname === '/train/diloco/load') {

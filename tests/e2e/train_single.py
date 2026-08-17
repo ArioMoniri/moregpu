@@ -102,6 +102,17 @@ def main():
             if n in before and len(before[n]) == len(after[n]):
                 max_move = max(max_move, max((abs(a - b) for a, b in zip(before[n], after[n])), default=0.0))
         check(max_move > 1e-6, f"the LoRA adapter trained off its init (max|Δparam|={max_move:.3e} > 1e-6 after {STEPS} steps)")
+
+        # (c) FINE-TUNE → INFERENCE — generate from the LIVE fine-tuned model (base + trained adapter), same
+        #     session, no reload. Must return in-vocab token ids AND leave the session trainable (a following
+        #     /train/step still works — proves train_generate restored train() and didn't corrupt the optimizer).
+        gen = td.api(port, "/train/generate", "POST", {"input_ids": batch[:8], "max_new_tokens": 6}, admin=ADMIN)
+        toks = gen.get("tokens") if isinstance(gen, dict) else None
+        check(isinstance(toks, list) and 1 <= len(toks) <= 6 and all(isinstance(t, int) and 0 <= t < td.VOCAB for t in toks),
+              f"/train/generate produced in-vocab tokens from the fine-tuned model ({toks if not isinstance(toks, list) else len(toks)})")
+        again = td.api(port, "/train/step", "POST", {"input_ids": batch, "labels": batch}, admin=ADMIN)
+        check(isinstance(again, dict) and "loss" in again and again["loss"] == again["loss"],
+              f"/train/step still works after generate (session left trainable, loss={again.get('loss')})")
         return finish(root)
     finally:
         for p in td.PROCS:
