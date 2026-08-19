@@ -1661,15 +1661,19 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     // once. TODO(review): full fix is to key training sessions by id on the worker; this guard prevents the
     // silent cross-session corruption until then.
     if (diloco && diloco.workers.includes(w.id)) return json({ error: `worker ${w.id} is part of a live DiLoCo group — it shares the single global TRAIN slot, so it can't also host a /train session; unload the DiLoCo group or pick another worker`, worker: w.id }, 409);
-    // DOWNLOAD-FREE: stage the base on the worker (fp32 for LoRA) WITHOUT push_end, so train_load reads the
-    // staged dir and this worker never touches the hub — a no-download node can fine-tune.
+    // RESERVE the single TRAIN slot BEFORE the (possibly multi-second) push, so a concurrent /train/load 409s
+    // at the guard above instead of both passing check-then-set and clobbering the slot. Roll back on failure.
+    const prevHome = trainingHome; trainingHome = w.id;
+    // DOWNLOAD-FREE: stage the base (fp32 for LoRA) WITHOUT push_end under a TRAINING-SCOPED id — never the bare
+    // model name, so a failed push's cleanup (pushModelToWorker's catch → unload {id}) can't evict a same-named
+    // resident SERVING model (MODELS[model]); train_load reads this staged id + drops it.
+    const trainStageId = `train::${body.model}`;
     if (body.push) {
-      try { await pushModelToWorker(w, body.model, body.model, false, false); }
-      catch (e) { return json({ error: `download-free training push failed: ${e instanceof Error ? e.message : e}` }, 502); }
+      try { await pushModelToWorker(w, body.model, trainStageId, false, false); }
+      catch (e) { trainingHome = prevHome; return json({ error: `download-free training push failed: ${e instanceof Error ? e.message : e}` }, 502); }
     }
-    const r = await trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets, push: body.push, id: body.model });
-    if (!r.ok) return json({ error: r.error }, 502);
-    trainingHome = w.id;
+    const r = await trainRPC(w, 'load', { model: body.model, rank: body.rank ?? 8, alpha: body.alpha ?? 16, lr: body.lr ?? 1e-3, seed: body.seed ?? 0, targets: body.targets, push: body.push, id: trainStageId });
+    if (!r.ok) { trainingHome = prevHome; return json({ error: r.error }, 502); }
     log('info', `train session loaded ${body.model} on ${w.id} · trainable=${r.data?.trainable_params}`);
     return json({ ok: true, worker: w.id, ...r.data });
   }
