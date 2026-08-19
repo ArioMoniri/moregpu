@@ -299,8 +299,10 @@ def train_load(cfg: dict) -> dict:
         st = PUSH.get(cfg.get("id"))
         if st is None:
             raise RuntimeError("training weights not staged — the coordinator must push the base before a push train_load")
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV)
-        _push_cleanup(cfg.get("id"))
+        try:
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV)
+        finally:
+            _push_cleanup(cfg.get("id"))  # drop staging on EVERY path (incl. an OOM/corrupt-load throw) so it never leaks
     else:
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV)
     if cfg.get("no_dropout"):  # deterministic training (e.g. DiLoCo) → reproducible against a reference
