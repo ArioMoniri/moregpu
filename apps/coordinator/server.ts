@@ -1932,7 +1932,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       backbone: plan?.backbone, holders: plan?.holders.map((h) => h.worker) ?? [], injects: st.injects, completes: st.completes, dispatches: st.dispatches });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; push?: boolean; async?: boolean; fp16?: boolean };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; split?: number[]; push?: boolean; async?: boolean; fp16?: boolean };
     if (!body.model) return json({ error: 'need {model} (GPT-2 / Llama-family)' }, 400);
     if (body.push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free shard` }, 400);
     // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
@@ -1967,16 +1967,24 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     }
     if (!(nLayer > 0)) nLayer = Number(body.layers) > 0 ? Math.max(1, Math.floor(Number(body.layers))) : 0;
     if (!(nLayer > 0)) return fail(`could not determine layer count for ${body.model} — pass {layers:N} to shard explicitly`, 502);
-    const nStages = Math.min(cands.length, nLayer);
-    // split [0, nLayer) into nStages contiguous ranges, as even as possible (first `extra` stages get one more)
-    const per = Math.floor(nLayer / nStages), extra = nLayer % nStages;
+    // Stage layout. Default: split [0, nLayer) into contiguous ranges, as even as possible. But an even split
+    // starves a heterogeneous fleet — a node on a 0.3 Mbps tunnel can't stream half a model in reasonable time,
+    // while its GPU could hold far more. An explicit {split:[n0,n1,...]} (per-stage layer counts, one per leading
+    // worker, summing to nLayer) lets the caller give bandwidth/VRAM-poor nodes fewer layers and fast-link nodes more.
     const stages: ShardStage[] = [];
     let cursor = 0;
-    for (let i = 0; i < nStages; i++) {
-      const size = per + (i < extra ? 1 : 0);
-      stages.push({ worker: cands[i].id, start: cursor, end: cursor + size, first: i === 0, last: i === nStages - 1 });
-      cursor += size;
+    const validSplit = Array.isArray(body.split) && body.split.length >= 1 && body.split.length <= cands.length
+      && body.split.every((n) => Number.isInteger(n) && n >= 1) && body.split.reduce((a, b) => a + b, 0) === nLayer;
+    if (Array.isArray(body.split) && !validSplit) return fail(`bad {split} for ${body.model}: need ${cands.length >= 1 ? '≤' + cands.length : ''} positive integers summing to nLayer=${nLayer} (got ${JSON.stringify(body.split)})`, 400);
+    if (validSplit) {
+      const ns = body.split!.length;
+      for (let i = 0; i < ns; i++) { const size = body.split![i]; stages.push({ worker: cands[i].id, start: cursor, end: cursor + size, first: i === 0, last: i === ns - 1 }); cursor += size; }
+    } else {
+      const nStages0 = Math.min(cands.length, nLayer);
+      const per = Math.floor(nLayer / nStages0), extra = nLayer % nStages0;
+      for (let i = 0; i < nStages0; i++) { const size = per + (i < extra ? 1 : 0); stages.push({ worker: cands[i].id, start: cursor, end: cursor + size, first: i === 0, last: i === nStages0 - 1 }); cursor += size; }
     }
+    const nStages = stages.length;
     // Load every stage (streaming its slice for a push shard). Returns the stage info or throws after cleaning
     // up any stages already loaded — so a half-loaded pipe never lingers. Runnable in the background for async.
     const model = body.model, push = !!body.push;

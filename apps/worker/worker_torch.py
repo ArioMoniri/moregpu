@@ -473,10 +473,25 @@ PUSH: dict = {}  # id -> {"dir": staging path, "bytes": total written, "ram": bo
 PUSH_MAX_BYTES = int(os.environ.get("MOREGPU_PUSH_MAX_BYTES", str(20 * 1024 ** 3)))
 
 def _stage_root() -> str:
-    """Prefer a RAM-backed filesystem so streamed weights never touch SSD; fall back to the OS temp dir."""
-    import tempfile
+    """Where to stage streamed weights. Explicit MOREGPU_STAGE_DIR wins (point it at a big disk on a
+    container whose /dev/shm and /tmp are tiny). Otherwise prefer RAM-backed /dev/shm so weights never
+    touch SSD — but ONLY when it has real room: many containers cap /dev/shm at 64 MB, which can't hold
+    even one stage's slice, so fall back to the OS temp dir there."""
+    import shutil, tempfile
+    env = os.environ.get("MOREGPU_STAGE_DIR")
+    if env:
+        try:
+            os.makedirs(env, exist_ok=True)
+            if os.access(env, os.W_OK):
+                return env
+        except OSError:
+            pass
     if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
-        return "/dev/shm"
+        try:
+            if shutil.disk_usage("/dev/shm").free >= 2 * 1024 ** 3:  # ≥2 GB free ⇒ worth using RAM
+                return "/dev/shm"
+        except OSError:
+            pass
     return tempfile.gettempdir()
 
 def _push_cleanup(mid) -> None:
