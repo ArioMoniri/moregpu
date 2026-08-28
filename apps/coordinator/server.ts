@@ -1939,8 +1939,8 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     // int8 / nf4 (bitsandbytes) — CUDA-only, and NON-PUSH only: a quantized stage is built by the worker's own
     // from_pretrained, so it can't be assembled from a streamed per-stage safetensors. Reject bad combos up front.
     if (body.quant !== undefined) {
-      if (body.quant !== 'int8' && body.quant !== 'nf4') return json({ error: `bad {quant} "${body.quant}" — use "int8" or "nf4"` }, 400);
-      if (body.push) return json({ error: 'quant (int8/nf4) is non-push only — omit push:true (the worker self-loads + quantizes from HF; quant + download-free streaming is not supported)' }, 400);
+      if (body.quant !== 'int8' && body.quant !== 'nf4' && body.quant !== 'auto') return json({ error: `bad {quant} "${body.quant}" — use "int8"/"nf4" (quantize an fp16 checkpoint on load) or "auto" (an already-quantized bnb-4bit/AWQ/GPTQ checkpoint, loaded as-is with no fp16 peak)` }, 400);
+      if (body.push) return json({ error: 'quant is non-push only — omit push:true (the worker self-loads + quantizes from HF; quant + download-free streaming is not supported)' }, 400);
     }
     // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
     const cands = (Array.isArray(body.workers) && body.workers.length)

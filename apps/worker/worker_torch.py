@@ -210,7 +210,7 @@ def _quant_mode(cfg: dict):
     non-CUDA worker (MPS/CPU) always falls back to the plain _load_dtype path even if quant is requested.
     Opt-in via the shard's `quant` field; int8 ≈ ½ the fp16 VRAM, nf4 ≈ ¼ — so a bigger model fits the stage."""
     q = str(cfg.get("quant") or "").lower()
-    return q if (q in ("int8", "nf4") and DEV == "cuda") else None
+    return q if (q in ("int8", "nf4", "auto") and DEV == "cuda") else None
 
 def _bnb_config(mode: str):
     """A transformers BitsAndBytesConfig for `mode`. Lazily imports bitsandbytes (a non-quant load never needs
@@ -743,11 +743,19 @@ def shard_load(cfg: dict) -> dict:
     else:
         # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
         _qm = _quant_mode(cfg)
-        if _qm:
+        if _qm == "auto":
+            # ALREADY-QUANTIZED checkpoint (bnb-4bit / AWQ / GPTQ): transformers reads the checkpoint's OWN
+            # quantization_config and loads it directly quantized — so peak VRAM is the QUANTIZED size, not the
+            # fp16 size. This is the only way a model too big to fp16-load (e.g. 7B on an 8 GB free slice) fits.
+            # No BitsAndBytesConfig, no .to(DEV). (bnb-4bit needs bitsandbytes — installed; AWQ/GPTQ need their
+            # own backend pkg, autoawq / auto-gptq, or the load raises a clear message.)
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], device_map={"": 0}, low_cpu_mem_usage=True).eval()
+        elif _qm:
             # int8 / nf4 via bitsandbytes (CUDA only). device_map={"":0} places the quantized weights on cuda:0;
             # do NOT call .to(DEV) — it raises on a bnb-quantized model. The manual slice + del below still frees
             # the unkept quantized modules (single device, no offload hooks); embeddings + lm_head stay fp16 so the
-            # final float() cast on the logits is unaffected.
+            # final float() cast on the logits is unaffected. NB: from_pretrained here loads fp16 THEN quantizes,
+            # so peak VRAM is the fp16 size — use quant:"auto" with a pre-quantized checkpoint to avoid that peak.
             model = AutoModelForCausalLM.from_pretrained(cfg["model"], quantization_config=_bnb_config(_qm),
                                                          device_map={"": 0}, low_cpu_mem_usage=True).eval()
         else:
