@@ -283,7 +283,11 @@ interface Worker {
   nick?: string; // optional admin-set display label
   peer?: { url: string; pub: string; candidates?: string[] }; // PEER TRANSPORT (opt-in): worker's activation endpoint(s) + pubkey (candidates: reachable URLs in preference order — public/forwarded first, LAN last)
   reflexiveIp?: string; // the source IP the coordinator observed for this worker's control connection (a STUN-like hint for MOREGPU_PEER_PUBLIC)
+  caps: Set<string>; // what this worker can host — 'kernel' (offloaded matmul/elementwise), 'shard' (a pipeline decoder-block slice), 'shardEnds' (first/last stage: embeddings/tokenizer/head), 'resident' (a whole model), 'train' (autograd). A WebGPU worker advertises {kernel,shard}; a torch worker gets them all.
 }
+// Capabilities a worker gets when it does NOT advertise a `caps` list (back-compat): a torch worker can do
+// everything (autograd + whole-model residency); anything else (WebGPU/CPU kernel worker) is kernel-only.
+function deriveCaps(label: string): string[] { return label.includes('torch') ? ['kernel', 'shard', 'shardEnds', 'resident', 'train'] : ['kernel']; }
 const workers = new Map<string, Worker>();
 const removedPubkeys = new Set<string>(cfg.removedPubkeys ?? []); // workers an admin removed — refuse their re-registration (ban by key); restored from config so a ban survives restart
 // Weight RESIDENCY: a named weight is cached on ONE worker; a resident matmul (bRef) runs there without
@@ -320,7 +324,11 @@ function wireWorker(ws: WebSocket, reflexiveIp?: string) {
     if (m.t === 'register') {
       if (registered) return; // one register per socket
       if (!constEq(String(m.joinToken ?? ''), cfg.joinToken)) { ws.send(JSON.stringify({ t: 'denied', reason: 'bad join token' })); log('warn', 'worker rejected: bad join token'); ws.close(); return; }
-      const node = m.node as { id: string; backend: string; label: string; os: string; peer?: { url: string; pub: string; candidates?: unknown } };
+      const node = m.node as { id: string; backend: string; label: string; os: string; caps?: unknown; peer?: { url: string; pub: string; candidates?: unknown } };
+      // CAPABILITY NEGOTIATION: a worker MAY advertise a `caps` list; otherwise derive from its label so old
+      // torch/WebGPU workers keep working. Sanitized + capped. This is the authority that replaces label-sniffing.
+      const advertised = Array.isArray(node.caps) ? (node.caps as unknown[]).filter((c): c is string => typeof c === 'string').map((c) => safeId(c)).slice(0, 16) : null;
+      const caps = new Set<string>(advertised && advertised.length ? advertised : deriveCaps(safeId(node.label)));
       const pubkeyB64 = typeof m.pubkey === 'string' ? m.pubkey : undefined;
       // PEER TRANSPORT (opt-in): a peer-enabled worker advertises its LAN activation endpoint; only honoured when the
       // coordinator itself has the flag on, and NEVER exposed publicly — it is handed only to same-tenant ring peers.
@@ -338,7 +346,7 @@ function wireWorker(ws: WebSocket, reflexiveIp?: string) {
       try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
       registered = true; clearTimeout(authTimer);
       const wkey = await deriveWorkerKey(id, keyEpoch); // this worker's OWN sealing key — derived, never the master, never shared
-      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, key: wkey, keyEpoch, paused: false, pausedReason: null, peer, reflexiveIp });
+      workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, key: wkey, keyEpoch, paused: false, pausedReason: null, peer, reflexiveIp, caps });
       // welcome still carries the key under `tenantKeyB64` (wire-compatible with existing workers + the fake fleet),
       // but it is now this worker's PER-WORKER derived key, plus the key epoch it was minted at.
       ws.send(JSON.stringify({ t: 'welcome', tenantKeyB64: b64e(wkey), epoch: keyEpoch, duty: DUTY_HINT }));
@@ -634,6 +642,10 @@ const moePlans = new Map<string, MoEPlan>();
 const RELAY_TIMEOUT_MS = Number(Deno.env.get('MOREGPU_TRAIN_TIMEOUT_MS') ?? 600_000);
 /** Native torch workers can fine-tune (autograd) and hold a whole model resident; WebGPU workers cannot. */
 const torchWorkers = () => activeFleet().filter((w) => w.label.includes('torch'));
+// Workers that can host a pipeline SHARD stage (a decoder-block slice) — torch OR a WebGPU worker with a WGSL
+// middle-stage runtime. The end stages (embeddings/tokenizer/head) additionally need 'shardEnds'. Used to place
+// shards; train/resident-serve/MoE stay on torchWorkers() (autograd / whole-model residency).
+const shardWorkers = () => activeFleet().filter((w) => w.caps.has('shard'));
 async function relayRPC(w: Worker, kind: 'train' | 'model', pend: Map<string, RelayPending>, op: string, payload: unknown): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string }> {
   // Bail fast if the socket is already closed: a chunk sent AFTER onclose ran (e.g. the next push in a multi-chunk
   // stream, once onclose rejected the in-flight one) would otherwise sit in `pend` for the full RELAY_TIMEOUT_MS —
@@ -983,7 +995,9 @@ async function replaceStage(sid: string, failedIdx: number): Promise<{ ok: boole
   if (!meta) return { ok: false, error: `shard ${sid}: no stream metadata — cannot re-place a stage (re-shard)` };
   const st = plan.stages[failedIdx];
   const others = new Set(plan.stages.filter((_, i) => i !== failedIdx).map((s) => s.worker));
-  const pick = () => torchWorkers().find((w) => !others.has(w.id));
+  // Re-place onto a shard-capable spare; a first/last stage additionally needs 'shardEnds' (embeddings/head).
+  const needEnds = st.first || st.last;
+  const pick = () => shardWorkers().find((w) => !others.has(w.id) && (!needEnds || w.caps.has('shardEnds')));
   let target = pick();
   if (!target) {
     log('info', `shard ${sid}: no spare torch worker for stage ${failedIdx} (layers ${st.start}-${st.end}) — waiting up to ${SHARD_RECONNECT_WAIT_MS}ms`);
@@ -1944,9 +1958,9 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     }
     // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
     const cands = (Array.isArray(body.workers) && body.workers.length)
-      ? body.workers.map((wid) => torchWorkers().find((w) => w.id === wid)).filter((w): w is Worker => !!w)
-      : torchWorkers();
-    if (cands.length === 0) return json({ error: 'no native (torch) worker connected — start apps/worker/worker_torch.py; pipeline sharding needs ≥1 (≥2 for a real split)' }, 503);
+      ? body.workers.map((wid) => shardWorkers().find((w) => w.id === wid)).filter((w): w is Worker => !!w)
+      : shardWorkers();
+    if (cands.length === 0) return json({ error: 'no shard-capable worker connected — start apps/worker/worker_torch.py (or a WebGPU worker advertising the "shard" cap); pipeline sharding needs ≥1 (≥2 for a real split)' }, 503);
     const sid = body.id ?? body.model;
     if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
     shardPlans.set(sid, { model: body.model, stages: [], fp16: !!body.fp16, quant: body.quant }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
@@ -1969,7 +1983,9 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       } catch (e) { return fail(`download-free shard preflight failed: ${e instanceof Error ? e.message : e}`, 502); }
     } else {
       // Resolve the model's REAL layer count (config-only, no weights) so gpt2-medium/large/xl shard correctly.
-      const arch = await modelRPC(cands[0], 'arch', { model: body.model });
+      // Probe a RESIDENT-capable (torch) worker — a WebGPU shard worker may not implement the 'arch' RPC.
+      const archW = cands.find((w) => w.caps.has('resident')) ?? cands[0];
+      const arch = await modelRPC(archW, 'arch', { model: body.model });
       if (arch.ok && Number(arch.data?.n_layer) > 0) nLayer = Math.floor(Number(arch.data!.n_layer));
     }
     if (!(nLayer > 0)) nLayer = Number(body.layers) > 0 ? Math.max(1, Math.floor(Number(body.layers))) : 0;
@@ -1992,6 +2008,15 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       for (let i = 0; i < nStages0; i++) { const size = per + (i < extra ? 1 : 0); stages.push({ worker: cands[i].id, start: cursor, end: cursor + size, first: i === 0, last: i === nStages0 - 1 }); cursor += size; }
     }
     const nStages = stages.length;
+    // END-STAGE + QUANT capability guards. The first stage embeds token ids (needs the tokenizer + embedding)
+    // and the last applies the final norm + LM head — so both need 'shardEnds'; a WebGPU worker (shard-but-not-
+    // shardEnds) can only host a MIDDLE stage. int8/nf4 quant is bitsandbytes/CUDA-only → every stage must be a
+    // torch/'resident' worker. Fail closed with a clear message instead of dispatching an op the worker can't run.
+    for (const st of stages) {
+      const w = workers.get(st.worker);
+      if ((st.first || st.last) && !w?.caps.has('shardEnds')) return fail(`stage worker ${st.worker} cannot host the ${st.first ? 'first' : 'last'} stage (needs embeddings/tokenizer/head — the 'shardEnds' cap); a WebGPU worker can only take a MIDDLE stage`, 400);
+      if (body.quant && !w?.caps.has('resident')) return fail(`quant (${body.quant}) is bitsandbytes/CUDA-only but stage worker ${st.worker} is not a torch/resident worker`, 400);
+    }
     // Load every stage (streaming its slice for a push shard). Returns the stage info or throws after cleaning
     // up any stages already loaded — so a half-loaded pipe never lingers. Runnable in the background for async.
     const model = body.model, push = !!body.push;

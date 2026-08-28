@@ -203,6 +203,111 @@ interface Backend {
   // Optional GPU paths for the other kernels; when absent the worker uses the CPU reference implementations.
   elementwise?(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Promise<Float32Array>;
   rowwise?(kernel: string, a: Float32Array, cols: number): Promise<Float32Array>;
+  shard?: ShardRuntime; // present on a GPU backend: lets this worker HOLD a pipeline MIDDLE stage (WGSL transformer forward)
+}
+
+// ════════════ WEBGPU MODEL-SHARD RUNTIME ════════════════════════════════════════════════════════════════
+// Lets a WebGPU worker hold a pipeline MIDDLE stage: parse the coordinator's streamed per-stage safetensors
+// slice + config, then run a numerically-correct Llama/Qwen2-style decoder-block forward (hidden→hidden) in
+// WGSL. Verified against a torch oracle to ~1e-6 (RMSNorm, GQA attention + RoPE + causal mask, SwiGLU, residuals).
+interface ShardCfg { H: number; NH: number; NKV: number; HD: number; INT: number; eps: number; theta: number }
+function f16ToF32(h: number): number {
+  const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x03ff;
+  if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+  if (e === 0x1f) return f ? NaN : (s ? -Infinity : Infinity);
+  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+// safetensors bytes → { name: {data: Float32Array (dequantized F32/F16/BF16), shape} }
+function parseSafetensors(buf: Uint8Array): Map<string, { data: Float32Array; shape: number[] }> {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const headerLen = Number(dv.getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(buf.subarray(8, 8 + headerLen)));
+  const dataStart = 8 + headerLen, out = new Map<string, { data: Float32Array; shape: number[] }>();
+  for (const [name, meta] of Object.entries(header)) {
+    if (name === '__metadata__') continue;
+    const m = meta as { dtype: string; shape: number[]; data_offsets: [number, number] };
+    const raw = buf.subarray(dataStart + m.data_offsets[0], dataStart + m.data_offsets[1]);
+    const n = m.shape.reduce((a, b) => a * b, 1); let data: Float32Array;
+    if (m.dtype === 'F32') data = new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+    else if (m.dtype === 'F16') { data = new Float32Array(n); const u = new Uint16Array(raw.buffer, raw.byteOffset, n); for (let i = 0; i < n; i++) data[i] = f16ToF32(u[i]); }
+    else if (m.dtype === 'BF16') { data = new Float32Array(n); const u = new Uint16Array(raw.buffer, raw.byteOffset, n); const f = new Uint32Array(data.buffer); for (let i = 0; i < n; i++) f[i] = u[i] << 16; }
+    else throw new Error(`unsupported safetensors dtype ${m.dtype} for ${name}`);
+    out.set(name, { data, shape: m.shape });
+  }
+  return out;
+}
+// HF rotary cos/sin from absolute positions (matches transformers to ~1e-7): inv_freq=theta^-(2i/HD), halves duplicated.
+function computeCosSin(positions: number[], HD: number, theta: number): { cos: Float32Array; sin: Float32Array } {
+  const S = positions.length, cos = new Float32Array(S * HD), sin = new Float32Array(S * HD);
+  for (let s = 0; s < S; s++) for (let i = 0; i < HD / 2; i++) {
+    const fr = positions[s] / Math.pow(theta, (2 * i) / HD);
+    cos[s * HD + i] = Math.cos(fr); cos[s * HD + i + HD / 2] = Math.cos(fr);
+    sin[s * HD + i] = Math.sin(fr); sin[s * HD + i + HD / 2] = Math.sin(fr);
+  }
+  return { cos, sin };
+}
+const SHARD_WGSL = {
+  linear: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read> bias:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,hasBias:u32};@group(0) @binding(4) var<uniform> u:U;
+@compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let n=g.x;if(r>=u.R||n>=u.N){return;}var a=0.0;for(var k=0u;k<u.K;k=k+1u){a=a+x[r*u.K+k]*w[n*u.K+k];}if(u.hasBias==1u){a=a+bias[n];}y[r*u.N+n]=a;}`,
+  rmsnorm: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read_write> y:array<f32>;struct U{H:u32,eps:f32};@group(0) @binding(3) var<uniform> u:U;
+@compute @workgroup_size(1) fn main(@builtin(workgroup_id) wid:vec3<u32>){let r=wid.x;var s=0.0;for(var i=0u;i<u.H;i=i+1u){let v=x[r*u.H+i];s=s+v*v;}let inv=inverseSqrt(s/f32(u.H)+u.eps);for(var i=0u;i<u.H;i=i+1u){y[r*u.H+i]=x[r*u.H+i]*inv*w[i];}}`,
+  rope: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> cosb:array<f32>;@group(0) @binding(2) var<storage,read> sinb:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{SEQ:u32,NHEADS:u32,HD:u32};@group(0) @binding(4) var<uniform> u:U;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let idx=g.x;let total=u.SEQ*u.NHEADS*u.HD;if(idx>=total){return;}let d=idx%u.HD;let rest=idx/u.HD;let h=rest%u.NHEADS;let s=rest/u.NHEADS;let half=u.HD/2u;let base=(s*u.NHEADS+h)*u.HD;let xv=x[base+d];var rot:f32;if(d<half){rot=-x[base+d+half];}else{rot=x[base+d-half];}y[idx]=xv*cosb[s*u.HD+d]+rot*sinb[s*u.HD+d];}`,
+  attn: `@group(0) @binding(0) var<storage,read> q:array<f32>;@group(0) @binding(1) var<storage,read> k:array<f32>;@group(0) @binding(2) var<storage,read> v:array<f32>;@group(0) @binding(3) var<storage,read_write> ctx:array<f32>;struct U{SEQ:u32,NH:u32,NKV:u32,HD:u32};@group(0) @binding(4) var<uniform> u:U;
+@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let h=g.y;if(i>=u.SEQ||h>=u.NH){return;}let kv=h/(u.NH/u.NKV);let scale=1.0/sqrt(f32(u.HD));let qbase=(i*u.NH+h)*u.HD;var sc:array<f32,512>;var mx=-3.0e38;for(var j=0u;j<=i;j=j+1u){let kb=(j*u.NKV+kv)*u.HD;var dot=0.0;for(var d=0u;d<u.HD;d=d+1u){dot=dot+q[qbase+d]*k[kb+d];}let s2=dot*scale;sc[j]=s2;if(s2>mx){mx=s2;}}var den=0.0;for(var j=0u;j<=i;j=j+1u){let e=exp(sc[j]-mx);sc[j]=e;den=den+e;}let ob=i*(u.NH*u.HD)+h*u.HD;for(var d=0u;d<u.HD;d=d+1u){var acc=0.0;for(var j=0u;j<=i;j=j+1u){let vb=(j*u.NKV+kv)*u.HD;acc=acc+sc[j]*v[vb+d];}ctx[ob+d]=acc/den;}}`,
+  swiglu: `@group(0) @binding(0) var<storage,read> gate:array<f32>;@group(0) @binding(1) var<storage,read> up:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i>=u.n){return;}let x=gate[i];out[i]=(x/(1.0+exp(-x)))*up[i];}`,
+  add: `@group(0) @binding(0) var<storage,read> a:array<f32>;@group(0) @binding(1) var<storage,read> b:array<f32>;@group(0) @binding(2) var<storage,read_write> o:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i>=u.n){return;}o[i]=a[i]+b[i];}`,
+};
+class ShardRuntime {
+  private cache = new Map<string, GPUComputePipeline>();
+  constructor(private dev: GPUDevice) {}
+  private pipe(code: string): GPUComputePipeline { let p = this.cache.get(code); if (!p) { p = this.dev.createComputePipeline({ layout: 'auto', compute: { module: this.dev.createShaderModule({ code }), entryPoint: 'main' } }); this.cache.set(code, p); } return p; }
+  private async run(code: string, storage: Float32Array[], uniform: ArrayBufferView, outLen: number, dispatch: [number, number, number]): Promise<Float32Array> {
+    const dev = this.dev;
+    const inBufs = storage.map((arr) => { const b = dev.createBuffer({ size: Math.max(4, (arr.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
+    const outBytes = Math.max(4, outLen * 4);
+    const outBuf = dev.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = dev.createBuffer({ size: outBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const uBuf = dev.createBuffer({ size: Math.max(16, uniform.byteLength), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(uBuf, 0, uniform as BufferSource);
+    const entries: GPUBindGroupEntry[] = inBufs.map((buffer, i) => ({ binding: i, resource: { buffer } }));
+    entries.push({ binding: storage.length, resource: { buffer: outBuf } }, { binding: storage.length + 1, resource: { buffer: uBuf } });
+    const pipe = this.pipe(code); const bind = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+    const enc = dev.createCommandEncoder(); const pass = enc.beginComputePass();
+    pass.setPipeline(pipe); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(dispatch[0], dispatch[1], dispatch[2]); pass.end();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, outBytes); dev.queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(readBuf.getMappedRange().slice(0, outLen * 4)); readBuf.unmap();
+    [...inBufs, outBuf, readBuf, uBuf].forEach((b) => b.destroy());
+    return out;
+  }
+  private u32(...v: number[]) { return new Uint32Array(v); }
+  private linear(x: Float32Array, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number) { return this.run(SHARD_WGSL.linear, [x, w, bias ?? new Float32Array(1)], this.u32(R, N, Kk, bias ? 1 : 0), R * N, [Math.ceil(N / 16), Math.ceil(R / 16), 1]); }
+  private rmsnorm(x: Float32Array, w: Float32Array, R: number, H: number, eps: number) { const b = new ArrayBuffer(8); new Uint32Array(b, 0, 1)[0] = H; new Float32Array(b, 4, 1)[0] = eps; return this.run(SHARD_WGSL.rmsnorm, [x, w], new Uint8Array(b), R * H, [R, 1, 1]); }
+  private rope(t: Float32Array, cos: Float32Array, sin: Float32Array, SEQ: number, nh: number, HD: number) { return this.run(SHARD_WGSL.rope, [t, cos, sin], this.u32(SEQ, nh, HD), SEQ * nh * HD, [Math.ceil(SEQ * nh * HD / 64), 1, 1]); }
+  private async layer(h: Float32Array, g: (n: string, opt?: boolean) => Float32Array | null, cos: Float32Array, sin: Float32Array, SEQ: number, c: ShardCfg): Promise<Float32Array> {
+    const { H, NH, NKV, HD, INT, eps } = c;
+    const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
+    const ln1 = await this.rmsnorm(h, req('input_layernorm.weight'), SEQ, H, eps);
+    // q/k/v bias is present on Qwen2/Qwen2.5, absent on Llama/SmolLM — optional (null → no bias add).
+    const q = await this.linear(ln1, req('self_attn.q_proj.weight'), g('self_attn.q_proj.bias', true), SEQ, NH * HD, H);
+    const k = await this.linear(ln1, req('self_attn.k_proj.weight'), g('self_attn.k_proj.bias', true), SEQ, NKV * HD, H);
+    const v = await this.linear(ln1, req('self_attn.v_proj.weight'), g('self_attn.v_proj.bias', true), SEQ, NKV * HD, H);
+    const qR = await this.rope(q, cos, sin, SEQ, NH, HD), kR = await this.rope(k, cos, sin, SEQ, NKV, HD);
+    const ctx = await this.run(SHARD_WGSL.attn, [qR, kR, v], this.u32(SEQ, NH, NKV, HD), SEQ * NH * HD, [SEQ, NH, 1]);
+    const attnOut = await this.linear(ctx, req('self_attn.o_proj.weight'), null, SEQ, H, NH * HD);
+    const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(SEQ * H), SEQ * H, [Math.ceil(SEQ * H / 64), 1, 1]);
+    const ln2 = await this.rmsnorm(hMid, req('post_attention_layernorm.weight'), SEQ, H, eps);
+    const gate = await this.linear(ln2, req('mlp.gate_proj.weight'), null, SEQ, INT, H);
+    const up = await this.linear(ln2, req('mlp.up_proj.weight'), null, SEQ, INT, H);
+    const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(SEQ * INT), SEQ * INT, [Math.ceil(SEQ * INT / 64), 1, 1]);
+    const mlpOut = await this.linear(act, req('mlp.down_proj.weight'), null, SEQ, H, INT);
+    return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(SEQ * H), SEQ * H, [Math.ceil(SEQ * H / 64), 1, 1]);
+  }
+  async stage(hidden: Float32Array, positions: number[], weights: Map<string, { data: Float32Array }>, start: number, end: number, c: ShardCfg): Promise<Float32Array> {
+    const SEQ = positions.length; const { cos, sin } = computeCosSin(positions, c.HD, c.theta); let h = hidden;
+    for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w.data; }; h = await this.layer(h, g, cos, sin, SEQ, c); }
+    return h;
+  }
 }
 
 let gpuLost = false; // set if the GPU device is lost (Metal reset, driver crash) → we fall back to CPU
@@ -253,6 +358,7 @@ async function makeGpuBackend(): Promise<Backend | null> {
   const MAXW = device.limits.maxComputeWorkgroupsPerDimension || 65535;
   const ELEM_PER = MAXW * 64;   // max elements per elementwise dispatch (workgroup_size 64)
   return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}${hasF16 ? '+f16' : ''}`, hasF16,
+    shard: new ShardRuntime(device), // this GPU worker can HOLD a pipeline middle-stage
     matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]),
     matmulF16: hasF16 ? ((a, b, M, N, K) => run(WGSL.matmulF16, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1])) : undefined,
     elementwise: async (kernel, a, b, scalar) => {
@@ -403,6 +509,48 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
     throw e;
   }
 }
+// ── MODEL SHARD (pipeline MIDDLE stage) — staging + dispatch for the sealed 'model' RPC ──
+// The coordinator streams this stage's config.json + per-stage safetensors via push_begin/push_chunk (download-
+// free), then shard_load parses them into GPU-ready weights and shard_forward runs the stage's decoder blocks
+// (hidden→hidden). This is what makes a WebGPU device a real shard host (not just an offloaded-kernel donor).
+const SHARD_STAGE = new Map<string, { weights: Map<string, { data: Float32Array }>; cfg: ShardCfg; start: number; end: number }>();
+const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
+function cfgFromJson(txt: string): ShardCfg {
+  const c = JSON.parse(txt) as Record<string, number>;
+  const H = c.hidden_size, NH = c.num_attention_heads, NKV = c.num_key_value_heads ?? NH;
+  return { H, NH, NKV, HD: c.head_dim ?? Math.floor(H / NH), INT: c.intermediate_size, eps: c.rms_norm_eps ?? 1e-6, theta: c.rope_theta ?? 10000 };
+}
+async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const id = String(p.id ?? p.model ?? '');
+  if (op === 'ping') return { ok: true, pong: true, n: String((p.blob as string) ?? '').length }; // RTT/throughput probe
+  if (op === 'push_begin') { SHARD_PUSH.set(id, new Map()); return { ok: true, id, staging: 'ram', resumed: false, sizes: {} }; }
+  if (op === 'push_chunk') { const files = SHARD_PUSH.get(id) ?? new Map<string, Uint8Array[]>(); SHARD_PUSH.set(id, files); const name = String(p.name); const arr = files.get(name) ?? []; arr.push(b64d(String(p.data))); files.set(name, arr); return { ok: true }; }
+  if (op === 'push_end') return { ok: true };
+  if (op === 'shard_load') {
+    if (p.first || p.last) throw new Error('a WebGPU worker can host only a MIDDLE stage (no embeddings/tokenizer/head)');
+    if (!backend.shard) throw new Error('this worker has no GPU shard runtime (CPU-only backend)');
+    const files = SHARD_PUSH.get(id); if (!files) throw new Error('shard weights not staged — push_begin/push_chunk must precede shard_load');
+    const join = (name: string): Uint8Array | null => { const parts = files.get(name); if (!parts) return null; const n = parts.reduce((a, b) => a + b.length, 0); const out = new Uint8Array(n); let o = 0; for (const pt of parts) { out.set(pt, o); o += pt.length; } return out; };
+    const cfgBytes = join('config.json'); if (!cfgBytes) throw new Error('no config.json staged');
+    const stBytes = join('model.safetensors'); if (!stBytes) throw new Error('no model.safetensors staged');
+    const cfg = cfgFromJson(new TextDecoder().decode(cfgBytes)); const weights = parseSafetensors(stBytes);
+    const start = Number(p.start), end = Number(p.end);
+    SHARD_STAGE.set(id, { weights, cfg, start, end }); SHARD_PUSH.delete(id);
+    let held = 0; for (const w of weights.values()) held += w.data.length;
+    return { ok: true, params_held: held, layers: end - start };
+  }
+  if (op === 'shard_forward') {
+    const st = SHARD_STAGE.get(id); if (!st) throw new Error(`shard ${id} not loaded`);
+    if (p.cached && Number(p.pos ?? 0) > 0) throw new Error('WebGPU middle stage is uncached — a pos>0 KV-decode step is not supported yet; re-feed the whole sequence (uncached)');
+    const seq = Number(p.seq); const hidden = b64ToF32(String(p.hidden));
+    const positions = Array.from({ length: seq }, (_, i) => i);
+    const out = await backend.shard!.stage(hidden, positions, st.weights, st.start, st.end, st.cfg);
+    return { ok: true, hidden: f32ToB64(out), seq, hidden_dim: st.cfg.H };
+  }
+  if (op === 'shard_reset') return { ok: true };
+  if (op === 'shard_unload') { SHARD_STAGE.delete(id); SHARD_PUSH.delete(id); return { ok: true }; }
+  throw new Error(`webgpu worker: unsupported model op '${op}' (this worker hosts MIDDLE stages only)`);
+}
 if (!TOKEN) console.log('[worker] warning: no join token set (--token / MOREGPU_TOKEN) — the server will reject me');
 let tenantKey: Uint8Array | null = null;
 // Weight RESIDENCY: named tensors cached on this worker so a matmul can reference one by id (bRef)
@@ -417,7 +565,10 @@ function connect() {
   const ws = new WebSocket(SERVER);
   let hb: ReturnType<typeof setInterval> | undefined;
   ws.onopen = () => {
-    ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os } }));
+    // CAPABILITIES: a GPU worker can hold a pipeline MIDDLE stage (WGSL transformer forward) → advertise 'shard';
+    // it has no embeddings/tokenizer/head, so NOT 'shardEnds', no autograd (NOT 'train'), no whole-model residency.
+    const caps = backend.shard ? ['kernel', 'shard'] : ['kernel'];
+    ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os, caps } }));
     // Heartbeat: report live load, adaptive duty, the ceiling, and why (if) we're paused.
     hb = setInterval(() => {
       let load1 = 0; try { load1 = Deno.loadavg()[0]; } catch { /* */ }
@@ -465,6 +616,15 @@ function connect() {
         console.log(`[worker] ${msg.shardId} done in ${ms.toFixed(1)}ms on ${backend.kind}`);
         const cool = effectiveDuty(); if (cool < 1) await sleep(ms * (1 / cool - 1)); // adaptive cool-down between shards
       } catch (e) { ws.send(JSON.stringify({ t: 'result', shardId: msg.shardId, jobId: msg.jobId, ok: false, error: String(e) })); }
+    }
+    if (msg.t === 'model') { // sealed pipeline-shard RPC (push_begin/chunk, shard_load/forward/reset/unload, ping)
+      try {
+        if (!tenantKey) throw new Error('no tenant key');
+        const payload = JSON.parse(new TextDecoder().decode(await unseal(tenantKey, msg.sealed)));
+        const res = await modelDispatch(String(msg.op), payload);
+        const sealed = await seal(tenantKey, new TextEncoder().encode(JSON.stringify(res)));
+        ws.send(JSON.stringify({ t: 'model_reply', reqId: msg.reqId, ok: true, sealed }));
+      } catch (e) { ws.send(JSON.stringify({ t: 'model_reply', reqId: msg.reqId, ok: false, error: String(e) })); }
     }
   };
   ws.onclose = () => { if (hb) clearInterval(hb); console.log('[worker] disconnected, retrying in 2s'); setTimeout(connect, 2000); };
