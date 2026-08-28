@@ -18,11 +18,25 @@
  *     --server wss://ADMIN:8787/ws --token <join-token>
  */
 
+// PLATFORM SHIM: this one file runs BOTH under Deno (CLI) and in a BROWSER TAB (served as a bundle by an
+// HTML page). Only the host APIs differ — everything below (WebSocket, WebGPU, crypto.subtle, WGSL) is
+// identical. In a browser, config comes from globalThis.MOREGPU (set by the page) or ?server=&token= URL params.
+const _D = (globalThis as { Deno?: { args: string[]; env: { get(k: string): string | undefined }; build: { os: string; arch: string }; hostname(): string; loadavg(): number[]; exit(c: number): never } }).Deno;
+const _CFG = ((globalThis as { MOREGPU?: Record<string, string> }).MOREGPU) ?? {};
+const _URLQ = (() => { try { return new URLSearchParams((globalThis as { location?: { search: string } }).location?.search ?? ''); } catch { return new URLSearchParams(); } })();
+const PLAT = {
+  os: _D ? _D.build.os : 'browser', arch: _D ? _D.build.arch : ((globalThis as { navigator?: { platform?: string } }).navigator?.platform ?? 'web'),
+  hostname: () => { try { return _D ? _D.hostname() : 'browser'; } catch { return 'browser'; } },
+  loadavg: (): number[] => { try { return _D ? _D.loadavg() : [0, 0, 0]; } catch { return [0, 0, 0]; } }, // browser has no load avg → the duty throttle just uses CPU-EMA
+  exit: (c: number) => { if (_D) _D.exit(c); else throw new Error(`worker exit(${c})`); },
+  env: (k: string): string | undefined => (_D ? _D.env.get(k) : (_CFG[k] ?? undefined)),
+};
 const args = new Map<string, string>();
-for (let i = 0; i < Deno.args.length; i++) { const a = Deno.args[i]; if (a.startsWith('--')) args.set(a.slice(2), Deno.args[i + 1] ?? 'true'); }
-const SERVER = args.get('server') ?? Deno.env.get('MOREGPU_SERVER') ?? 'ws://localhost:8787/ws';
-const TOKEN = args.get('token') ?? Deno.env.get('MOREGPU_TOKEN') ?? '';
-const NAME = args.get('name') ?? Deno.env.get('MOREGPU_NAME') ?? `${(() => { try { return Deno.hostname(); } catch { return 'worker'; } })()}-${crypto.randomUUID().slice(0, 6)}`;
+if (_D) for (let i = 0; i < _D.args.length; i++) { const a = _D.args[i]; if (a.startsWith('--')) args.set(a.slice(2), _D.args[i + 1] ?? 'true'); }
+const _pick = (k: string, env: string) => args.get(k) ?? _CFG[k] ?? _URLQ.get(k) ?? PLAT.env(env) ?? undefined;
+const SERVER = _pick('server', 'MOREGPU_SERVER') ?? 'ws://localhost:8787/ws';
+const TOKEN = _pick('token', 'MOREGPU_TOKEN') ?? '';
+const NAME = _pick('name', 'MOREGPU_NAME') ?? `${PLAT.hostname()}-${crypto.randomUUID().slice(0, 6)}`;
 // Duty cycle CEILING: the most of this machine the pool may ever use (fraction of time computing).
 // The EFFECTIVE duty adapts DOWN from this ceiling in real time based on the machine's own load, so
 // the moment the user works their PC harder, the pool's share shrinks and the user is not disturbed.
@@ -30,7 +44,7 @@ let CEIL = args.has('throttle') ? Math.max(0.05, Math.min(1, Number(args.get('th
 const MIN_DUTY = 0.05;
 // Keep TOTAL system utilization under this; the pool only ever uses the slack below it. Lower = more
 // headroom reserved for the user. Configurable per machine.
-const MAX_UTIL = Math.max(0.3, Math.min(0.98, Number(Deno.env.get('MOREGPU_MAX_UTIL') ?? args.get('max-util') ?? 0.85)));
+const MAX_UTIL = Math.max(0.3, Math.min(0.98, Number(PLAT.env('MOREGPU_MAX_UTIL') ?? args.get('max-util') ?? 0.85)));
 const CORES = Math.max(1, navigator.hardwareConcurrency || 4);
 let emaUtil = 0; // smoothed system utilization (excluding transient spikes)
 let lastDuty = MIN_DUTY;
@@ -40,9 +54,9 @@ let lastDuty = MIN_DUTY;
 //   "HH:MM-HH:MM" active window in local time (may wrap past midnight, e.g. "22:00-07:00" = nights only).
 // While outside the window / not idle / admin-paused, the worker takes NO new work (duty 0) and reports
 // "paused" so the coordinator stops assigning to it. In-flight shards always finish (work is never dropped).
-let SCHEDULE = (args.get('schedule') ?? Deno.env.get('MOREGPU_SCHEDULE') ?? 'always').trim().toLowerCase();
+let SCHEDULE = (args.get('schedule') ?? PLAT.env('MOREGPU_SCHEDULE') ?? 'always').trim().toLowerCase();
 let adminPaused = false; // toggled by an admin 'control' frame from the coordinator
-const IDLE_UTIL = Math.max(0.05, Math.min(0.9, Number(Deno.env.get('MOREGPU_IDLE_UTIL') ?? 0.25)));
+const IDLE_UTIL = Math.max(0.05, Math.min(0.9, Number(PLAT.env('MOREGPU_IDLE_UTIL') ?? 0.25)));
 function inWindow(now: Date): boolean {
   const m = SCHEDULE.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
   if (!m) return true; // not a time window → always (unless 'idle-only', handled below)
@@ -62,7 +76,7 @@ function isActive(): boolean { return !adminPaused && scheduleActive(); }
 function effectiveDuty(): number {
   const ceil = Number.isNaN(CEIL) ? 0.6 : CEIL;
   let load1 = 0;
-  try { load1 = Deno.loadavg()[0]; } catch { load1 = 0; }
+  try { load1 = PLAT.loadavg()[0]; } catch { load1 = 0; }
   if (load1 <= 0) return ceil; // no load signal (e.g. Windows) → fall back to the static ceiling
   const util = Math.min(1, load1 / CORES);
   emaUtil = emaUtil === 0 ? util : emaUtil + 0.4 * (util - emaUtil);
@@ -257,7 +271,15 @@ const SHARD_WGSL = {
 @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let h=g.y;if(i>=u.SEQ||h>=u.NH){return;}let kv=h/(u.NH/u.NKV);let scale=1.0/sqrt(f32(u.HD));let qbase=(i*u.NH+h)*u.HD;var sc:array<f32,512>;var mx=-3.0e38;for(var j=0u;j<=i;j=j+1u){let kb=(j*u.NKV+kv)*u.HD;var dot=0.0;for(var d=0u;d<u.HD;d=d+1u){dot=dot+q[qbase+d]*k[kb+d];}let s2=dot*scale;sc[j]=s2;if(s2>mx){mx=s2;}}var den=0.0;for(var j=0u;j<=i;j=j+1u){let e=exp(sc[j]-mx);sc[j]=e;den=den+e;}let ob=i*(u.NH*u.HD)+h*u.HD;for(var d=0u;d<u.HD;d=d+1u){var acc=0.0;for(var j=0u;j<=i;j=j+1u){let vb=(j*u.NKV+kv)*u.HD;acc=acc+sc[j]*v[vb+d];}ctx[ob+d]=acc/den;}}`,
   swiglu: `@group(0) @binding(0) var<storage,read> gate:array<f32>;@group(0) @binding(1) var<storage,read> up:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i>=u.n){return;}let x=gate[i];out[i]=(x/(1.0+exp(-x)))*up[i];}`,
   add: `@group(0) @binding(0) var<storage,read> a:array<f32>;@group(0) @binding(1) var<storage,read> b:array<f32>;@group(0) @binding(2) var<storage,read_write> o:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i>=u.n){return;}o[i]=a[i]+b[i];}`,
+  // FIRST-stage embedding gather: out[s,:] = embed_tokens.weight[ids[s],:]. ids uploaded as u32 bit-patterns via a Float32Array view.
+  embed: `@group(0) @binding(0) var<storage,read> ids:array<u32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{seq:u32,H:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let total=u.seq*u.H;if(i>=total){return;}let s=i/u.H;let d=i%u.H;out[i]=w[ids[s]*u.H+d];}`,
+  // ONLINE-softmax cached attention: streams the whole KV cache (running max/denom/context), so ANY length — no
+  // fixed scores array (removes the seq<=512 cap) — and supports KV-cached decode (q for the new tokens attends
+  // over the full cache). causal: token i (abs pos past+i) attends 0..(past+i). GQA kv=h/(NH/NKV). dispatch [seqNew,NH,1].
+  cachedAttn: `@group(0) @binding(0) var<storage,read> q:array<f32>;@group(0) @binding(1) var<storage,read> k:array<f32>;@group(0) @binding(2) var<storage,read> v:array<f32>;@group(0) @binding(3) var<storage,read_write> ctx:array<f32>;struct U{seqNew:u32,NH:u32,NKV:u32,HD:u32,past:u32};@group(0) @binding(4) var<uniform> u:U;
+@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let h=g.y;if(i>=u.seqNew||h>=u.NH){return;}let kv=h/(u.NH/u.NKV);let scale=1.0/sqrt(f32(u.HD));let qbase=(i*u.NH+h)*u.HD;let limit=u.past+i;var m=-3.0e38;var l=0.0;var acc:array<f32,256>;for(var d=0u;d<u.HD;d=d+1u){acc[d]=0.0;}for(var j=0u;j<=limit;j=j+1u){let kb=(j*u.NKV+kv)*u.HD;var dot=0.0;for(var d=0u;d<u.HD;d=d+1u){dot=dot+q[qbase+d]*k[kb+d];}let s=dot*scale;let newm=max(m,s);let corr=exp(m-newm);let p=exp(s-newm);l=l*corr+p;let vb=(j*u.NKV+kv)*u.HD;for(var d=0u;d<u.HD;d=d+1u){acc[d]=acc[d]*corr+p*v[vb+d];}m=newm;}let ob=i*(u.NH*u.HD)+h*u.HD;for(var d=0u;d<u.HD;d=d+1u){ctx[ob+d]=acc[d]/l;}}`,
 };
+interface LayerKV { K: Float32Array; V: Float32Array; len: number }
 class ShardRuntime {
   private cache = new Map<string, GPUComputePipeline>();
   constructor(private dev: GPUDevice) {}
@@ -306,6 +328,48 @@ class ShardRuntime {
   async stage(hidden: Float32Array, positions: number[], weights: Map<string, { data: Float32Array }>, start: number, end: number, c: ShardCfg): Promise<Float32Array> {
     const SEQ = positions.length; const { cos, sin } = computeCosSin(positions, c.HD, c.theta); let h = hidden;
     for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w.data; }; h = await this.layer(h, g, cos, sin, SEQ, c); }
+    return h;
+  }
+  // FIRST stage: token ids → embeddings (gather rows of embed_tokens.weight). ids uploaded as u32 bit-patterns.
+  embed(ids: number[], embW: Float32Array, H: number): Promise<Float32Array> {
+    const idsF32 = new Float32Array(new Uint32Array(ids).buffer);
+    return this.run(SHARD_WGSL.embed, [idsF32, embW], this.u32(ids.length, H), ids.length * H, [Math.ceil(ids.length * H / 64), 1, 1]);
+  }
+  // LAST stage: final RMSNorm → lm_head → logits[seq,vocab]. headW is embed_tokens.weight when tied.
+  async lmHead(hidden: Float32Array, normW: Float32Array, headW: Float32Array, seq: number, H: number, vocab: number, eps: number): Promise<Float32Array> {
+    const normed = await this.rmsnorm(hidden, normW, seq, H, eps);
+    return await this.linear(normed, headW, null, seq, vocab, H);
+  }
+  newCache(NL: number): LayerKV[] { return Array.from({ length: NL }, () => ({ K: new Float32Array(0), V: new Float32Array(0), len: 0 })); }
+  // One cached decoder block: `seqNew` new tokens at absolute position `past`; appends K/V to the layer cache
+  // and attends over the full cache with online softmax (any length; used for both prefill and 1-token decode).
+  private async cachedLayer(h: Float32Array, g: (n: string, opt?: boolean) => Float32Array | null, seqNew: number, past: number, kvc: LayerKV, c: ShardCfg): Promise<Float32Array> {
+    const { H, NH, NKV, HD, INT, eps, theta } = c;
+    const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
+    const ln1 = await this.rmsnorm(h, req('input_layernorm.weight'), seqNew, H, eps);
+    const q = await this.linear(ln1, req('self_attn.q_proj.weight'), g('self_attn.q_proj.bias', true), seqNew, NH * HD, H);
+    const k = await this.linear(ln1, req('self_attn.k_proj.weight'), g('self_attn.k_proj.bias', true), seqNew, NKV * HD, H);
+    const v = await this.linear(ln1, req('self_attn.v_proj.weight'), g('self_attn.v_proj.bias', true), seqNew, NKV * HD, H);
+    const positions = Array.from({ length: seqNew }, (_, i) => past + i);
+    const { cos, sin } = computeCosSin(positions, HD, theta);
+    const qR = await this.rope(q, cos, sin, seqNew, NH, HD), kR = await this.rope(k, cos, sin, seqNew, NKV, HD);
+    const Kfull = new Float32Array(kvc.K.length + kR.length); Kfull.set(kvc.K, 0); Kfull.set(kR, kvc.K.length);
+    const Vfull = new Float32Array(kvc.V.length + v.length); Vfull.set(kvc.V, 0); Vfull.set(v, kvc.V.length);
+    kvc.K = Kfull; kvc.V = Vfull; kvc.len = past + seqNew;
+    const ctx = await this.run(SHARD_WGSL.cachedAttn, [qR, Kfull, Vfull], this.u32(seqNew, NH, NKV, HD, past), seqNew * NH * HD, [seqNew, NH, 1]);
+    const attnOut = await this.linear(ctx, req('self_attn.o_proj.weight'), null, seqNew, H, NH * HD);
+    const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(seqNew * H), seqNew * H, [Math.ceil(seqNew * H / 64), 1, 1]);
+    const ln2 = await this.rmsnorm(hMid, req('post_attention_layernorm.weight'), seqNew, H, eps);
+    const gate = await this.linear(ln2, req('mlp.gate_proj.weight'), null, seqNew, INT, H);
+    const up = await this.linear(ln2, req('mlp.up_proj.weight'), null, seqNew, INT, H);
+    const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(seqNew * INT), seqNew * INT, [Math.ceil(seqNew * INT / 64), 1, 1]);
+    const mlpOut = await this.linear(act, req('mlp.down_proj.weight'), null, seqNew, H, INT);
+    return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(seqNew * H), seqNew * H, [Math.ceil(seqNew * H / 64), 1, 1]);
+  }
+  // Cached stage — same call serves PREFILL (past=0, seqNew=SEQ) and DECODE (past=M, seqNew=1). Mutates `cache`.
+  async cachedStage(hidden: Float32Array, past: number, weights: Map<string, { data: Float32Array }>, start: number, end: number, cache: LayerKV[], c: ShardCfg): Promise<Float32Array> {
+    const seqNew = Math.floor(hidden.length / c.H); let h = hidden;
+    for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w.data; }; h = await this.cachedLayer(h, g, seqNew, past, cache[li - start], c); }
     return h;
   }
 }
@@ -398,7 +462,7 @@ async function makeGpuBackend(): Promise<Backend | null> {
 /** CPU backend: computes in small row-chunks and sleeps between them to honor the duty cycle,
  *  so the machine stays responsive for its user and average power draw stays low. */
 function makeCpuBackend(): Backend {
-  return { kind: 'cpu', label: `cpu:${Deno.build.arch}`,
+  return { kind: 'cpu', label: `cpu:${PLAT.arch}`,
     async matmul(a, b, M, N, K) {
       const o = new Float32Array(M * N);
       const chunk = Math.max(1, Math.min(M, Math.ceil(32768 / (K + 1)))); // ~constant work per chunk
@@ -476,7 +540,7 @@ function runRowwise(kernel: string, a: Float32Array, cols: number): Float32Array
 }
 
 // ---------- work loop ----------
-const FORCE_CPU = args.has('cpu') || Deno.env.get('MOREGPU_FORCE_CPU') === '1';
+const FORCE_CPU = args.has('cpu') || PLAT.env('MOREGPU_FORCE_CPU') === '1';
 let backend = (FORCE_CPU ? null : await makeGpuBackend().catch(() => null)) ?? makeCpuBackend();
 console.log(`[worker] ${NAME} · backend=${backend.label} · server=${SERVER}`);
 
@@ -513,12 +577,12 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
 // The coordinator streams this stage's config.json + per-stage safetensors via push_begin/push_chunk (download-
 // free), then shard_load parses them into GPU-ready weights and shard_forward runs the stage's decoder blocks
 // (hidden→hidden). This is what makes a WebGPU device a real shard host (not just an offloaded-kernel donor).
-const SHARD_STAGE = new Map<string, { weights: Map<string, { data: Float32Array }>; cfg: ShardCfg; start: number; end: number }>();
+const SHARD_STAGE = new Map<string, { weights: Map<string, { data: Float32Array }>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]> }>();
 const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
-function cfgFromJson(txt: string): ShardCfg {
+function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
   const H = c.hidden_size, NH = c.num_attention_heads, NKV = c.num_key_value_heads ?? NH;
-  return { H, NH, NKV, HD: c.head_dim ?? Math.floor(H / NH), INT: c.intermediate_size, eps: c.rms_norm_eps ?? 1e-6, theta: c.rope_theta ?? 10000 };
+  return { cfg: { H, NH, NKV, HD: c.head_dim ?? Math.floor(H / NH), INT: c.intermediate_size, eps: c.rms_norm_eps ?? 1e-6, theta: c.rope_theta ?? 10000 }, vocab: c.vocab_size };
 }
 async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Record<string, unknown>> {
   const id = String(p.id ?? p.model ?? '');
@@ -527,29 +591,55 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
   if (op === 'push_chunk') { const files = SHARD_PUSH.get(id) ?? new Map<string, Uint8Array[]>(); SHARD_PUSH.set(id, files); const name = String(p.name); const arr = files.get(name) ?? []; arr.push(b64d(String(p.data))); files.set(name, arr); return { ok: true }; }
   if (op === 'push_end') return { ok: true };
   if (op === 'shard_load') {
-    if (p.first || p.last) throw new Error('a WebGPU worker can host only a MIDDLE stage (no embeddings/tokenizer/head)');
     if (!backend.shard) throw new Error('this worker has no GPU shard runtime (CPU-only backend)');
     const files = SHARD_PUSH.get(id); if (!files) throw new Error('shard weights not staged — push_begin/push_chunk must precede shard_load');
     const join = (name: string): Uint8Array | null => { const parts = files.get(name); if (!parts) return null; const n = parts.reduce((a, b) => a + b.length, 0); const out = new Uint8Array(n); let o = 0; for (const pt of parts) { out.set(pt, o); o += pt.length; } return out; };
     const cfgBytes = join('config.json'); if (!cfgBytes) throw new Error('no config.json staged');
     const stBytes = join('model.safetensors'); if (!stBytes) throw new Error('no model.safetensors staged');
-    const cfg = cfgFromJson(new TextDecoder().decode(cfgBytes)); const weights = parseSafetensors(stBytes);
-    const start = Number(p.start), end = Number(p.end);
-    SHARD_STAGE.set(id, { weights, cfg, start, end }); SHARD_PUSH.delete(id);
+    const { cfg, vocab } = cfgFromJson(new TextDecoder().decode(cfgBytes)); const weights = parseSafetensors(stBytes);
+    const first = !!p.first, last = !!p.last;
+    if (first && !weights.get('model.embed_tokens.weight')) throw new Error('first stage needs model.embed_tokens.weight (not streamed)');
+    if (last && !weights.get('model.norm.weight')) throw new Error('last stage needs model.norm.weight (not streamed)');
+    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map() }); SHARD_PUSH.delete(id);
     let held = 0; for (const w of weights.values()) held += w.data.length;
-    return { ok: true, params_held: held, layers: end - start };
+    return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
   }
   if (op === 'shard_forward') {
     const st = SHARD_STAGE.get(id); if (!st) throw new Error(`shard ${id} not loaded`);
-    if (p.cached && Number(p.pos ?? 0) > 0) throw new Error('WebGPU middle stage is uncached — a pos>0 KV-decode step is not supported yet; re-feed the whole sequence (uncached)');
-    const seq = Number(p.seq); const hidden = b64ToF32(String(p.hidden));
-    const positions = Array.from({ length: seq }, (_, i) => i);
-    const out = await backend.shard!.stage(hidden, positions, st.weights, st.start, st.end, st.cfg);
-    return { ok: true, hidden: f32ToB64(out), seq, hidden_dim: st.cfg.H };
+    const rt = backend.shard!; const { H, eps } = st.cfg;
+    const cached = !!p.cached && typeof p.session === 'string';
+    const past = cached ? Math.max(0, Number(p.pos ?? 0)) : 0;   // absolute start position (RoPE + causal offset)
+    const w = (n: string) => st.weights.get(n)?.data;
+    // stage INPUT → hidden [seqNew, H]
+    let h: Float32Array, seqNew: number;
+    if (st.first) { const ids = p.input_ids as number[]; seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H); }
+    else { seqNew = Number(p.seq); h = b64ToF32(String(p.hidden)); }
+    // run this stage's decoder blocks (cached KV or uncached full-sequence)
+    if (cached) {
+      const key = String(p.session); let kv = st.kv.get(key); if (!kv || past === 0) { kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); }
+      h = await rt.cachedStage(h, past, st.weights, st.start, st.end, kv, st.cfg);
+    } else {
+      const positions = Array.from({ length: seqNew }, (_, i) => i);
+      h = await rt.stage(h, positions, st.weights, st.start, st.end, st.cfg);
+    }
+    // stage OUTPUT: last → logits + argmax; else → hidden for the next stage
+    if (st.last) {
+      const normW = w('model.norm.weight')!, headW = w('lm_head.weight') ?? w('model.embed_tokens.weight')!;
+      const logits = await rt.lmHead(h, normW, headW, seqNew, H, st.vocab, eps);
+      const lastRow = logits.subarray((seqNew - 1) * st.vocab, seqNew * st.vocab);
+      let argmax = 0, mx = -Infinity; for (let i = 0; i < st.vocab; i++) if (lastRow[i] > mx) { mx = lastRow[i]; argmax = i; }
+      const res: Record<string, unknown> = { ok: true, argmax };
+      if (p.return_logits) res.logits = f32ToB64(lastRow.slice(0));
+      if (cached) res.past = past + seqNew;
+      return res;
+    }
+    const res: Record<string, unknown> = { ok: true, hidden: f32ToB64(h), seq: seqNew, hidden_dim: H };
+    if (cached) res.past = past + seqNew;
+    return res;
   }
-  if (op === 'shard_reset') return { ok: true };
+  if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') st.kv.delete(String(p.session)); else st.kv.clear(); } return { ok: true }; }
   if (op === 'shard_unload') { SHARD_STAGE.delete(id); SHARD_PUSH.delete(id); return { ok: true }; }
-  throw new Error(`webgpu worker: unsupported model op '${op}' (this worker hosts MIDDLE stages only)`);
+  throw new Error(`webgpu worker: unsupported model op '${op}'`);
 }
 if (!TOKEN) console.log('[worker] warning: no join token set (--token / MOREGPU_TOKEN) — the server will reject me');
 let tenantKey: Uint8Array | null = null;
@@ -565,13 +655,14 @@ function connect() {
   const ws = new WebSocket(SERVER);
   let hb: ReturnType<typeof setInterval> | undefined;
   ws.onopen = () => {
-    // CAPABILITIES: a GPU worker can hold a pipeline MIDDLE stage (WGSL transformer forward) → advertise 'shard';
-    // it has no embeddings/tokenizer/head, so NOT 'shardEnds', no autograd (NOT 'train'), no whole-model residency.
-    const caps = backend.shard ? ['kernel', 'shard'] : ['kernel'];
-    ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: Deno.build.os, caps } }));
+    // CAPABILITIES: a GPU worker can hold ANY pipeline stage — a middle decoder-block slice ('shard') AND the
+    // ends ('shardEnds': embedding gather on the first stage, final norm + LM head + argmax on the last), so it
+    // can even host a whole small model solo. No autograd (NOT 'train') and no torch whole-model residency path.
+    const caps = backend.shard ? ['kernel', 'shard', 'shardEnds'] : ['kernel'];
+    ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: PLAT.os, caps } }));
     // Heartbeat: report live load, adaptive duty, the ceiling, and why (if) we're paused.
     hb = setInterval(() => {
-      let load1 = 0; try { load1 = Deno.loadavg()[0]; } catch { /* */ }
+      let load1 = 0; try { load1 = PLAT.loadavg()[0]; } catch { /* */ }
       const active = isActive();
       const reason = adminPaused ? 'admin' : (!scheduleActive() ? 'schedule' : null);
       try { ws.send(JSON.stringify({ t: 'heartbeat', id: NAME, load1, cores: CORES, util: +(load1 / CORES).toFixed(3), duty: active ? +effectiveDuty().toFixed(3) : 0, ceil: +(Number.isNaN(CEIL) ? 0.6 : CEIL).toFixed(2), paused: !active, pausedReason: reason, schedule: SCHEDULE })); } catch { /* */ }
@@ -579,7 +670,7 @@ function connect() {
   };
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data as string);
-    if (msg.t === 'denied') { console.error(`[worker] rejected by server: ${msg.reason}. Check the join token.`); try { ws.close(); } catch { /* */ } Deno.exit(1); }
+    if (msg.t === 'denied') { console.error(`[worker] rejected by server: ${msg.reason}. Check the join token.`); try { ws.close(); } catch { /* */ } PLAT.exit(1); }
     if (msg.t === 'welcome') { tenantKey = b64d(msg.tenantKeyB64); if (Number.isNaN(CEIL)) CEIL = typeof msg.duty === 'number' ? msg.duty : 0.6; console.log(`[worker] joined pool · duty ceiling=${(CEIL * 100).toFixed(0)}% · schedule=${SCHEDULE} · adaptive (backs off as your machine gets busier, keeps total load < ${(MAX_UTIL * 100).toFixed(0)}%)`); return; }
     if (msg.t === 'control') { // the admin remotely pauses/resumes, caps duty, or sets a schedule for this machine
       if (typeof msg.pause === 'boolean') adminPaused = msg.pause;

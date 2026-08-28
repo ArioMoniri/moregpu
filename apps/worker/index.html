@@ -1,0 +1,72 @@
+<!doctype html>
+<!--
+  MoreGPU browser worker. Open this page (served over http/https) and the browser's GPU joins the pool —
+  no install. It can hold a pipeline stage (or a whole small model) or run offloaded kernels.
+
+  Build the bundle it loads (the SAME apps/worker/worker.ts that runs under Deno, via the platform shim):
+      deno bundle --platform browser apps/worker/worker.ts -o worker.bundle.js
+  then serve this directory over HTTP and open index.html (optionally with ?server=wss://…/ws&token=… ).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoreGPU — donate this browser's GPU</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 20px; } .sub { opacity: .7; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 13px; }
+  input { width: 100%; padding: 8px; border: 1px solid #8888; border-radius: 6px; background: transparent; color: inherit; }
+  button { margin-top: 16px; padding: 10px 18px; font-weight: 600; border: 0; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin: 16px 0; padding: 10px 12px; border-radius: 8px; background: #8881; font-weight: 600; }
+  #gpu { font-size: 13px; opacity: .8; }
+  pre { background: #0b0b0b; color: #b9f; padding: 12px; border-radius: 8px; height: 240px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>MoreGPU · browser worker</h1>
+<p class="sub">Open this page and your browser's GPU joins the pool — no install. It can hold a slice of a model (a pipeline stage), a whole small model, or run kernels. Close the tab to leave.</p>
+<div id="gpu">checking WebGPU…</div>
+<label>Coordinator (wss/ws URL)</label>
+<input id="server" placeholder="wss://host:8787/ws">
+<label>Join token</label>
+<input id="token" placeholder="paste the pool's join token">
+<label>Name (optional)</label>
+<input id="name" placeholder="browser-worker">
+<button id="join">Join pool</button>
+<div id="status">idle</div>
+<pre id="log"></pre>
+<script>
+const qs = new URLSearchParams(location.search);
+for (const k of ['server','token','name']) { const v = qs.get(k); if (v) document.getElementById(k).value = v; }
+const logEl = document.getElementById('log'), statusEl = document.getElementById('status');
+function log(...a){ const s = a.map(x => typeof x==='string'?x:JSON.stringify(x)).join(' '); logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight;
+  if (/joined pool/.test(s)) statusEl.textContent = '🟢 joined the pool — contributing';
+  if (/shard .* loaded|shard_load|params_held/i.test(s)) statusEl.textContent = '🟢 holding a model stage';
+  if (/disconnected|rejected|error/i.test(s)) statusEl.textContent = '🔴 ' + s.slice(0,80);
+}
+const _cl = console.log, _ce = console.error;
+console.log = (...a) => { _cl(...a); log(...a); };
+console.error = (...a) => { _ce(...a); log('ERR', ...a); };
+(async () => {
+  const gpu = navigator.gpu ? await navigator.gpu.requestAdapter().catch(()=>null) : null;
+  document.getElementById('gpu').textContent = gpu
+    ? `WebGPU ✓  (shader-f16: ${gpu.features.has('shader-f16')}, max buffer: ${(gpu.limits.maxStorageBufferBindingSize/1e6).toFixed(0)} MB)`
+    : 'WebGPU ✗ — this browser can still contribute CPU kernels';
+})();
+document.getElementById('join').onclick = async () => {
+  const server = document.getElementById('server').value.trim();
+  const token = document.getElementById('token').value.trim();
+  const name = document.getElementById('name').value.trim() || undefined;
+  if (!server || !token) { statusEl.textContent = 'enter a coordinator URL + join token'; return; }
+  document.getElementById('join').disabled = true;
+  statusEl.textContent = 'connecting…';
+  globalThis.MOREGPU = { server, token, ...(name ? { name } : {}) }; // the worker's platform shim reads this
+  log('[page] loading worker bundle → ' + server);
+  await import('./worker.bundle.js');
+};
+</script>
+</body>
+</html>
