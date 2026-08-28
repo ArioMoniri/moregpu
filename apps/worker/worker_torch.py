@@ -205,6 +205,26 @@ def _load_dtype(cfg: dict) -> torch.dtype:
     exact-match parity path is byte-for-byte unchanged."""
     return torch.float16 if (bool(cfg.get("fp16")) and DEV != "cpu") else torch.float32
 
+def _quant_mode(cfg: dict):
+    """bitsandbytes quantization for this shard — 'int8', 'nf4', or None. bitsandbytes is CUDA-only, so a
+    non-CUDA worker (MPS/CPU) always falls back to the plain _load_dtype path even if quant is requested.
+    Opt-in via the shard's `quant` field; int8 ≈ ½ the fp16 VRAM, nf4 ≈ ¼ — so a bigger model fits the stage."""
+    q = str(cfg.get("quant") or "").lower()
+    return q if (q in ("int8", "nf4") and DEV == "cuda") else None
+
+def _bnb_config(mode: str):
+    """A transformers BitsAndBytesConfig for `mode`. Lazily imports bitsandbytes (a non-quant load never needs
+    it) and raises a clear pip message if the CUDA build is absent. bnb runs the matmul in fp16 and accepts
+    fp16 activations, so a quant stage sets its activation dtype to fp16 (the fp32 wire hidden casts to fp16)."""
+    try:
+        import bitsandbytes  # noqa: F401  — presence check; the CUDA build must be installed on this worker
+    except Exception as e:
+        raise RuntimeError(f"quant={mode} needs bitsandbytes (CUDA build) on this worker — `pip install bitsandbytes` ({e})")
+    from transformers import BitsAndBytesConfig
+    if mode == "nf4":
+        return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+    return BitsAndBytesConfig(load_in_8bit=True)
+
 def _check_ids(vocab, *seqs):
     """Reject out-of-range token ids BEFORE the embedding lookup — an out-of-vocab index is a device-side
     assert on CUDA that poisons the whole process context (bricks TORCH_POOL), so fail cleanly instead."""
@@ -722,7 +742,16 @@ def shard_load(cfg: dict) -> dict:
         model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
     else:
         # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
+        _qm = _quant_mode(cfg)
+        if _qm:
+            # int8 / nf4 via bitsandbytes (CUDA only). device_map={"":0} places the quantized weights on cuda:0;
+            # do NOT call .to(DEV) — it raises on a bnb-quantized model. The manual slice + del below still frees
+            # the unkept quantized modules (single device, no offload hooks); embeddings + lm_head stay fp16 so the
+            # final float() cast on the logits is unaffected.
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], quantization_config=_bnb_config(_qm),
+                                                         device_map={"": 0}, low_cpu_mem_usage=True).eval()
+        else:
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     arch = _shard_arch(model)
     mc = model.config
     # REJECT sliding-window / mixed-attention models: a middle stage recomputes ONE full-causal mask for all its
@@ -780,7 +809,10 @@ def shard_load(cfg: dict) -> dict:
         SHARDS.pop(next(iter(SHARDS)), None)
     del base, model
     _empty_cache()
-    shard["dtype"] = _load_dtype(cfg)  # fp16 (GPU) or fp32; shard_forward casts the piped-in fp32 hidden to this
+    # bnb (int8/nf4) runs the matmul in fp16 and takes fp16 activations, so a quant stage casts the fp32 wire
+    # hidden to fp16; otherwise use the plain load dtype (fp16 on GPU, fp32 on CPU).
+    shard["quant"] = _quant_mode(cfg)
+    shard["dtype"] = torch.float16 if shard["quant"] else _load_dtype(cfg)  # shard_forward casts the piped-in fp32 hidden to this
     SHARDS[sid] = shard
     tok_ok = False
     if first:
