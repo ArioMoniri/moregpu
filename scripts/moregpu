@@ -109,10 +109,17 @@ need_deno() {
 
 # Resolve the admin HTTP base from MOREGPU_SERVER (accepts ws/wss/http/https, with or without /ws).
 mg_base() { local x="${MOREGPU_SERVER:-http://localhost:8787}"; x="${x%/ws}"; x="${x/wss:/https:}"; x="${x/ws:/http:}"; echo "$x"; }
-mg_ctl()  { # <worker-id> <json-body> — POST an admin control frame
+# curl with the admin bearer token passed via -K stdin, NOT argv: argv is world-readable through ps/proc on the
+# shared/multi-user hosts this project targets, and the token is full pool control. The request body (non-secret)
+# stays on argv; only the Authorization header comes from stdin.
+mg_curl() {
+  curl "$@" -K - <<EOF
+header = "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}"
+EOF
+}
+mg_ctl()  { # <worker-id> <json-body> — POST an admin control frame (token off argv)
   [ $# -ge 2 ] || { echo "[moregpu] usage: moregpu <pause|resume|set|rm> <worker-id> [value]" >&2; exit 2; }
-  curl -fsS -X POST "$(mg_base)/workers/$1/control" \
-    -H "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}" -H 'content-type: application/json' -d "$2"; echo
+  mg_curl -fsS -X POST "$(mg_base)/workers/$1/control" -H 'content-type: application/json' -d "$2"; echo
 }
 
 # serve, with optional --host (advertise a reachable name) and --tunnel (auto-expose over a real-cert tunnel so
@@ -228,7 +235,7 @@ case "$cmd" in
     else echo "[moregpu] logs: foreground workers print to their terminal; services log to the OS log."; fi ;;
 
   # ---- admin fleet control (needs MOREGPU_SERVER + MOREGPU_ADMIN_TOKEN) ----
-  workers) curl -fsS "$(mg_base)/workers" -H "authorization: Bearer ${MOREGPU_ADMIN_TOKEN:-}" ;;
+  workers) mg_curl -fsS "$(mg_base)/workers" ;;
   pause)   mg_ctl "${1:-}" '{"action":"pause"}' ;;
   resume)  mg_ctl "${1:-}" '{"action":"resume"}' ;;
   set)     case "${2:-}" in ''|*[!0-9.]*) echo "[moregpu] duty must be a number 0.05-1" >&2; exit 2;; esac
@@ -238,9 +245,9 @@ case "$cmd" in
   rm|remove) mg_ctl "${1:-}" '{"action":"remove"}' ;;
 
   monitor)
-    base="$(mg_base)"; tok="${MOREGPU_ADMIN_TOKEN:-}"
-    echo "[moregpu] $base/device"; curl -fsS "$base/device" -H "authorization: Bearer $tok" || echo "  (need MOREGPU_ADMIN_TOKEN, and the server reachable)"
-    echo; echo "[moregpu] workers:"; curl -fsS "$base/workers" -H "authorization: Bearer $tok" || true ;;
+    base="$(mg_base)"
+    echo "[moregpu] $base/device"; mg_curl -fsS "$base/device" || echo "  (need MOREGPU_ADMIN_TOKEN, and the server reachable)"
+    echo; echo "[moregpu] workers:"; mg_curl -fsS "$base/workers" || true ;;
 
   version) echo "moregpu CLI ${VERSION} (repo $REPO@$BRANCH)" ;;
 

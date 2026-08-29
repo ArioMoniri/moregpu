@@ -66,11 +66,14 @@ function log(level: Level, msg: string, ctx?: string) {
 // keyEpoch + removedPubkeys are PERSISTED so a revocation survives a coordinator restart: without this a restart
 // resets the epoch to 0 (re-deriving pre-revocation keys) and empties the ban list, resurrecting a removed worker.
 interface Config { adminToken: string; joinToken: string; tenantKeyB64: string; created: string; keyEpoch?: number; removedPubkeys?: string[]; }
+// The config file holds the MASTER secret (tenantKeyB64) + admin/join tokens, so it is written owner-only (0600),
+// like the TLS private key — never world-readable, even on the shared/multi-tenant hosts this project targets.
+async function chmod600(path: string): Promise<void> { try { await Deno.chmod(path, 0o600); } catch { /* windows / best-effort */ } }
 async function loadOrInitConfig(): Promise<{ cfg: Config; fresh: boolean }> {
-  try { return { cfg: JSON.parse(await Deno.readTextFile(CONFIG_PATH)), fresh: false }; }
+  try { const cfg = JSON.parse(await Deno.readTextFile(CONFIG_PATH)); await chmod600(CONFIG_PATH); return { cfg, fresh: false }; }
   catch {
     const cfg: Config = { adminToken: tokenB64url(24), joinToken: tokenB64url(18), tenantKeyB64: b64e(crypto.getRandomValues(new Uint8Array(32))), created: new Date().toISOString(), keyEpoch: 0, removedPubkeys: [] };
-    await Deno.writeTextFile(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    await Deno.writeTextFile(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 }); await chmod600(CONFIG_PATH);
     return { cfg, fresh: true };
   }
 }
@@ -88,7 +91,7 @@ let keyEpoch = cfg.keyEpoch ?? 0;
 // Persist mutable trust state (epoch + ban list) back to the config file so revocation is durable across restarts.
 async function saveConfig(): Promise<void> {
   const out: Config = { adminToken: cfg.adminToken, joinToken: cfg.joinToken, tenantKeyB64: cfg.tenantKeyB64, created: cfg.created, keyEpoch, removedPubkeys: [...removedPubkeys] };
-  try { await Deno.writeTextFile(CONFIG_PATH, JSON.stringify(out, null, 2)); } catch (e) { log('warn', `could not persist config: ${e instanceof Error ? e.message : e}`); }
+  try { await Deno.writeTextFile(CONFIG_PATH, JSON.stringify(out, null, 2), { mode: 0o600 }); await chmod600(CONFIG_PATH); } catch (e) { log('warn', `could not persist config: ${e instanceof Error ? e.message : e}`); }
 }
 const HKDF_SALT = new TextEncoder().encode('moregpu:hkdf:v1');
 async function hkdf(info: string, bytes = 32): Promise<Uint8Array> {
@@ -343,7 +346,12 @@ function wireWorker(ws: WebSocket, reflexiveIp?: string) {
       if (workers.has(wantId)) { ws.send(JSON.stringify({ t: 'denied', reason: 'worker id already registered' })); log('warn', `worker rejected: duplicate id ${wantId}`); ws.close(); return; }
       id = wantId;
       let pubkey: CryptoKey | undefined;
-      try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* worker without a valid key runs unsigned */ }
+      try { if (pubkeyB64) pubkey = await crypto.subtle.importKey('raw', b64d(pubkeyB64) as BufferSource, { name: 'Ed25519' }, false, ['verify']); } catch { /* invalid key → rejected below */ }
+      // A signing key is MANDATORY: every OK result this worker returns is Ed25519-verified against it, and a ban
+      // lists it. Both worker.ts and worker_torch.py always send one. A worker that OMITS the key (or sends an
+      // undecodable one) is rejected here; an importable-but-fake key still cannot produce valid signatures, so its
+      // results are rejected at verification — either way there is no unsigned, unbannable donor returning forged data.
+      if (!pubkey) { ws.send(JSON.stringify({ t: 'denied', reason: 'a valid Ed25519 signing public key is required' })); log('warn', `worker rejected: missing/invalid signing pubkey`); ws.close(); return; }
       registered = true; clearTimeout(authTimer);
       const wkey = await deriveWorkerKey(id, keyEpoch); // this worker's OWN sealing key — derived, never the master, never shared
       workers.set(id, { id, backend: safeId(node.backend), label: safeId(node.label), os: safeId(node.os), ws, load1: 0, util: 0, duty: DUTY_HINT, ceil: DUTY_HINT, busy: false, joinedAt: Date.now(), shards: 0, units: 0, ops: 0, tokens: 0, errors: 0, consecErrors: 0, healthyBeats: 0, busyCount: 0, totalMs: 0, lastOps: 0, history: [], pubkey, pubkeyB64, key: wkey, keyEpoch, paused: false, pausedReason: null, peer, reflexiveIp, caps });
@@ -390,8 +398,11 @@ function wireWorker(ws: WebSocket, reflexiveIp?: string) {
       if (!p || p.workerId !== id) return; // forged/foreign result for another worker's shard → ignored
       const w = workers.get(id);
       let signed = false;
-      if (m.ok && m.sealedOut && w?.pubkey && typeof m.sig === 'string') {
-        const blob = m.sealedOut as { iv: string; ct: string };
+      if (m.ok) {
+        // An OK result carries sealed output we will CONSUME → its Ed25519 signature is MANDATORY (pubkey is required
+        // at registration, so w.pubkey is always present). An error result has no sealed output and needs no signature.
+        const blob = m.sealedOut as { iv: string; ct: string } | undefined;
+        if (!blob || typeof m.sig !== 'string' || !w?.pubkey) { log('warn', `unsigned result from ${id} — rejecting`); p.reject(new Error('unsigned result rejected — a signature is required')); return; }
         const okSig = await crypto.subtle.verify({ name: 'Ed25519' }, w.pubkey, b64d(m.sig) as BufferSource, new TextEncoder().encode(`${m.shardId}|${blob.iv}|${blob.ct}`));
         if (!okSig) { log('warn', `result signature INVALID from ${id} — rejecting shard`); p.reject(new Error('invalid result signature')); return; }
         signed = true;
@@ -407,6 +418,10 @@ function wireWorker(ws: WebSocket, reflexiveIp?: string) {
       if (!registered) return;
       const ring = rings.get(String(m.sid));
       if (!ring || ring.epoch !== m.epoch) return; // stale epoch (a torn/re-wired pipe) → ignore
+      // Only the LAST stage may deliver a finished token — a middle stage cannot forge {complete, argmax} to steer
+      // the output (the sealed-activation design's whole point). Bind the frame to the plan's tail worker.
+      const cplan = shardPlans.get(String(m.sid));
+      if (!cplan || cplan.stages.length === 0 || cplan.stages[cplan.stages.length - 1].worker !== id) { log('warn', `ring ${m.sid}: 'complete' from ${id} which is not the tail stage — ignored`); return; }
       const k = `${m.sid}|${m.seq}`, p = pendingRing.get(k);
       if (!p) return;
       pendingRing.delete(k);
@@ -455,6 +470,9 @@ function wireWorker(ws: WebSocket, reflexiveIp?: string) {
       if (!registered) return;
       const mring = moeRings.get(String(m.sid));
       if (!mring || mring.epoch !== m.epoch) return; // stale epoch (a re-wired MoE ring) → ignore
+      // Only the BACKBONE delivers the MoE final logits — an expert holder cannot forge the output.
+      const mp = moePlans.get(String(m.sid));
+      if (!mp || mp.backbone !== id) { log('warn', `moe ${m.sid}: 'moe_complete' from ${id} which is not the backbone — ignored`); return; }
       const k = `${m.sid}|${m.seq}`, p = pendingMoeRing.get(k);
       if (!p) return;
       pendingMoeRing.delete(k);
