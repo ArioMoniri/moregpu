@@ -964,9 +964,126 @@ class ShardRuntime {
   }
   // Cached stage — same call serves PREFILL (past=0, seqNew=SEQ) and DECODE (past=M, seqNew=1). Mutates `cache`.
   async cachedStage(hidden: Float32Array, past: number, weights: Map<string, WEntry>, start: number, end: number, cache: LayerKV[], c: ShardCfg): Promise<Float32Array> {
+    if (this.fused) return this.cachedStageFused(hidden, past, weights, start, end, cache, c); // opt-in fused path (1 submit + 1 map), bit-identical
     const seqNew = Math.floor(hidden.length / c.H); let h = hidden;
     for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w; }; h = await this.cachedLayer(h, g, seqNew, past, cache[li - start], c); }
     return h;
+  }
+
+  // ===================== FUSED DECODE PATH (#12) — opt-in via MOREGPU_FUSED_DECODE =====================
+  // The activations stay RESIDENT on-GPU across a whole cached stage: every op is one compute pass appended to a
+  // single command encoder, and we map to CPU exactly ONCE (the hidden that crosses the wire). Collapses a decode
+  // stage from ~15·NL GPU→CPU map-stalls to 1 submit + 1 map. BIT-IDENTICAL to cachedStage above — same WGSL /
+  // dispatch / uniforms / scalar order — the only change is when work is submitted. The KV append becomes a GPU→GPU
+  // copyBufferToBuffer at the tail (vs a host writeBuffer of a mapped array); cachedAttn binds the resident kvc.K/V.
+  // Ping-pong pool buffers bound memory; WebGPU auto-syncs successive passes and pass↔copy (no explicit barrier API
+  // exists or is needed). The runtime shares one encoder/pool → NOT re-entrant → cachedStageFused serializes per
+  // instance via fusedLock (the async onmessage loop can start a second stage before the first awaits).
+  private get fused() { return FUSED_DECODE; } // getter, not a field initializer: FUSED_DECODE is declared later in the module, so reading it at construction (new ShardRuntime in makeGpuBackend) would hit its TDZ — defer to call time (cachedStage), by when it is initialized
+  private pool: GPUBuffer[] = [];       // free ping-pong activation buffers (bounded, reused across stages)
+  private flive = new Set<GPUBuffer>(); // buffers acquired but not yet recycled — so an error mid-stage can reclaim them
+  private poolBytes = 0;                // current pool-buffer size = largest activation for the active stage
+  private fenc: GPUCommandEncoder | null = null;
+  private funi: GPUBuffer[] = [];       // per-stage uniform buffers, freed after submit
+  private fdefer: GPUBuffer[] = [];     // old KV buffers referenced by an in-encoder grow copy — freed after submit
+  private ftmp: GPUBuffer[] = [];       // per-stage transients (cos/sin) — freed after submit
+  private _zeroBuf?: GPUBuffer;         // dummy bias for no-bias linears (hasBias=0 ⇒ never read)
+  private fusedLock: Promise<void> = Promise.resolve();
+  private get zeroBuf(): GPUBuffer { if (!this._zeroBuf) { this._zeroBuf = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); this.dev.queue.writeBuffer(this._zeroBuf, 0, new Float32Array(4)); } return this._zeroBuf; }
+  private acquire(): GPUBuffer { let b = this.pool.pop(); if (b && b.size < this.poolBytes) { b.destroy(); b = undefined; } if (!b) b = this.dev.createBuffer({ size: Math.max(4, this.poolBytes), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }); this.flive.add(b); return b; }
+  private recycle(b: GPUBuffer) { this.flive.delete(b); this.pool.push(b); }
+  // Encode ONE op as its own compute pass on this.fenc (same bind layout as run(): ins 0..n-1, out n, uniform n+1). No submit/map.
+  private opB(code: string, ins: GPUBuffer[], uniform: ArrayBufferView, dispatch: [number, number, number]): GPUBuffer {
+    const dev = this.dev, out = this.acquire();
+    const uBuf = dev.createBuffer({ size: Math.max(16, uniform.byteLength), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(uBuf, 0, uniform as BufferSource); this.funi.push(uBuf);
+    const entries: GPUBindGroupEntry[] = ins.map((buffer, i) => ({ binding: i, resource: { buffer } }));
+    entries.push({ binding: ins.length, resource: { buffer: out } }, { binding: ins.length + 1, resource: { buffer: uBuf } });
+    const pipe = this.pipe(code); const bind = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+    const pass = this.fenc!.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(dispatch[0], dispatch[1], dispatch[2]); pass.end();
+    return out;
+  }
+  // Buffer-returning op variants — identical WGSL/dispatch/uniform to the per-op-map versions above.
+  private linearB(x: GPUBuffer, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number): GPUBuffer {
+    const ins = [x, this.resident(w), bias ? this.resident(bias) : this.zeroBuf], uni = this.u32(R, N, Kk, bias ? 1 : 0);
+    if (Kk % 4 === 0) { if (R > 1) return this.opB(SHARD_WGSL.linearVec4x4, ins, uni, [Math.ceil(N / 64), Math.ceil(R / 16), 1]); return this.opB(SHARD_WGSL.linearVec4, ins, uni, [Math.ceil(N / 16), Math.ceil(R / 16), 1]); }
+    return this.opB(SHARD_WGSL.linear, ins, uni, [Math.ceil(N / 16), Math.ceil(R / 16), 1]);
+  }
+  private linearQ8B(x: GPUBuffer, q: QInfo, bias: Float32Array | null, R: number): GPUBuffer { return this.opB(SHARD_WGSL.linearQ8, [x, this.resident(q.wq), this.resident(q.scale), bias ? this.resident(bias) : this.zeroBuf], this.u32(R, q.N, q.K, bias ? 1 : 0), [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
+  private linearQ4B(x: GPUBuffer, q: QInfo, bias: Float32Array | null, R: number): GPUBuffer { return this.opB(SHARD_WGSL.linearQ4, [x, this.resident(q.wq), this.resident(q.scale), bias ? this.resident(bias) : this.zeroBuf], this.u32(R, q.N, q.K, q.group, q.ng, bias ? 1 : 0), [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
+  private matmulB(x: GPUBuffer, e: WEntry, bias: Float32Array | null, R: number, N: number, K: number): GPUBuffer { return e.q ? (e.q.kind === 'i8' ? this.linearQ8B(x, e.q, bias, R) : this.linearQ4B(x, e.q, bias, R)) : this.linearB(x, e.data!, bias, R, N, K); }
+  private rmsnormB(x: GPUBuffer, w: Float32Array, R: number, H: number, eps: number): GPUBuffer { const b = new ArrayBuffer(8); new Uint32Array(b, 0, 1)[0] = H; new Float32Array(b, 4, 1)[0] = eps; return this.opB(SHARD_WGSL.rmsnorm, [x, this.resident(w)], new Uint8Array(b), [R, 1, 1]); }
+  private ropeB(t: GPUBuffer, cosB: GPUBuffer, sinB: GPUBuffer, SEQ: number, nh: number, HD: number): GPUBuffer { return this.opB(SHARD_WGSL.rope, [t, cosB, sinB], this.u32(SEQ, nh, HD), this.d1(SEQ * nh * HD)); }
+  private addB(a: GPUBuffer, b: GPUBuffer, n: number): GPUBuffer { return this.opB(SHARD_WGSL.add, [a, b], this.u32(n), this.d1(n)); }
+  private swigluB(gate: GPUBuffer, up: GPUBuffer, n: number): GPUBuffer { return this.opB(SHARD_WGSL.swiglu, [gate, up], this.u32(n), this.d1(n)); }
+  private cachedAttnB(q: GPUBuffer, K: GPUBuffer, V: GPUBuffer, seqNew: number, past: number, c: ShardCfg): GPUBuffer { return this.opB(SHARD_WGSL.cachedAttn, [q, K, V], this.u32(seqNew, c.NH, c.NKV, c.HD, past), [seqNew, c.NH, 1]); }
+  // #11 resident-KV grow, but the live-rows copy is ENCODED on this.fenc (old buffers freed after submit) so a resize step stays ONE submit.
+  private ensureKVEncoded(kv: LayerKV, needRows: number, rowFloats: number, maxPos: number): void {
+    if (kv.K && needRows <= kv.cap) return;
+    let cap = kv.cap === 0 ? Math.max(32, needRows) : kv.cap; while (cap < needRows) cap *= 2; if (cap > maxPos) cap = maxPos;
+    if (needRows > cap) throw new Error(`KV context ${needRows} exceeds cap ${maxPos} (raise MOREGPU_MAX_KV_CTX / model max_position_embeddings)`);
+    const nK = this.allocKV(rowFloats, cap), nV = this.allocKV(rowFloats, cap);
+    if (kv.K && kv.len > 0) { const bytes = kv.len * rowFloats * 4; this.fenc!.copyBufferToBuffer(kv.K, 0, nK, 0, bytes); this.fenc!.copyBufferToBuffer(kv.V!, 0, nV, 0, bytes); }
+    if (kv.K) this.fdefer.push(kv.K, kv.V!);
+    kv.K = nK; kv.V = nV; kv.cap = cap;
+  }
+  // One fused cached decoder block. h is a resident pool buffer; returns a resident pool buffer. cosB/sinB uploaded ONCE per stage.
+  private cachedLayerFused(h: GPUBuffer, g: (n: string, opt?: boolean) => WEntry | null, seqNew: number, past: number, kvc: LayerKV, cosB: GPUBuffer, sinB: GPUBuffer, c: ShardCfg): GPUBuffer {
+    const { H, NH, NKV, HD, INT, eps, maxPos } = c;
+    const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
+    const nf = (n: string) => req(n).data!;
+    const bias = (n: string) => g(n, true)?.data ?? null;
+    const ln1 = this.rmsnormB(h, nf('input_layernorm.weight'), seqNew, H, eps);
+    const q = this.matmulB(ln1, req('self_attn.q_proj.weight'), bias('self_attn.q_proj.bias'), seqNew, NH * HD, H);
+    const k = this.matmulB(ln1, req('self_attn.k_proj.weight'), bias('self_attn.k_proj.bias'), seqNew, NKV * HD, H);
+    const v = this.matmulB(ln1, req('self_attn.v_proj.weight'), bias('self_attn.v_proj.bias'), seqNew, NKV * HD, H);
+    this.recycle(ln1);
+    const qR = this.ropeB(q, cosB, sinB, seqNew, NH, HD); this.recycle(q);
+    const kR = this.ropeB(k, cosB, sinB, seqNew, NKV, HD); this.recycle(k);
+    const rowFloats = NKV * HD; this.ensureKVEncoded(kvc, past + seqNew, rowFloats, maxPos);
+    const tailByte = past * rowFloats * 4, appendBytes = seqNew * rowFloats * 4;
+    this.fenc!.copyBufferToBuffer(kR, 0, kvc.K!, tailByte, appendBytes); this.fenc!.copyBufferToBuffer(v, 0, kvc.V!, tailByte, appendBytes); kvc.len = past + seqNew;
+    this.recycle(kR); this.recycle(v); // the KV-append copies are already encoded; a later WAR reuse is auto-synced
+    const ctx = this.cachedAttnB(qR, kvc.K!, kvc.V!, seqNew, past, c); this.recycle(qR);
+    const attnOut = this.matmulB(ctx, req('self_attn.o_proj.weight'), null, seqNew, H, NH * HD); this.recycle(ctx);
+    const hMid = this.addB(h, attnOut, seqNew * H); this.recycle(h); this.recycle(attnOut);
+    const ln2 = this.rmsnormB(hMid, nf('post_attention_layernorm.weight'), seqNew, H, eps);
+    const gate = this.matmulB(ln2, req('mlp.gate_proj.weight'), null, seqNew, INT, H);
+    const up = this.matmulB(ln2, req('mlp.up_proj.weight'), null, seqNew, INT, H); this.recycle(ln2);
+    const act = this.swigluB(gate, up, seqNew * INT); this.recycle(gate); this.recycle(up);
+    const mlpOut = this.matmulB(act, req('mlp.down_proj.weight'), null, seqNew, H, INT); this.recycle(act);
+    const out = this.addB(hMid, mlpOut, seqNew * H); this.recycle(hMid); this.recycle(mlpOut);
+    return out;
+  }
+  private _fusedCleanup(): void { this.funi.forEach((b) => b.destroy()); this.funi = []; this.fdefer.forEach((b) => b.destroy()); this.fdefer = []; this.ftmp.forEach((b) => b.destroy()); this.ftmp = []; this.fenc = null; }
+  // Error path: reclaim every buffer acquired-but-not-recycled this stage (locals unwound by the throw) + the scratch.
+  private _fusedAbort(): void { for (const b of this.flive) b.destroy(); this.flive.clear(); this._fusedCleanup(); }
+  // finish a stage: copy the final hidden → a MAP_READ buffer, submit ONCE, map ONCE, free per-stage scratch.
+  private async finishStage(src: GPUBuffer, len: number): Promise<Float32Array> {
+    const bytes = len * 4;
+    const readBuf = this.dev.createBuffer({ size: Math.max(4, bytes), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.fenc!.copyBufferToBuffer(src, 0, readBuf, 0, bytes); this.dev.queue.submit([this.fenc!.finish()]);
+    try {
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const out = new Float32Array(readBuf.getMappedRange().slice(0, bytes)); readBuf.unmap();
+      this.recycle(src); this._fusedCleanup();
+      return out;
+    } finally { readBuf.destroy(); } // always freed, even if mapAsync rejects (device lost after submit)
+  }
+  // Fused equivalent of cachedStage — 1 submit + 1 map for the whole layer loop. Serialized per instance (shared encoder/pool).
+  async cachedStageFused(hidden: Float32Array, past: number, weights: Map<string, WEntry>, start: number, end: number, cache: LayerKV[], c: ShardCfg): Promise<Float32Array> {
+    const prev = this.fusedLock; let unlock!: () => void; this.fusedLock = new Promise<void>((r) => { unlock = r; }); await prev;
+    try {
+      const seqNew = Math.floor(hidden.length / c.H);
+      this.poolBytes = Math.max(seqNew * c.INT, seqNew * c.NH * c.HD, seqNew * c.H) * 4;
+      this.fenc = this.dev.createCommandEncoder();
+      const positions = Array.from({ length: seqNew }, (_, i) => past + i);
+      const { cos, sin } = computeCosSin(positions, c.HD, c.theta);
+      const cosB = this.dev.createBuffer({ size: Math.max(4, (cos.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); this.dev.queue.writeBuffer(cosB, 0, cos as BufferSource); this.ftmp.push(cosB);
+      const sinB = this.dev.createBuffer({ size: Math.max(4, (sin.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); this.dev.queue.writeBuffer(sinB, 0, sin as BufferSource); this.ftmp.push(sinB);
+      let h = this.acquire(); this.dev.queue.writeBuffer(h, 0, hidden as BufferSource); // the ONE host→GPU activation upload
+      for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w; }; h = this.cachedLayerFused(h, g, seqNew, past, cache[li - start], cosB, sinB, c); }
+      return await this.finishStage(h, seqNew * c.H);
+    } catch (e) { this._fusedAbort(); throw e; } finally { unlock(); }
   }
 }
 // ===== SHARD RUNTIME END =====
@@ -1212,6 +1329,7 @@ const MAX_KV_SESSIONS = _envn('MOREGPU_MAX_KV_SESSIONS', 8);
 const MAX_STAGING = _envn('MOREGPU_MAX_STAGING', 4);
 const MAX_STAGING_BYTES = _envn('MOREGPU_MAX_STAGING_BYTES', 8 * 2 ** 30); // 8 GiB across all live pushes
 const MAX_KV_CTX = _envn('MOREGPU_MAX_KV_CTX', 131072); // resident-KV context hard cap (VRAM / storage-binding-size backstop); a model's own max_position_embeddings usually lowers it
+const FUSED_DECODE = (_D?.env.get('MOREGPU_FUSED_DECODE') ?? '') === '1'; // opt-in (#12): fuse a whole cached stage into ONE submit + ONE GPU→CPU map (bit-identical; default off)
 const dropPush = (id: string) => { SHARD_PUSH.delete(id); SHARD_PUSH_BYTES.delete(id); };
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
