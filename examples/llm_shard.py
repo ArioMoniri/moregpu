@@ -36,6 +36,10 @@ TOKEN = os.environ.get("MOREGPU_ADMIN_TOKEN", "")
 MODEL = os.environ.get("MOREGPU_LLM", "gpt2")
 PROMPT = os.environ.get("MOREGPU_PROMPT", "The future of distributed computing is")
 GEN = int(os.environ.get("MOREGPU_GEN", "16"))
+# MOREGPU_QUANT: "wq8"/"wq4" → the coordinator quantizes each stage to int8/int4 before streaming (any WebGPU
+# worker, download-free) · "int8"/"nf4"/"auto" → bitsandbytes on a CUDA torch worker (non-push).
+QUANT = os.environ.get("MOREGPU_QUANT", "").strip() or None
+PUSH = os.environ.get("MOREGPU_PUSH", "1" if QUANT in ("wq8", "wq4") else "0") not in ("", "0", "false", "no")
 
 
 def main():
@@ -45,17 +49,20 @@ def main():
     ids = tok(PROMPT)["input_ids"]
 
     pool = MoreGPU(BASE, TOKEN, timeout=600)
-    torch_workers = [w for w in pool.workers() if "torch" in (w.get("label") or "")]
-    if not torch_workers:
-        sys.exit("no native torch worker in the fleet — start apps/worker/worker_torch.py and retry")
-    if len(torch_workers) < 2:
-        print(f"note: only {len(torch_workers)} torch worker — the split is degenerate (1 stage = whole model). "
+    # A shard host is any worker that advertises the 'shard' cap — a native torch worker OR a WebGPU worker.
+    sw = [w for w in pool.workers() if "shard" in (w.get("caps") or []) or "torch" in (w.get("label") or "")]
+    if not sw:
+        sys.exit("no shard-capable worker in the fleet — start apps/worker/worker_torch.py or a WebGPU worker and retry")
+    if len(sw) < 2:
+        print(f"note: only {len(sw)} shard worker — the split is degenerate (1 stage = whole model). "
               f"Start a 2nd worker for a real cross-machine pipeline.")
 
-    print(f"== pipeline-shard {MODEL} across {len(torch_workers)} worker(s) ==  prompt={PROMPT!r}  gen={GEN}")
+    qmsg = f"  quant={QUANT}" if QUANT else ""
+    print(f"== pipeline-shard {MODEL} across {len(sw)} worker(s) ==  prompt={PROMPT!r}  gen={GEN}{qmsg}")
 
     # SHARD: the coordinator splits the layers into contiguous stages, one per worker, and loads each stage.
-    plan = pool.shard_load(MODEL)
+    # push+quant=wq8/wq4 → the coordinator quantizes each stage to int8/int4 before streaming (WebGPU workers).
+    plan = pool.shard_load(MODEL, push=PUSH, quant=QUANT)
     stages = plan["stages"]
     print(f"sharded into {len(stages)} stage(s) over {plan['layers']} transformer layers:")
     for i, s in enumerate(stages):

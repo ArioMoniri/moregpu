@@ -200,7 +200,7 @@ case "$cmd" in
   join)    need_deno; exec deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
   install) exec sh -c "curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVICE=1 sh" ;;
 
-  finetune|generate|chat) ml_run "$cmd" "$@" ;;
+  finetune|generate|chat|shard) ml_run "$cmd" "$@" ;;
 
   isolate) need_deno
     command -v bash >/dev/null 2>&1 || { echo "[moregpu] isolate needs bash (Linux, systemd + cgroups v2)"; exit 1; }
@@ -265,6 +265,14 @@ case "$cmd" in
     moregpu generate MODEL --prompt "…" [--from-training]
                                                run the model; --from-training uses the just-fine-tuned one
     moregpu chat MODEL [--from-training]        interactive chat (one turn per line)
+
+  SHARD A MODEL ACROSS THE FLEET   (split too-big models; runs on torch AND WebGPU workers)
+    moregpu shard MODEL [--quant wq8|wq4] [--split 12,24] [--prompt "…"] [--unload]
+                                               pipeline-shard MODEL across the workers (download-free by default).
+                                               --quant wq8/wq4: the coordinator quantizes each stage to int8/int4
+                                                 before streaming, so a WebGPU/browser worker holds a bigger slice.
+                                               --quant int8/nf4/auto: bitsandbytes on a CUDA torch worker.
+                                               --prompt: after sharding, chat it (the first stage tokenizes on-device).
 
   ADMIN FLEET CONTROL   (env: MOREGPU_SERVER, MOREGPU_ADMIN_TOKEN)
     moregpu workers | monitor                  list workers / pool device

@@ -1107,7 +1107,15 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
 // The coordinator streams this stage's config.json + per-stage safetensors via push_begin/push_chunk (download-
 // free), then shard_load parses them into GPU-ready weights and shard_forward runs the stage's decoder blocks
 // (hidden→hidden). This is what makes a WebGPU device a real shard host (not just an offloaded-kernel donor).
-const SHARD_STAGE = new Map<string, { weights: Map<string, WEntry>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]>; tok: BpeTokenizer | null }>();
+const SHARD_STAGE = new Map<string, { weights: Map<string, WEntry>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]>; tok: BpeTokenizer | null; eos: number | null }>();
+// Resolve the model's EOS token id from the streamed generation_config.json (eos_token_id, int or list) or, as a
+// fallback, tokenizer_config.json's eos_token string mapped through the tokenizer's vocab — so a WebGPU first stage
+// can stop generation on EOS just like the torch worker (which uses tk.eos_token_id).
+function resolveEos(join: (n: string) => Uint8Array | null, tok: BpeTokenizer | null): number | null {
+  try { const g = join('generation_config.json'); if (g) { const e = (JSON.parse(new TextDecoder().decode(g)) as { eos_token_id?: number | number[] }).eos_token_id; if (Array.isArray(e) && e.length) return Number(e[0]); if (typeof e === 'number') return e; } } catch { /* */ }
+  try { const t = join('tokenizer_config.json'); if (t && tok) { const raw = (JSON.parse(new TextDecoder().decode(t)) as { eos_token?: string | { content?: string } }).eos_token; const content = typeof raw === 'string' ? raw : raw?.content; if (content) { const id = tok.vocab.get(content); if (typeof id === 'number') return id; } } } catch { /* */ }
+  return null;
+}
 const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
@@ -1135,7 +1143,8 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     // making a browser/Deno tab a self-contained first stage — no client-side tokenizer needed. Ids still work too.
     const tokBytes = first ? join('tokenizer.json') : null;
     const tok = tokBytes ? BpeTokenizer.fromTokenizerJson(JSON.parse(new TextDecoder().decode(tokBytes))) : null;
-    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok }); SHARD_PUSH.delete(id);
+    const eos = tok ? resolveEos(join, tok) : null;
+    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok, eos }); SHARD_PUSH.delete(id);
     let held = 0; for (const w of weights.values()) held += (w.data?.length ?? (w.q ? w.q.N * w.q.K : 0));
     return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
   }
@@ -1181,6 +1190,10 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
   }
   if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') st.kv.delete(String(p.session)); else st.kv.clear(); } return { ok: true }; }
   if (op === 'shard_unload') { SHARD_STAGE.delete(id); SHARD_PUSH.delete(id); return { ok: true }; }
+  // TEXT ↔ ids on the FIRST stage's on-device tokenizer, so /model/shard_chat works when the first stage is a WebGPU
+  // worker (mirrors worker_torch's shard_tok/shard_detok). Needs a tokenizer.json to have been streamed to this stage.
+  if (op === 'shard_tok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard — the tokenizer.json streams to the first stage; a WebGPU first stage needs it'); return { ok: true, input_ids: st.tok.encode(String(p.prompt ?? '').slice(0, 8000)), eos: st.eos }; }
+  if (op === 'shard_detok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard'); return { ok: true, text: st.tok.decode((p.tokens as number[]) ?? [], { skipSpecialTokens: true }) }; }
   throw new Error(`webgpu worker: unsupported model op '${op}'`);
 }
 if (!TOKEN) console.log('[worker] warning: no join token set (--token / MOREGPU_TOKEN) — the server will reject me');
