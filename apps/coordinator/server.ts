@@ -1018,14 +1018,27 @@ function buildQuantStage(tensors: { name: string; dtype: string; shape: number[]
   return out;
 }
 // ===== QUANT STAGE BUILDER END =====
-// Fetch each tensor of a stage, build the quantized per-stage safetensors, and chunk-push it as "model.safetensors".
+// Stream a QUANTIZED per-stage safetensors as "model.safetensors", tensor-by-tensor (byte-identical to
+// buildQuantStage). Memory-bounded: the header offsets come from SHAPES alone (no weight bytes), then each tensor is
+// fetched → quantized → pushed → released, so peak RAM is one tensor + a <PUSH_CHUNK buffer — never the whole stage
+// (which for a big model split onto one strong worker would OOM the coordinator if buffered at once).
 async function streamStageSafetensorsQuant(w: Worker, id: string, model: string, plan: STPlan, names: string[], quant: string, budget: { left: number }): Promise<number> {
-  const tensors: { name: string; dtype: string; shape: number[]; raw: Uint8Array }[] = [];
-  for (const name of names) { const t = plan[name]; const raw = await hfFetchRange(model, t.file, t.dataStart + t.data_offsets[0], t.dataStart + t.data_offsets[1] - 1); tensors.push({ name, dtype: t.dtype, shape: t.shape, raw }); }
-  const buf = buildQuantStage(tensors, quant);
-  budget.left -= buf.length; if (budget.left < 0) throw new Error(`shard push exceeded ${PUSH_MAX_BYTES}-byte cap (raise MOREGPU_PUSH_MAX_BYTES)`);
-  for (let o = 0, seq = 0; o < buf.length; o += PUSH_CHUNK) { const last = o + PUSH_CHUNK >= buf.length; const r = await modelRPC(w, 'push_chunk', { id, name: 'model.safetensors', seq: seq++, data: b64e(buf.slice(o, Math.min(o + PUSH_CHUNK, buf.length))), last }); if (!r.ok) throw new Error(`push_chunk safetensors: ${r.error}`); }
-  return buf.length;
+  const newHeader: STHeader = {}; let off = 0;
+  for (const name of names) { const t = plan[name]; for (const o of qOutputs(name, t.dtype, t.shape, quant)) { newHeader[o.name] = { dtype: o.dtype, shape: o.shape, data_offsets: [off, off + o.bytes] }; off += o.bytes; } }
+  let hstr = JSON.stringify(newHeader); while ((8 + new TextEncoder().encode(hstr).length) % 8 !== 0) hstr += ' ';
+  const hbytes = new TextEncoder().encode(hstr);
+  const prefix = new Uint8Array(8); new DataView(prefix.buffer).setBigUint64(0, BigInt(hbytes.length), true);
+  let pending = new Uint8Array(0), seq = 0, total = 0;
+  const push = async (data: Uint8Array, last: boolean) => { const r = await modelRPC(w, 'push_chunk', { id, name: 'model.safetensors', seq: seq++, data: b64e(data), last }); if (!r.ok) throw new Error(`push_chunk safetensors: ${r.error}`); };
+  const feed = async (b: Uint8Array, last = false) => {
+    total += b.length; budget.left -= b.length; if (budget.left < 0) throw new Error(`shard push exceeded ${PUSH_MAX_BYTES}-byte cap (raise MOREGPU_PUSH_MAX_BYTES)`);
+    const merged = new Uint8Array(pending.length + b.length); merged.set(pending); merged.set(b, pending.length); pending = merged;
+    while (pending.length >= PUSH_CHUNK) { await push(pending.slice(0, PUSH_CHUNK), false); pending = pending.slice(PUSH_CHUNK); }
+    if (last) await push(pending, true);
+  };
+  await feed(prefix); await feed(hbytes);
+  for (let i = 0; i < names.length; i++) { const t = plan[names[i]]; const raw = await hfFetchRange(model, t.file, t.dataStart + t.data_offsets[0], t.dataStart + t.data_offsets[1] - 1); const outParts = qTransform(names[i], t.dtype, t.shape, quant, raw); for (let j = 0; j < outParts.length; j++) await feed(outParts[j], i === names.length - 1 && j === outParts.length - 1); }
+  return total;
 }
 
 // Run ONE forward across a shard plan: stage 0 embeds input_ids → hidden; each next stage runs its blocks on
@@ -1048,9 +1061,12 @@ type ShardCache = { session: string; pos: number; seq?: number[] };
 async function streamStageToWorker(sid: string, model: string, push: boolean, configText: string | null, stPlan: STPlan | null, st: ShardStage, w: Worker, resume: boolean): Promise<{ ok: boolean; data?: Record<string, unknown>; error?: string; bytes: number }> {
   const fp16 = !!shardPlans.get(sid)?.fp16;  // fp16 halves each stage's footprint on a GPU worker (plan-wide; failover reads it too)
   const quant = shardPlans.get(sid)?.quant;   // int8/nf4 (non-push only) — the worker quantizes on load; CUDA-gated worker-side
+  const wq = quant === 'wq8' || quant === 'wq4';   // coordinator-side quantize-and-stream (download-free, any WebGPU backend)
   if (!push) { const r = await modelRPC(w, 'shard_load', { model, id: sid, start: st.start, end: st.end, first: st.first, last: st.last, fp16, quant }); return { ...r, bytes: 0 }; }
   try {
-    const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
+    // The quant path re-streams the full quantized buffer from offset 0 (its bytes are transformed, so a partial
+    // resume would concatenate onto a stale prefix and corrupt the staged file) — force a clean re-push (resume=false).
+    const begin = await modelRPC(w, 'push_begin', { id: sid, model, resume: wq ? false : resume }); if (!begin.ok) throw new Error(`push_begin: ${begin.error}`);
     const sizes = (begin.data?.sizes ?? {}) as Record<string, number>;
     if (resume && Number(sizes['model.safetensors']) > 0) log('info', `shard ${sid} stage ${st.worker}: resuming — ${(Number(sizes['model.safetensors']) / 1e6).toFixed(1)}MB already staged, streaming the rest`);
     const budget = { left: PUSH_MAX_BYTES };
@@ -1065,7 +1081,6 @@ async function streamStageToWorker(sid: string, model: string, push: boolean, co
       }
     }
     const names = stageTensors(stPlan!, st.start, st.end, st.first, st.last);
-    const wq = quant === 'wq8' || quant === 'wq4';   // coordinator-side quantize-and-stream (download-free, any WebGPU backend)
     const bytes = wq
       ? await streamStageSafetensorsQuant(w, sid, model, stPlan!, names, quant!, budget)
       : await streamStageSafetensors(w, sid, model, stPlan!, names, budget, Number(sizes['model.safetensors']) || 0);
@@ -2059,10 +2074,12 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       if (torchQuant && body.push) return json({ error: 'int8/nf4/auto are non-push (the worker self-loads + quantizes from HF); for download-free quant on a WebGPU worker use quant:"wq8"/"wq4"' }, 400);
       if (webgpuQuant && !body.push) return json({ error: 'wq8/wq4 are push-only — the coordinator quantizes each stage and streams it; add push:true' }, 400);
     }
-    // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the torch fleet order
+    // explicit `workers` picks the stage order (stage i = workers[i]); otherwise use the fleet order. wq8/wq4 emit
+    // I8/U8+scale tensors only a WebGPU shard runtime dequantizes — a torch/'resident' worker would from_pretrained
+    // them as raw codes (silent garbage), so auto-placement filters resident workers out for that quant.
     const cands = (Array.isArray(body.workers) && body.workers.length)
       ? body.workers.map((wid) => shardWorkers().find((w) => w.id === wid)).filter((w): w is Worker => !!w)
-      : shardWorkers();
+      : (webgpuQuant ? shardWorkers().filter((w) => !w.caps.has('resident')) : shardWorkers());
     if (cands.length === 0) return json({ error: 'no shard-capable worker connected — start apps/worker/worker_torch.py (or a WebGPU worker advertising the "shard" cap); pipeline sharding needs ≥1 (≥2 for a real split)' }, 503);
     const sid = body.id ?? body.model;
     if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
@@ -2120,6 +2137,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       const w = workers.get(st.worker);
       if ((st.first || st.last) && !w?.caps.has('shardEnds')) return fail(`stage worker ${st.worker} cannot host the ${st.first ? 'first' : 'last'} stage (needs embeddings/tokenizer/head — the 'shardEnds' cap); a WebGPU worker can only take a MIDDLE stage`, 400);
       if (torchQuant && !w?.caps.has('resident')) return fail(`quant (${body.quant}) is bitsandbytes/CUDA-only but stage worker ${st.worker} is not a torch/resident worker`, 400);
+      if (webgpuQuant && w?.caps.has('resident')) return fail(`quant (${body.quant}) emits int8/int4 + scale tensors that only a WebGPU shard runtime dequantizes, but stage worker ${st.worker} is a torch/resident worker that would load them as raw weights — place wq8/wq4 stages on WebGPU workers`, 400);
     }
     // Load every stage (streaming its slice for a push shard). Returns the stage info or throws after cleaning
     // up any stages already loaded — so a half-loaded pipe never lingers. Runnable in the background for async.
@@ -2190,6 +2208,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       const started = Date.now();
       shardLoads.set(sid, { status: 'loading', model, started, stagesDone: 0, stagesTotal: nStages }); // fresh state — never inherit a prior load's `aborted`
       const info = await runLoad();
+      if (shardLoads.get(sid)?.aborted) return json({ error: 'shard load aborted (unloaded during load)', id: sid }, 409); // a concurrent shard_unload tore it down — don't re-mark ready
       shardLoads.set(sid, { status: 'ready', model, started, stagesDone: nStages, stagesTotal: nStages, info });
       return json({ ok: true, id: sid, model, layers: nLayer, mode: push ? 'download-free' : 'download', stages: info });
     } catch (e) { return fail(e instanceof Error ? e.message : String(e), 502); }
@@ -2208,7 +2227,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     // PEER TRANSPORT (opt-in): an uncached forward goes worker->worker via ringPipe (coordinator off the data path);
     // ringPipe itself falls back to shardPipe when no direct ring is wired or a cache step is requested.
     const out = await pipeForward(sid, body.input_ids, !!body.return_logits, cache);
-    if (!out.ok) { if (out.disconnected) shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); }
+    if (!out.ok) { if (out.disconnected) { shardPlans.delete(sid); shardStreams.delete(sid); } return json({ error: out.error, id: sid }, out.disconnected ? 503 : 502); } // keep the plan + stream metadata on a live-worker compute error (failover still needs them)
     return json({ ok: true, id: sid, ...out.data });
   }
   // Coordinator-side pipelined GENERATE: run the whole greedy loop HERE (one client request), streaming one
@@ -2277,7 +2296,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
         if (Number.isFinite(eos) && tok === eos) break;
       }
     } finally { await shardReset(sid, session); } // evict this request's live KV on every stage (also on error/return)
-    if (piped && !piped.ok) { if (piped.disconnected) shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: piped.error, id: sid }, piped.disconnected ? 503 : 502); }
+    if (piped && !piped.ok) { if (piped.disconnected) { shardPlans.delete(sid); shardStreams.delete(sid); } return json({ error: piped.error, id: sid }, piped.disconnected ? 503 : 502); } // keep plan + stream metadata on a live-worker error so failover still works
     const newTokens = seq.slice(promptLen);
     const dt = await modelRPC(first, 'shard_detok', { id: sid, tokens: newTokens });
     if (!dt.ok) return json({ error: `decode failed: ${dt.error}` }, 502);
@@ -2297,9 +2316,16 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     const sid = body.id ?? [...shardPlans.keys()][0];
     if (!sid || !shardPlans.has(sid)) return json({ error: 'no such sharded model' }, 404);
     const plan = shardPlans.get(sid)!;
+    const ls = shardLoads.get(sid);
+    // If a load is still finalizing, mark it aborted so neither the async .then nor the sync finalize re-marks it
+    // ready after we tear it down. Whether the reservation is still empty (truly mid-load) or already finalized (the
+    // brief wireRing window before status flips to ready) we then delete the plan and unload every PLACED stage:
+    //  - empty reservation (stages:[]) → runLoad's own abort checks unloadAll the stages it has placed;
+    //  - finalized plan (real stages) → we unload them here (runLoad is already past its abort checks).
+    if (ls && ls.status === 'loading') shardLoads.set(sid, { ...ls, aborted: true, status: 'error', error: 'unloaded during load' });
     shardPlans.delete(sid); shardStreams.delete(sid); rings.delete(sid); ringStats.delete(sid); // drop any peer ring too
     for (const st of plan.stages) { const w = workers.get(st.worker); if (w) await modelRPC(w, 'shard_unload', { id: sid }); }
-    log('info', `sharded model ${sid} unloaded (${plan.stages.length} stages)`);
+    log('info', `sharded model ${sid} unloaded (${plan.stages.length} stages)${ls?.status === 'loading' ? ' — load aborted' : ''}`);
     return json({ ok: true, id: sid, stages: plan.stages.length });
   }
   // EXPERT PARALLELISM (MoE) — see docs/ROADMAP.md. FIRST verifiable increment: a routed-MoE placed as an EP×pipe
