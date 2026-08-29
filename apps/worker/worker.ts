@@ -359,6 +359,8 @@ interface TokenizerConfig {
   pretokenizerRegex?: string;
   /** ByteLevel add_prefix_space (GPT-2/Qwen2 default: false). */
   addPrefixSpace?: boolean;
+  /** Apply Unicode NFC normalization before pre-tokenization (Qwen2's tokenizer.json declares a NFC normalizer). */
+  nfc?: boolean;
   unkToken?: string;
 }
 
@@ -372,6 +374,7 @@ class BpeTokenizer {
   readonly bpeRanks: Map<string, number>;
   readonly addedTokens: AddedToken[];
   readonly addPrefixSpace: boolean;
+  readonly nfc: boolean;
   readonly unkToken?: string;
 
   private readonly byteToChar: string[];
@@ -413,6 +416,7 @@ class BpeTokenizer {
     this.pat = new RegExp(patternSrc, "gu");
 
     this.addPrefixSpace = cfg.addPrefixSpace ?? false;
+    this.nfc = cfg.nfc ?? false;
     this.unkToken = cfg.unkToken;
 
     // added / special tokens.
@@ -465,6 +469,7 @@ class BpeTokenizer {
       pretokenizerRegex: regex ?? undefined,
       pretokenizer: regex ? undefined : "gpt2",
       addPrefixSpace,
+      nfc: hasNFCNormalizer(obj.normalizer),
       unkToken: model.unk_token ?? undefined,
     });
   }
@@ -592,6 +597,7 @@ class BpeTokenizer {
   // ---- public API -------------------------------------------------------
 
   encode(text: string): number[] {
+    if (this.nfc) text = text.normalize("NFC");   // Qwen2 (and any NFC-normalizer tokenizer) canonicalizes first
     if (this.addPrefixSpace && text.length && !/^\s/.test(text)) {
       text = " " + text;
     }
@@ -668,6 +674,14 @@ function normalizeMerges(merges: any[]): Array<[string, string]> {
     }
   }
   return out;
+}
+
+// Detect whether a tokenizer.json `normalizer` node applies NFC (directly, or nested in a Sequence).
+function hasNFCNormalizer(node: any): boolean {
+  if (!node) return false;
+  if (node.type === "NFC") return true;
+  if (Array.isArray(node.normalizers)) return node.normalizers.some(hasNFCNormalizer);
+  return false;
 }
 
 // Read a tokenizer.json pre_tokenizer node -> { explicit regex?, add_prefix_space }.
