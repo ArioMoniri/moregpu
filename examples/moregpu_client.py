@@ -243,9 +243,13 @@ class MoreGPU:
     # ---- pipeline-parallel sharding (GPT-2 family only): split the layers into contiguous STAGES,
     # one per torch worker; each worker holds ONLY its stage. Needs apps/worker/worker_torch.py (≥2 for a real split). ----
     def shard_load(self, model: str, layers: int | None = None, workers: Sequence[str] | None = None,
-                   id: str | None = None, push: bool = False) -> dict:
-        """Split `model`'s transformer layers into contiguous stages across the torch workers. GPT-2 / Llama-family.
+                   id: str | None = None, push: bool = False, quant: str | None = None,
+                   split: Sequence[int] | None = None, fp16: bool = False, actq: str | None = None) -> dict:
+        """Split `model`'s transformer layers into contiguous stages across the workers. GPT-2 / Llama-family.
         push=True → download-free: the coordinator streams each worker only its stage's weights (no fleet download).
+        quant → smaller stages: "wq8"/"wq4" (the coordinator quantizes each stage to int8/int4 + scale before
+        streaming; runs on ANY WebGPU worker; needs push=True) or "int8"/"nf4"/"auto" (bitsandbytes on a CUDA torch
+        worker; non-push). split=[n0,n1,…] gives explicit per-stage layer counts for a heterogeneous fleet.
         Returns {id, mode, stages:[{worker, start, end, first, last, params_held, bytes}]}."""
         body: dict[str, Any] = {"model": model}
         if layers is not None:
@@ -256,7 +260,24 @@ class MoreGPU:
             body["id"] = id
         if push:
             body["push"] = True
+        if quant:
+            body["quant"] = quant
+        if split:
+            body["split"] = list(split)
+        if fp16:
+            body["fp16"] = True
+        if actq:
+            body["actq"] = actq
         return self._req("/model/shard", "POST", body)
+
+    def shard_chat(self, prompt: str, id: str | None = None, max_new_tokens: int = 64) -> dict:
+        """Text-in / text-out over a sharded model: the FIRST stage tokenizes on-device (a WebGPU first stage uses
+        its inlined byte-level BPE), the coordinator pipes every token through all stages, and the first stage
+        detokenizes. Returns {text, n, ms, workers}."""
+        body: dict[str, Any] = {"prompt": prompt, "max_new_tokens": max_new_tokens}
+        if id:
+            body["id"] = id
+        return self._req("/model/shard_chat", "POST", body)
 
     def shard_forward(self, input_ids: Sequence[int], id: str | None = None, return_logits: bool = False) -> dict:
         """Run ONE full forward across the pipeline: the coordinator pipes the hidden state stage→stage

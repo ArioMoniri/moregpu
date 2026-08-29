@@ -105,6 +105,21 @@ def f32_to_b64(t: torch.Tensor) -> str:
     return b64e(t.detach().to("cpu", torch.float32).contiguous().numpy().astype("<f4").tobytes())
 def b64_to_t(s: str) -> torch.Tensor:  # flat float32 tensor (on CPU; caller moves to DEV)
     return torch.from_numpy(np.frombuffer(b64d(s), dtype="<f4").copy())
+# INT8 ACTIVATION WIRE (opt-in) — a stage's [seq,H] hidden crosses as symmetric per-ROW int8 + one f32 scale/row
+# (~4x smaller) instead of fp32. BYTE-IDENTICAL to worker.ts actqEncode so a torch stage and a WebGPU stage can
+# hand off across a boundary: scale = float64(maxAbs/127)->f32; q = round-half-away-from-zero of the f64 quotient,
+# clamp [-127,127]. Lossy (per-hop, compounds) — used only where the coordinator enables it (never into the head).
+def actq_encode(h, seq: int, H: int) -> dict:
+    x = (h.detach().to("cpu", torch.float32).contiguous().numpy() if hasattr(h, "detach") else np.asarray(h, dtype=np.float32))
+    x = np.ascontiguousarray(x).reshape(seq, H).astype(np.float32, copy=False)
+    scale = (np.abs(x).max(axis=1).astype(np.float64) / 127.0).astype(np.float32)
+    denom = np.where(scale == 0.0, np.float64(1.0), scale.astype(np.float64))
+    q = np.clip(np.floor(np.abs(x.astype(np.float64) / denom[:, None]) + 0.5) * np.sign(x.astype(np.float64)), -127.0, 127.0).astype(np.int8)
+    return {"qB64": b64e(np.ascontiguousarray(q).tobytes()), "scaleB64": b64e(np.ascontiguousarray(scale.astype("<f4")).tobytes())}
+def actq_decode(qB64: str, scaleB64: str, seq: int, H: int) -> torch.Tensor:
+    q = np.frombuffer(b64d(qB64), dtype=np.int8).reshape(seq, H)
+    scale = np.frombuffer(b64d(scaleB64), dtype="<f4").reshape(seq).copy()
+    return torch.from_numpy(np.ascontiguousarray((q.astype(np.float32) * scale[:, None]).astype(np.float32)))
 
 # ---- sealing: AES-256-GCM, 12-byte IV, ct = ciphertext||16-byte tag (byte-compatible w/ WebCrypto) ----
 def seal(key: bytes, plain: bytes) -> dict:
@@ -879,8 +894,12 @@ def shard_forward(payload: dict) -> dict:
             seq = ids.shape[1]
         else:
             seq = int(payload["seq"])
-            # the wire carries fp32 activations; cast to THIS stage's dtype (fp16 on a GPU worker) before its layers
-            h = b64_to_t(payload["hidden"]).reshape(1, seq, hidden_dim).to(DEV).to(shard.get("dtype", torch.float32))
+            # the wire carries fp32 (or opt-in int8) activations; cast to THIS stage's dtype (fp16 on a GPU worker)
+            if payload.get("actq") == "int8":
+                h = actq_decode(payload["hidden_q"]["qB64"], payload["hidden_q"]["scaleB64"], seq, hidden_dim)
+            else:
+                h = b64_to_t(payload["hidden"])
+            h = h.reshape(1, seq, hidden_dim).to(DEV).to(shard.get("dtype", torch.float32))
         # absolute positions of THIS call's tokens: [past_len .. past_len+seq). For an uncached call past_len==0,
         # so cache_position == arange(seq) and every path below reduces to the original stateless numerics.
         cache_position = torch.arange(past_len, past_len + seq, dtype=torch.long, device=DEV)
@@ -924,7 +943,11 @@ def shard_forward(payload: dict) -> dict:
             if payload.get("return_logits"):
                 res["logits"] = f32_to_b64(logits)
         else:
-            res = {"ok": True, "hidden": f32_to_b64(h.flatten()), "seq": seq, "hidden_dim": hidden_dim}
+            # hidden → next stage: opt-in int8 activation wire (actq_out set by the coordinator for non-last boundaries).
+            if payload.get("actq_out") == "int8":
+                res = {"ok": True, "hidden_q": actq_encode(h.reshape(seq, hidden_dim), seq, hidden_dim), "actq": "int8", "seq": seq, "hidden_dim": hidden_dim}
+            else:
+                res = {"ok": True, "hidden": f32_to_b64(h.flatten()), "seq": seq, "hidden_dim": hidden_dim}
     if cached:
         res["past"] = int(past_len + seq)  # cache length after this call == the coordinator's next pos
     if DEV == "cuda": torch.cuda.synchronize()

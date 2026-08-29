@@ -108,9 +108,34 @@ class Pool:
         return self._req("/model/generate", "POST",
                          {"input_ids": list(ids), "max_new_tokens": max_new_tokens}).get("tokens", [])
 
+    # ---- pipeline sharding (split a model across workers; optionally quantized) ----
+    def shard_load(self, model, push=True, quant=None, split=None, layers=None, actq=None):
+        body = {"model": model, "push": bool(push), "async": True}
+        if quant:
+            body["quant"] = quant
+        if split:
+            body["split"] = split
+        if layers:
+            body["layers"] = layers
+        if actq:
+            body["actq"] = actq
+        return self._req("/model/shard", "POST", body)
+
+    def shard_status(self, sid=None):
+        return self._req("/model/shard_status" + (f"?id={sid}" if sid else ""))
+
+    def shard_chat(self, prompt, sid=None, max_new_tokens=64):
+        body = {"prompt": prompt, "max_new_tokens": max_new_tokens}
+        if sid:
+            body["id"] = sid
+        return self._req("/model/shard_chat", "POST", body)
+
+    def shard_unload(self, sid=None):
+        return self._req("/model/shard_unload", "POST", {"id": sid} if sid else {})
+
 
 # ----------------------------------------------------------------------------- helpers
-def discover(args) -> Pool:
+def discover(args, need_torch: bool = True) -> Pool:
     url = args.url or os.environ.get("MOREGPU_BASE")
     if not url:
         srv = os.environ.get("MOREGPU_SERVER", "http://localhost:8787")
@@ -130,9 +155,11 @@ def discover(args) -> Pool:
     ws = pool.workers()
     if not ws:
         sys.exit(f"no workers in the fleet at {url} — start one (`moregpu serve --worker`, or a torch worker).")
-    if not any("torch" in (w.get("label") or "") for w in ws):
+    if need_torch and not any("torch" in (w.get("label") or "") for w in ws):
         sys.exit("no native torch worker in the fleet — fine-tuning/serving needs apps/worker/worker_torch.py "
                  "(WebGPU workers are inference-only kernels). Start a torch worker and retry.")
+    # sharding runs on any 'shard'-capable worker (WebGPU or torch); the coordinator's /model/shard is the authority
+    # and returns a clear error if none is connected, so we don't hard-gate here (older coordinators omit caps).
     return pool
 
 
@@ -305,6 +332,53 @@ def cmd_chat(args) -> int:
     return 0
 
 
+def cmd_shard(args) -> int:
+    import time
+    pool = discover(args, need_torch=False)  # sharding runs on WebGPU workers too (not just torch)
+    if args.unload:
+        print(json.dumps(pool.shard_unload(None if args.model in ("", "-") else args.model), indent=2))
+        return 0
+    # wq8/wq4 are push (coordinator quantizes + streams); int8/nf4/auto are non-push (worker self-loads via bnb).
+    push = not args.no_push
+    if args.quant in ("int8", "nf4", "auto"):
+        push = False
+    split = [int(x) for x in args.split.split(",")] if args.split else None
+    print(f"sharding {args.model}" + (f" · quant={args.quant}" if args.quant else "") + (f" · actq={args.actq}" if args.actq else "") + (" · download-free" if push else "") + " …")
+    r = pool.shard_load(args.model, push=push, quant=args.quant, split=split, layers=args.layers, actq=args.actq)
+    sid = r.get("id", args.model)
+    if r.get("error") and not r.get("stages"):
+        print("shard failed:", r.get("error"))
+        return 1
+    for _ in range(900):  # async load → poll until ready
+        st = pool.shard_status(sid)
+        status = st.get("status")
+        if status in ("ready", "error"):
+            r = st
+            break
+        if status == "unknown" and st.get("error"):
+            r = st
+            break
+        time.sleep(1)
+    if r.get("status") == "error" or r.get("error"):
+        print("shard failed:", r.get("error", "unknown error"))
+        return 1
+    stages = r.get("stages", [])
+    print(f"sharded '{sid}' into {len(stages)} stage(s):")
+    for i, s in enumerate(stages):
+        role = "first+last" if s.get("first") and s.get("last") else "first" if s.get("first") else "last" if s.get("last") else "middle"
+        ph = s.get("params_held")
+        print(f"  stage {i}: worker {s.get('worker')}  layers [{s.get('start')},{s.get('end')})  {role}" + (f"  · {ph:,} params" if ph else ""))
+    if args.prompt:
+        print(f"\nchat> {args.prompt}")
+        cr = pool.shard_chat(args.prompt, sid=sid, max_new_tokens=args.max_new)
+        if cr.get("error"):
+            print("chat failed:", cr["error"])
+            return 1
+        print(cr.get("text", ""))
+        print(f"[{cr.get('n')} tokens · {cr.get('ms')}ms · workers {cr.get('workers')}]")
+    return 0
+
+
 def _chat_ids(tok, line: str) -> list[int]:
     if getattr(tok, "chat_template", None):
         return tok.apply_chat_template([{"role": "user", "content": line}], add_generation_prompt=True)
@@ -349,6 +423,21 @@ def main(argv=None) -> int:
     c.add_argument("--push", action="store_true", help="download-free: coordinator streams weights to the worker")
     c.add_argument("--fp16", action="store_true", help="load in fp16 on a GPU worker — halves VRAM (CPU downgrades to fp32)")
     c.set_defaults(fn=cmd_chat)
+
+    sh = sub.add_parser("shard", help="pipeline-shard a model across workers (optionally quantized), then optionally chat it")
+    sh.add_argument("model", help="HF model id (Llama/Qwen2-family for a WebGPU worker); or the shard id when --unload")
+    sh.add_argument("--quant", choices=["wq8", "wq4", "int8", "nf4", "auto"],
+                    help="wq8/wq4: the coordinator quantizes each stage to int8/int4 + scale and streams it (any "
+                         "WebGPU worker, download-free); int8/nf4/auto: bitsandbytes on a CUDA torch worker (non-push)")
+    sh.add_argument("--actq", choices=["int8"], help="int8 activation wire between MIDDLE stages (~4x smaller "
+                    "per-hop; lossy, kept fp32 into the last stage) — cuts the recurring per-token bandwidth")
+    sh.add_argument("--split", help="explicit per-stage layer counts for a heterogeneous fleet, e.g. 12,24")
+    sh.add_argument("--layers", type=int, help="override the model's layer count (if config can't be read)")
+    sh.add_argument("--prompt", help="after sharding, run this prompt through the pipeline (text in → text out)")
+    sh.add_argument("--max-new", dest="max_new", type=int, default=64)
+    sh.add_argument("--no-push", action="store_true", help="disable download-free streaming (the worker self-loads from HF)")
+    sh.add_argument("--unload", action="store_true", help="unload the sharded model (pass its id/model) instead of loading")
+    sh.set_defaults(fn=cmd_shard)
 
     args = p.parse_args(argv)
     return args.fn(args)

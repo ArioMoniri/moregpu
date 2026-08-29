@@ -359,6 +359,8 @@ interface TokenizerConfig {
   pretokenizerRegex?: string;
   /** ByteLevel add_prefix_space (GPT-2/Qwen2 default: false). */
   addPrefixSpace?: boolean;
+  /** Apply Unicode NFC normalization before pre-tokenization (Qwen2's tokenizer.json declares a NFC normalizer). */
+  nfc?: boolean;
   unkToken?: string;
 }
 
@@ -372,6 +374,7 @@ class BpeTokenizer {
   readonly bpeRanks: Map<string, number>;
   readonly addedTokens: AddedToken[];
   readonly addPrefixSpace: boolean;
+  readonly nfc: boolean;
   readonly unkToken?: string;
 
   private readonly byteToChar: string[];
@@ -413,6 +416,7 @@ class BpeTokenizer {
     this.pat = new RegExp(patternSrc, "gu");
 
     this.addPrefixSpace = cfg.addPrefixSpace ?? false;
+    this.nfc = cfg.nfc ?? false;
     this.unkToken = cfg.unkToken;
 
     // added / special tokens.
@@ -465,6 +469,7 @@ class BpeTokenizer {
       pretokenizerRegex: regex ?? undefined,
       pretokenizer: regex ? undefined : "gpt2",
       addPrefixSpace,
+      nfc: hasNFCNormalizer(obj.normalizer),
       unkToken: model.unk_token ?? undefined,
     });
   }
@@ -592,6 +597,7 @@ class BpeTokenizer {
   // ---- public API -------------------------------------------------------
 
   encode(text: string): number[] {
+    if (this.nfc) text = text.normalize("NFC");   // Qwen2 (and any NFC-normalizer tokenizer) canonicalizes first
     if (this.addPrefixSpace && text.length && !/^\s/.test(text)) {
       text = " " + text;
     }
@@ -668,6 +674,14 @@ function normalizeMerges(merges: any[]): Array<[string, string]> {
     }
   }
   return out;
+}
+
+// Detect whether a tokenizer.json `normalizer` node applies NFC (directly, or nested in a Sequence).
+function hasNFCNormalizer(node: any): boolean {
+  if (!node) return false;
+  if (node.type === "NFC") return true;
+  if (Array.isArray(node.normalizers)) return node.normalizers.some(hasNFCNormalizer);
+  return false;
 }
 
 // Read a tokenizer.json pre_tokenizer node -> { explicit regex?, add_prefix_space }.
@@ -1015,6 +1029,25 @@ async function seal(key: Uint8Array, plain: Uint8Array) { const iv = crypto.getR
 async function unseal(key: Uint8Array, blob: { iv: string; ct: string }) { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(blob.iv) as BufferSource }, await importKey(key), b64d(blob.ct) as BufferSource)); }
 const f32ToB64 = (a: Float32Array) => b64e(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
 const b64ToF32 = (s: string) => new Float32Array(b64d(s).buffer);
+// INT8 ACTIVATION WIRE (opt-in) — a stage's [seq,H] hidden crosses the wire as symmetric per-ROW (per-token)
+// int8 + one f32 scale/row instead of fp32 (~4x smaller). BYTE-IDENTICAL with worker_torch.py's actq_encode
+// (both stages of a boundary must agree): scale = fround(maxAbs/127) [f64 divide → f32], q = round-half-away-
+// from-zero of the f64 quotient, clamp [-127,127]. Lossy (per-hop, compounds) — used only where the plan enables it.
+function actqEncode(h: Float32Array, seq: number, H: number): { qB64: string; scaleB64: string } {
+  const q = new Int8Array(seq * H), scale = new Float32Array(seq);
+  for (let i = 0; i < seq; i++) {
+    const base = i * H; let maxAbs = 0;
+    for (let j = 0; j < H; j++) { const a = Math.abs(h[base + j]); if (a > maxAbs) maxAbs = a; }
+    const s = Math.fround(maxAbs / 127); scale[i] = s; const denom = s === 0 ? 1 : s;
+    for (let j = 0; j < H; j++) { const v = h[base + j] / denom; let qi = Math.floor(Math.abs(v) + 0.5); if (v < 0) qi = -qi; q[base + j] = qi > 127 ? 127 : qi < -127 ? -127 : qi; }
+  }
+  return { qB64: b64e(new Uint8Array(q.buffer)), scaleB64: b64e(new Uint8Array(scale.buffer)) };
+}
+function actqDecode(qB64: string, scaleB64: string, seq: number, H: number): Float32Array {
+  const q = new Int8Array(b64d(qB64).buffer), scale = new Float32Array(b64d(scaleB64).buffer), out = new Float32Array(seq * H);
+  for (let i = 0; i < seq; i++) { const s = scale[i], base = i * H; for (let j = 0; j < H; j++) out[base + j] = Math.fround(q[base + j] * s); }
+  return out;
+}
 
 // ---------- Ed25519 result signing (per-worker authenticity + tamper-evidence) ----------
 // The worker signs every result with a fresh keypair; the coordinator verifies against the public key
@@ -1107,7 +1140,15 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
 // The coordinator streams this stage's config.json + per-stage safetensors via push_begin/push_chunk (download-
 // free), then shard_load parses them into GPU-ready weights and shard_forward runs the stage's decoder blocks
 // (hidden→hidden). This is what makes a WebGPU device a real shard host (not just an offloaded-kernel donor).
-const SHARD_STAGE = new Map<string, { weights: Map<string, WEntry>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]>; tok: BpeTokenizer | null }>();
+const SHARD_STAGE = new Map<string, { weights: Map<string, WEntry>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]>; tok: BpeTokenizer | null; eos: number | null }>();
+// Resolve the model's EOS token id from the streamed generation_config.json (eos_token_id, int or list) or, as a
+// fallback, tokenizer_config.json's eos_token string mapped through the tokenizer's vocab — so a WebGPU first stage
+// can stop generation on EOS just like the torch worker (which uses tk.eos_token_id).
+function resolveEos(join: (n: string) => Uint8Array | null, tok: BpeTokenizer | null): number | null {
+  try { const g = join('generation_config.json'); if (g) { const e = (JSON.parse(new TextDecoder().decode(g)) as { eos_token_id?: number | number[] }).eos_token_id; if (Array.isArray(e) && e.length) return Number(e[0]); if (typeof e === 'number') return e; } } catch { /* */ }
+  try { const t = join('tokenizer_config.json'); if (t && tok) { const raw = (JSON.parse(new TextDecoder().decode(t)) as { eos_token?: string | { content?: string } }).eos_token; const content = typeof raw === 'string' ? raw : raw?.content; if (content) { const id = tok.vocab.get(content); if (typeof id === 'number') return id; } } } catch { /* */ }
+  return null;
+}
 const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
@@ -1135,7 +1176,8 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     // making a browser/Deno tab a self-contained first stage — no client-side tokenizer needed. Ids still work too.
     const tokBytes = first ? join('tokenizer.json') : null;
     const tok = tokBytes ? BpeTokenizer.fromTokenizerJson(JSON.parse(new TextDecoder().decode(tokBytes))) : null;
-    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok }); SHARD_PUSH.delete(id);
+    const eos = tok ? resolveEos(join, tok) : null;
+    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok, eos }); SHARD_PUSH.delete(id);
     let held = 0; for (const w of weights.values()) held += (w.data?.length ?? (w.q ? w.q.N * w.q.K : 0));
     return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
   }
@@ -1155,7 +1197,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
       else throw new Error('first stage: need input_ids, or prompt text + a staged tokenizer.json');
       seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H);
     }
-    else { seqNew = Number(p.seq); h = b64ToF32(String(p.hidden)); }
+    else { seqNew = Number(p.seq); h = (p.actq === 'int8' && p.hidden_q) ? actqDecode((p.hidden_q as { qB64: string }).qB64, (p.hidden_q as { scaleB64: string }).scaleB64, seqNew, H) : b64ToF32(String(p.hidden)); }
     // run this stage's decoder blocks (cached KV or uncached full-sequence)
     if (cached) {
       const key = String(p.session); let kv = st.kv.get(key); if (!kv || past === 0) { kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); }
@@ -1175,12 +1217,18 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
       if (cached) res.past = past + seqNew;
       return res;
     }
-    const res: Record<string, unknown> = { ok: true, hidden: f32ToB64(h), seq: seqNew, hidden_dim: H };
+    // hidden → next stage: opt-in int8 activation wire (p.actq_out set by the coordinator for non-last-input boundaries).
+    const res: Record<string, unknown> = { ok: true, seq: seqNew, hidden_dim: H };
+    if (p.actq_out === 'int8') { res.hidden_q = actqEncode(h, seqNew, H); res.actq = 'int8'; } else res.hidden = f32ToB64(h);
     if (cached) res.past = past + seqNew;
     return res;
   }
   if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') st.kv.delete(String(p.session)); else st.kv.clear(); } return { ok: true }; }
   if (op === 'shard_unload') { SHARD_STAGE.delete(id); SHARD_PUSH.delete(id); return { ok: true }; }
+  // TEXT ↔ ids on the FIRST stage's on-device tokenizer, so /model/shard_chat works when the first stage is a WebGPU
+  // worker (mirrors worker_torch's shard_tok/shard_detok). Needs a tokenizer.json to have been streamed to this stage.
+  if (op === 'shard_tok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard — the tokenizer.json streams to the first stage; a WebGPU first stage needs it'); return { ok: true, input_ids: st.tok.encode(String(p.prompt ?? '').slice(0, 8000)), eos: st.eos }; }
+  if (op === 'shard_detok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard'); return { ok: true, text: st.tok.decode((p.tokens as number[]) ?? [], { skipSpecialTokens: true }) }; }
   throw new Error(`webgpu worker: unsupported model op '${op}'`);
 }
 if (!TOKEN) console.log('[worker] warning: no join token set (--token / MOREGPU_TOKEN) — the server will reject me');
