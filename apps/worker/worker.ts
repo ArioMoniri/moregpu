@@ -806,13 +806,13 @@ const SHARD_WGSL = {
   rmsnorm: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read_write> y:array<f32>;struct U{H:u32,eps:f32};@group(0) @binding(3) var<uniform> u:U;
 @compute @workgroup_size(1) fn main(@builtin(workgroup_id) wid:vec3<u32>){let r=wid.x;var s=0.0;for(var i=0u;i<u.H;i=i+1u){let v=x[r*u.H+i];s=s+v*v;}let inv=inverseSqrt(s/f32(u.H)+u.eps);for(var i=0u;i<u.H;i=i+1u){y[r*u.H+i]=x[r*u.H+i]*inv*w[i];}}`,
   rope: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> cosb:array<f32>;@group(0) @binding(2) var<storage,read> sinb:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{SEQ:u32,NHEADS:u32,HD:u32};@group(0) @binding(4) var<uniform> u:U;
-@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let idx=g.x;let total=u.SEQ*u.NHEADS*u.HD;if(idx>=total){return;}let d=idx%u.HD;let rest=idx/u.HD;let h=rest%u.NHEADS;let s=rest/u.NHEADS;let half=u.HD/2u;let base=(s*u.NHEADS+h)*u.HD;let xv=x[base+d];var rot:f32;if(d<half){rot=-x[base+d+half];}else{rot=x[base+d-half];}y[idx]=xv*cosb[s*u.HD+d]+rot*sinb[s*u.HD+d];}`,
-  attn: `@group(0) @binding(0) var<storage,read> q:array<f32>;@group(0) @binding(1) var<storage,read> k:array<f32>;@group(0) @binding(2) var<storage,read> v:array<f32>;@group(0) @binding(3) var<storage,read_write> ctx:array<f32>;struct U{SEQ:u32,NH:u32,NKV:u32,HD:u32};@group(0) @binding(4) var<uniform> u:U;
-@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let h=g.y;if(i>=u.SEQ||h>=u.NH){return;}let kv=h/(u.NH/u.NKV);let scale=1.0/sqrt(f32(u.HD));let qbase=(i*u.NH+h)*u.HD;var sc:array<f32,512>;var mx=-3.0e38;for(var j=0u;j<=i;j=j+1u){let kb=(j*u.NKV+kv)*u.HD;var dot=0.0;for(var d=0u;d<u.HD;d=d+1u){dot=dot+q[qbase+d]*k[kb+d];}let s2=dot*scale;sc[j]=s2;if(s2>mx){mx=s2;}}var den=0.0;for(var j=0u;j<=i;j=j+1u){let e=exp(sc[j]-mx);sc[j]=e;den=den+e;}let ob=i*(u.NH*u.HD)+h*u.HD;for(var d=0u;d<u.HD;d=d+1u){var acc=0.0;for(var j=0u;j<=i;j=j+1u){let vb=(j*u.NKV+kv)*u.HD;acc=acc+sc[j]*v[vb+d];}ctx[ob+d]=acc/den;}}`,
-  swiglu: `@group(0) @binding(0) var<storage,read> gate:array<f32>;@group(0) @binding(1) var<storage,read> up:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i>=u.n){return;}let x=gate[i];out[i]=(x/(1.0+exp(-x)))*up[i];}`,
-  add: `@group(0) @binding(0) var<storage,read> a:array<f32>;@group(0) @binding(1) var<storage,read> b:array<f32>;@group(0) @binding(2) var<storage,read_write> o:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i>=u.n){return;}o[i]=a[i]+b[i];}`,
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>,@builtin(num_workgroups) nwg:vec3<u32>){let idx=g.y*nwg.x*64u+g.x;let total=u.SEQ*u.NHEADS*u.HD;if(idx>=total){return;}let d=idx%u.HD;let rest=idx/u.HD;let h=rest%u.NHEADS;let s=rest/u.NHEADS;let half=u.HD/2u;let base=(s*u.NHEADS+h)*u.HD;let xv=x[base+d];var rot:f32;if(d<half){rot=-x[base+d+half];}else{rot=x[base+d-half];}y[idx]=xv*cosb[s*u.HD+d]+rot*sinb[s*u.HD+d];}`,
+  // (The former fixed-`array<f32,512>` `attn` kernel is gone — the uncached path now uses `cachedAttn` with past=0,
+  //  the same online-softmax kernel, which has no sequence cap. That removes the silent >512-token corruption.)
+  swiglu: `@group(0) @binding(0) var<storage,read> gate:array<f32>;@group(0) @binding(1) var<storage,read> up:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>,@builtin(num_workgroups) nwg:vec3<u32>){let i=g.y*nwg.x*64u+g.x;if(i>=u.n){return;}let x=gate[i];out[i]=(x/(1.0+exp(-x)))*up[i];}`,
+  add: `@group(0) @binding(0) var<storage,read> a:array<f32>;@group(0) @binding(1) var<storage,read> b:array<f32>;@group(0) @binding(2) var<storage,read_write> o:array<f32>;struct U{n:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>,@builtin(num_workgroups) nwg:vec3<u32>){let i=g.y*nwg.x*64u+g.x;if(i>=u.n){return;}o[i]=a[i]+b[i];}`,
   // FIRST-stage embedding gather: out[s,:] = embed_tokens.weight[ids[s],:]. ids uploaded as u32 bit-patterns via a Float32Array view.
-  embed: `@group(0) @binding(0) var<storage,read> ids:array<u32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{seq:u32,H:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let total=u.seq*u.H;if(i>=total){return;}let s=i/u.H;let d=i%u.H;out[i]=w[ids[s]*u.H+d];}`,
+  embed: `@group(0) @binding(0) var<storage,read> ids:array<u32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read_write> out:array<f32>;struct U{seq:u32,H:u32};@group(0) @binding(3) var<uniform> u:U;@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>,@builtin(num_workgroups) nwg:vec3<u32>){let i=g.y*nwg.x*64u+g.x;let total=u.seq*u.H;if(i>=total){return;}let s=i/u.H;let d=i%u.H;out[i]=w[ids[s]*u.H+d];}`,
   // ONLINE-softmax cached attention: streams the whole KV cache (running max/denom/context), so ANY length — no
   // fixed scores array (removes the seq<=512 cap) — and supports KV-cached decode (q for the new tokens attends
   // over the full cache). causal: token i (abs pos past+i) attends 0..(past+i). GQA kv=h/(NH/NKV). dispatch [seqNew,NH,1].
@@ -850,6 +850,10 @@ class ShardRuntime {
     return out;
   }
   private u32(...v: number[]) { return new Uint32Array(v); }
+  // Dispatch for a 1-D @workgroup_size(64) kernel over `total` elements, folded into 2-D so it never exceeds
+  // maxComputeWorkgroupsPerDimension (65535). The kernels reconstruct the flat index as g.y*nwg.x*64 + g.x. A
+  // large prefill (e.g. 3B swiglu at seq≈400 → 66k workgroups) used to overflow one dimension and fail the stage.
+  private d1(total: number): [number, number, number] { const wg = Math.ceil(total / 64), MAX = 65535; return wg <= MAX ? [wg, 1, 1] : [MAX, Math.ceil(wg / MAX), 1]; }
   private linear(x: Float32Array, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number) {
     const args = [x, w, bias ?? new Float32Array(1)], uni = this.u32(R, N, Kk, bias ? 1 : 0);
     // vec4 loads are BIT-IDENTICAL to the naive kernel and ~1.6-2.3x faster (memory-bandwidth-bound GEMM; wider
@@ -866,7 +870,7 @@ class ShardRuntime {
   // Route one linear to fp32 or the int8/int4 kernel based on how the weight was loaded (see WEntry/assembleQuant).
   private matmul(x: Float32Array, e: WEntry, bias: Float32Array | null, R: number, N: number, K: number) { return e.q ? (e.q.kind === 'i8' ? this.linearQ8(x, e.q, bias, R) : this.linearQ4(x, e.q, bias, R)) : this.linear(x, e.data!, bias, R, N, K); }
   private rmsnorm(x: Float32Array, w: Float32Array, R: number, H: number, eps: number) { const b = new ArrayBuffer(8); new Uint32Array(b, 0, 1)[0] = H; new Float32Array(b, 4, 1)[0] = eps; return this.run(SHARD_WGSL.rmsnorm, [x, w], new Uint8Array(b), R * H, [R, 1, 1]); }
-  private rope(t: Float32Array, cos: Float32Array, sin: Float32Array, SEQ: number, nh: number, HD: number) { return this.run(SHARD_WGSL.rope, [t, cos, sin], this.u32(SEQ, nh, HD), SEQ * nh * HD, [Math.ceil(SEQ * nh * HD / 64), 1, 1]); }
+  private rope(t: Float32Array, cos: Float32Array, sin: Float32Array, SEQ: number, nh: number, HD: number) { return this.run(SHARD_WGSL.rope, [t, cos, sin], this.u32(SEQ, nh, HD), SEQ * nh * HD, this.d1(SEQ * nh * HD)); }
   private async layer(h: Float32Array, g: (n: string, opt?: boolean) => WEntry | null, cos: Float32Array, sin: Float32Array, SEQ: number, c: ShardCfg): Promise<Float32Array> {
     const { H, NH, NKV, HD, INT, eps } = c;
     const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
@@ -877,15 +881,15 @@ class ShardRuntime {
     const k = await this.matmul(ln1, req('self_attn.k_proj.weight'), bias('self_attn.k_proj.bias'), SEQ, NKV * HD, H);
     const v = await this.matmul(ln1, req('self_attn.v_proj.weight'), bias('self_attn.v_proj.bias'), SEQ, NKV * HD, H);
     const qR = await this.rope(q, cos, sin, SEQ, NH, HD), kR = await this.rope(k, cos, sin, SEQ, NKV, HD);
-    const ctx = await this.run(SHARD_WGSL.attn, [qR, kR, v], this.u32(SEQ, NH, NKV, HD), SEQ * NH * HD, [SEQ, NH, 1]);
+    const ctx = await this.run(SHARD_WGSL.cachedAttn, [qR, kR, v], this.u32(SEQ, NH, NKV, HD, 0), SEQ * NH * HD, [SEQ, NH, 1]); // online-softmax, past=0 → full causal attention, NO seq cap
     const attnOut = await this.matmul(ctx, req('self_attn.o_proj.weight'), null, SEQ, H, NH * HD);
-    const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(SEQ * H), SEQ * H, [Math.ceil(SEQ * H / 64), 1, 1]);
+    const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(SEQ * H), SEQ * H, this.d1(SEQ * H));
     const ln2 = await this.rmsnorm(hMid, nf('post_attention_layernorm.weight'), SEQ, H, eps);
     const gate = await this.matmul(ln2, req('mlp.gate_proj.weight'), null, SEQ, INT, H);
     const up = await this.matmul(ln2, req('mlp.up_proj.weight'), null, SEQ, INT, H);
-    const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(SEQ * INT), SEQ * INT, [Math.ceil(SEQ * INT / 64), 1, 1]);
+    const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(SEQ * INT), SEQ * INT, this.d1(SEQ * INT));
     const mlpOut = await this.matmul(act, req('mlp.down_proj.weight'), null, SEQ, H, INT);
-    return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(SEQ * H), SEQ * H, [Math.ceil(SEQ * H / 64), 1, 1]);
+    return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(SEQ * H), SEQ * H, this.d1(SEQ * H));
   }
   async stage(hidden: Float32Array, positions: number[], weights: Map<string, WEntry>, start: number, end: number, c: ShardCfg): Promise<Float32Array> {
     const SEQ = positions.length; const { cos, sin } = computeCosSin(positions, c.HD, c.theta); let h = hidden;
@@ -895,7 +899,7 @@ class ShardRuntime {
   // FIRST stage: token ids → embeddings (gather rows of embed_tokens.weight). ids uploaded as u32 bit-patterns.
   embed(ids: number[], embW: Float32Array, H: number): Promise<Float32Array> {
     const idsF32 = new Float32Array(new Uint32Array(ids).buffer);
-    return this.run(SHARD_WGSL.embed, [idsF32, embW], this.u32(ids.length, H), ids.length * H, [Math.ceil(ids.length * H / 64), 1, 1]);
+    return this.run(SHARD_WGSL.embed, [idsF32, embW], this.u32(ids.length, H), ids.length * H, this.d1(ids.length * H));
   }
   // LAST stage: final RMSNorm → lm_head → logits[seq,vocab]. headW is embed_tokens.weight when tied.
   async lmHead(hidden: Float32Array, normW: Float32Array, headW: Float32Array, seq: number, H: number, vocab: number, eps: number): Promise<Float32Array> {
@@ -922,13 +926,13 @@ class ShardRuntime {
     kvc.K = Kfull; kvc.V = Vfull; kvc.len = past + seqNew;
     const ctx = await this.run(SHARD_WGSL.cachedAttn, [qR, Kfull, Vfull], this.u32(seqNew, NH, NKV, HD, past), seqNew * NH * HD, [seqNew, NH, 1]);
     const attnOut = await this.matmul(ctx, req('self_attn.o_proj.weight'), null, seqNew, H, NH * HD);
-    const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(seqNew * H), seqNew * H, [Math.ceil(seqNew * H / 64), 1, 1]);
+    const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(seqNew * H), seqNew * H, this.d1(seqNew * H));
     const ln2 = await this.rmsnorm(hMid, nf('post_attention_layernorm.weight'), seqNew, H, eps);
     const gate = await this.matmul(ln2, req('mlp.gate_proj.weight'), null, seqNew, INT, H);
     const up = await this.matmul(ln2, req('mlp.up_proj.weight'), null, seqNew, INT, H);
-    const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(seqNew * INT), seqNew * INT, [Math.ceil(seqNew * INT / 64), 1, 1]);
+    const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(seqNew * INT), seqNew * INT, this.d1(seqNew * INT));
     const mlpOut = await this.matmul(act, req('mlp.down_proj.weight'), null, seqNew, H, INT);
-    return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(seqNew * H), seqNew * H, [Math.ceil(seqNew * H / 64), 1, 1]);
+    return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(seqNew * H), seqNew * H, this.d1(seqNew * H));
   }
   // Cached stage — same call serves PREFILL (past=0, seqNew=SEQ) and DECODE (past=M, seqNew=1). Mutates `cache`.
   async cachedStage(hidden: Float32Array, past: number, weights: Map<string, WEntry>, start: number, end: number, cache: LayerKV[], c: ShardCfg): Promise<Float32Array> {
@@ -1221,8 +1225,13 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     else { seqNew = Number(p.seq); h = (p.actq === 'int8' && p.hidden_q) ? actqDecode((p.hidden_q as { qB64: string }).qB64, (p.hidden_q as { scaleB64: string }).scaleB64, seqNew, H) : b64ToF32(String(p.hidden)); }
     // run this stage's decoder blocks (cached KV or uncached full-sequence)
     if (cached) {
-      const key = String(p.session); let kv = st.kv.get(key); if (!kv || past === 0) { kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); }
-      h = await rt.cachedStage(h, past, st.weights, st.start, st.end, kv, st.cfg);
+      const key = String(p.session); let kv = st.kv.get(key);
+      // A pos-0 call (re)prefills → fresh cache. A pos>0 decode MUST match the cache's current length, else the
+      // caller (a reconnect, a lost/evicted session, a coordinator bug) would attend over a zero-filled phantom
+      // prefix and silently return wrong tokens — reject it so the coordinator resets + re-prefills instead.
+      if (past === 0) { kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); }
+      else if (!kv || (kv[0] && kv[0].len !== past)) throw new Error(`KV desync for session ${key}: ${kv?.[0]?.len ?? 'no'} tokens cached but pos=${past} — reset the session and re-prefill`);
+      h = await rt.cachedStage(h, past, st.weights, st.start, st.end, kv!, st.cfg);
     } else {
       const positions = Array.from({ length: seqNew }, (_, i) => i);
       h = await rt.stage(h, positions, st.weights, st.start, st.end, st.cfg);
