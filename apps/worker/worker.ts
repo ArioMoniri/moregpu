@@ -792,6 +792,17 @@ function computeCosSin(positions: number[], HD: number, theta: number): { cos: F
 const SHARD_WGSL = {
   linear: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read> bias:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,hasBias:u32};@group(0) @binding(4) var<uniform> u:U;
 @compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let n=g.x;if(r>=u.R||n>=u.N){return;}var a=0.0;for(var k=0u;k<u.K;k=k+1u){a=a+x[r*u.K+k]*w[n*u.K+k];}if(u.hasBias==1u){a=a+bias[n];}y[r*u.N+n]=a;}`,
+  // VEC4 GEMM — reads x/w as vec4<f32> (128-bit loads), BIT-IDENTICAL to `linear` (explicit .x/.y/.z/.w adds keep
+  // the exact scalar accumulation order). This GEMM is memory-bandwidth-bound and Apple's unified cache already
+  // captures the reuse shared-memory TILING exists for (tiling measured SLOWER on Metal); wider loads are the win —
+  // ~1.6x (decode) to ~2.3x (prefill vec4x4), zero accuracy change. Needs K%4==0 (every Qwen/Llama linear); the
+  // caller falls back to `linear` otherwise. Same bindings/uniform as `linear`, so the SAME f32 buffers upload.
+  linearVec4: `@group(0) @binding(0) var<storage,read> x:array<vec4<f32>>;@group(0) @binding(1) var<storage,read> w:array<vec4<f32>>;@group(0) @binding(2) var<storage,read> bias:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,hasBias:u32};@group(0) @binding(4) var<uniform> u:U;
+@compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let n=g.x;if(r>=u.R||n>=u.N){return;}let kv=u.K/4u;let xb=r*kv;let wb=n*kv;var a=0.0;for(var q=0u;q<kv;q=q+1u){let xv=x[xb+q];let wv=w[wb+q];a=a+xv.x*wv.x;a=a+xv.y*wv.y;a=a+xv.z*wv.z;a=a+xv.w*wv.w;}if(u.hasBias==1u){a=a+bias[n];}y[r*u.N+n]=a;}`,
+  // VEC4X4 — vec4 loads + 4 output cols/thread (each x-vec4 reused across 4 weight rows). Fastest for PREFILL (R>1);
+  // dispatch X uses a /64 divisor (16 threads × 4 cols). Bit-identical; needs K%4==0.
+  linearVec4x4: `@group(0) @binding(0) var<storage,read> x:array<vec4<f32>>;@group(0) @binding(1) var<storage,read> w:array<vec4<f32>>;@group(0) @binding(2) var<storage,read> bias:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,hasBias:u32};@group(0) @binding(4) var<uniform> u:U;
+@compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;if(r>=u.R){return;}let nb=g.x*4u;let kv=u.K/4u;let xb=r*kv;let n0=nb;let n1=nb+1u;let n2=nb+2u;let n3=nb+3u;var a0=0.0;var a1=0.0;var a2=0.0;var a3=0.0;for(var q=0u;q<kv;q=q+1u){let xv=x[xb+q];if(n0<u.N){let wv=w[n0*kv+q];a0=a0+xv.x*wv.x;a0=a0+xv.y*wv.y;a0=a0+xv.z*wv.z;a0=a0+xv.w*wv.w;}if(n1<u.N){let wv=w[n1*kv+q];a1=a1+xv.x*wv.x;a1=a1+xv.y*wv.y;a1=a1+xv.z*wv.z;a1=a1+xv.w*wv.w;}if(n2<u.N){let wv=w[n2*kv+q];a2=a2+xv.x*wv.x;a2=a2+xv.y*wv.y;a2=a2+xv.z*wv.z;a2=a2+xv.w*wv.w;}if(n3<u.N){let wv=w[n3*kv+q];a3=a3+xv.x*wv.x;a3=a3+xv.y*wv.y;a3=a3+xv.z*wv.z;a3=a3+xv.w*wv.w;}}if(n0<u.N){var v=a0;if(u.hasBias==1u){v=v+bias[n0];}y[r*u.N+n0]=v;}if(n1<u.N){var v=a1;if(u.hasBias==1u){v=v+bias[n1];}y[r*u.N+n1]=v;}if(n2<u.N){var v=a2;if(u.hasBias==1u){v=v+bias[n2];}y[r*u.N+n2]=v;}if(n3<u.N){var v=a3;if(u.hasBias==1u){v=v+bias[n3];}y[r*u.N+n3]=v;}}`,
   rmsnorm: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> w:array<f32>;@group(0) @binding(2) var<storage,read_write> y:array<f32>;struct U{H:u32,eps:f32};@group(0) @binding(3) var<uniform> u:U;
 @compute @workgroup_size(1) fn main(@builtin(workgroup_id) wid:vec3<u32>){let r=wid.x;var s=0.0;for(var i=0u;i<u.H;i=i+1u){let v=x[r*u.H+i];s=s+v*v;}let inv=inverseSqrt(s/f32(u.H)+u.eps);for(var i=0u;i<u.H;i=i+1u){y[r*u.H+i]=x[r*u.H+i]*inv*w[i];}}`,
   rope: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> cosb:array<f32>;@group(0) @binding(2) var<storage,read> sinb:array<f32>;@group(0) @binding(3) var<storage,read_write> y:array<f32>;struct U{SEQ:u32,NHEADS:u32,HD:u32};@group(0) @binding(4) var<uniform> u:U;
@@ -839,7 +850,17 @@ class ShardRuntime {
     return out;
   }
   private u32(...v: number[]) { return new Uint32Array(v); }
-  private linear(x: Float32Array, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number) { return this.run(SHARD_WGSL.linear, [x, w, bias ?? new Float32Array(1)], this.u32(R, N, Kk, bias ? 1 : 0), R * N, [Math.ceil(N / 16), Math.ceil(R / 16), 1]); }
+  private linear(x: Float32Array, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number) {
+    const args = [x, w, bias ?? new Float32Array(1)], uni = this.u32(R, N, Kk, bias ? 1 : 0);
+    // vec4 loads are BIT-IDENTICAL to the naive kernel and ~1.6-2.3x faster (memory-bandwidth-bound GEMM; wider
+    // loads beat shared-memory tiling on Apple's unified cache). Needs K%4==0 (every Qwen/Llama linear); vec4x4
+    // (4 output cols/thread) wins for prefill (R>1), plain vec4 for a 1-row decode. Else fall back to the naive kernel.
+    if (Kk % 4 === 0) {
+      if (R > 1) return this.run(SHARD_WGSL.linearVec4x4, args, uni, R * N, [Math.ceil(N / 64), Math.ceil(R / 16), 1]);
+      return this.run(SHARD_WGSL.linearVec4, args, uni, R * N, [Math.ceil(N / 16), Math.ceil(R / 16), 1]);
+    }
+    return this.run(SHARD_WGSL.linear, args, uni, R * N, [Math.ceil(N / 16), Math.ceil(R / 16), 1]);
+  }
   private linearQ8(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ8, [x, q.wq, q.scale, bias ?? new Float32Array(1)], this.u32(R, q.N, q.K, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
   private linearQ4(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ4, [x, q.wq, q.scale, bias ?? new Float32Array(1)], this.u32(R, q.N, q.K, q.group, q.ng, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
   // Route one linear to fp32 or the int8/int4 kernel based on how the weight was loaded (see WEntry/assembleQuant).
