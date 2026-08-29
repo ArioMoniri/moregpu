@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']   # a release tag runs CI with the signature-freshness gate in STRICT mode
   pull_request:
     branches: [main]
 
@@ -92,7 +93,9 @@ jobs:
       - name: Seal negatives — tampered ciphertext / bad-or-replayed signature rejected
         run: python3 tests/security/seal_negatives.py
 
-      - name: Release verify — tampered / wrong-key / unsigned worker release rejected (install-time gate)
+      - name: Release verify — supply-chain gate (always); worker.ts signature-freshness (hard only on a release tag)
+        env:
+          MOREGPU_RELEASE_STRICT: ${{ github.ref_type == 'tag' && '1' || '0' }}
         run: python3 tests/security/release_verify.py
 
       - name: TLS default — self-signed wss + worker cert pinning; wrong pin refused; ws:// opt-out intact
