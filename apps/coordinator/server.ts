@@ -1619,7 +1619,10 @@ function deviceDescriptor() {
     queue: { depth: g.queueDepth, running: g.busy },
     throughput: { totalOps: g.totalOps, totalUnits: g.totalUnits, totalShards: g.totalShards, tokensServed: g.totalTokens, trend: g.poolTrend },
     seal: 'AES-256-GCM',
-    capabilities: { dataMode: true, verifiedResults: true, signedResults: true, adaptiveThrottle: true, asyncSubmit: true, sealedWire: true, tokenIsolated: true },
+    // verifiedResults is HONEST about its scope: only small matmuls (M*N ≤ 640*640) are RECOMPUTED and checked;
+    // larger results and every LLM token are authenticated by a mandatory Ed25519 signature (who sent them) but NOT
+    // recomputed (whether they are numerically correct). Redundant N-of-M recompute for large work is not built yet.
+    capabilities: { dataMode: true, verifiedResults: 'small-matmul-recompute', signedResults: true, adaptiveThrottle: true, asyncSubmit: true, sealedWire: true, tokenIsolated: true },
   };
 }
 
