@@ -45,7 +45,9 @@ try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     _HAVE_CRYPTO = True
-except Exception:                                # a fake node with a bad key just registers UNSIGNED (server.ts:205)
+except Exception:                                # no cryptography → send a random 32-byte pubkey (a valid-length Ed25519
+                                                 # key the coordinator accepts at register; these load-test nodes never
+                                                 # return results, so the mandatory result-signature check never applies)
     _HAVE_CRYPTO = False
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
