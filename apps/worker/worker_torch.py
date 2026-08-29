@@ -754,7 +754,10 @@ def shard_load(cfg: dict) -> dict:
         # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        try:
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        except Exception:
+            _push_cleanup(sid); raise  # a failed push load (OOM / truncated safetensors on a small box) must not leak the staging dir
     else:
         # (non-push) materializes the FULL model on-device then slices — simple, but the worker downloads it.
         _qm = _quant_mode(cfg)
@@ -1057,7 +1060,10 @@ def moe_backbone_load(cfg: dict) -> dict:
         # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        try:
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        except Exception:
+            _push_cleanup(sid); raise  # a failed push load (OOM / truncated safetensors on a small box) must not leak the staging dir
     else:
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
@@ -1106,7 +1112,10 @@ def expert_load(cfg: dict) -> dict:
         # ignore_mismatched_sizes: a push checkpoint is INTENTIONALLY partial (only this stage's layers / this
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
-        model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        try:
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+        except Exception:
+            _push_cleanup(sid); raise  # a failed push load (OOM / truncated safetensors on a small box) must not leak the staging dir
     else:
         model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):

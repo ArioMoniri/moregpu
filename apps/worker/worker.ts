@@ -1175,6 +1175,15 @@ function resolveEos(join: (n: string) => Uint8Array | null, tok: BpeTokenizer | 
   return null;
 }
 const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
+const SHARD_PUSH_BYTES = new Map<string, number>(); // id → staged bytes, for the cap below
+// Resource bounds so a buggy/hostile coordinator can't OOM the worker: cap concurrent live decode sessions (LRU-evict
+// the idle ones), the number of concurrent push-staging ids (evict an abandoned push whose shard_load never arrived),
+// and the total staged bytes across all pushes. All overridable via env.
+const _envn = (k: string, d: number) => { const v = _D?.env.get(k); const n = v ? Number(v) : NaN; return Number.isFinite(n) && n > 0 ? n : d; };
+const MAX_KV_SESSIONS = _envn('MOREGPU_MAX_KV_SESSIONS', 8);
+const MAX_STAGING = _envn('MOREGPU_MAX_STAGING', 4);
+const MAX_STAGING_BYTES = _envn('MOREGPU_MAX_STAGING_BYTES', 8 * 2 ** 30); // 8 GiB across all live pushes
+const dropPush = (id: string) => { SHARD_PUSH.delete(id); SHARD_PUSH_BYTES.delete(id); };
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
   const H = c.hidden_size, NH = c.num_attention_heads, NKV = c.num_key_value_heads ?? NH;
@@ -1183,8 +1192,8 @@ function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
 async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Record<string, unknown>> {
   const id = String(p.id ?? p.model ?? '');
   if (op === 'ping') return { ok: true, pong: true, n: String((p.blob as string) ?? '').length }; // RTT/throughput probe
-  if (op === 'push_begin') { SHARD_PUSH.set(id, new Map()); return { ok: true, id, staging: 'ram', resumed: false, sizes: {} }; }
-  if (op === 'push_chunk') { const files = SHARD_PUSH.get(id) ?? new Map<string, Uint8Array[]>(); SHARD_PUSH.set(id, files); const name = String(p.name); const arr = files.get(name) ?? []; arr.push(b64d(String(p.data))); files.set(name, arr); return { ok: true }; }
+  if (op === 'push_begin') { while (SHARD_PUSH.size >= MAX_STAGING && !SHARD_PUSH.has(id)) { const oldest = SHARD_PUSH.keys().next().value; if (oldest === undefined) break; dropPush(oldest); } SHARD_PUSH.set(id, new Map()); SHARD_PUSH_BYTES.set(id, 0); return { ok: true, id, staging: 'ram', resumed: false, sizes: {} }; }
+  if (op === 'push_chunk') { const files = SHARD_PUSH.get(id) ?? new Map<string, Uint8Array[]>(); SHARD_PUSH.set(id, files); const chunk = b64d(String(p.data)); let total = chunk.length; for (const b of SHARD_PUSH_BYTES.values()) total += b; if (total > MAX_STAGING_BYTES) throw new Error(`push staging exceeded ${MAX_STAGING_BYTES} bytes across pushes — raise MOREGPU_MAX_STAGING_BYTES`); SHARD_PUSH_BYTES.set(id, (SHARD_PUSH_BYTES.get(id) ?? 0) + chunk.length); const name = String(p.name); const arr = files.get(name) ?? []; arr.push(chunk); files.set(name, arr); return { ok: true }; }
   if (op === 'push_end') return { ok: true };
   if (op === 'shard_load') {
     if (!backend.shard) throw new Error('this worker has no GPU shard runtime (CPU-only backend)');
@@ -1202,7 +1211,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     const tokBytes = first ? join('tokenizer.json') : null;
     const tok = tokBytes ? BpeTokenizer.fromTokenizerJson(JSON.parse(new TextDecoder().decode(tokBytes))) : null;
     const eos = tok ? resolveEos(join, tok) : null;
-    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok, eos }); SHARD_PUSH.delete(id);
+    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok, eos }); dropPush(id);
     let held = 0; for (const w of weights.values()) held += (w.data?.length ?? (w.q ? w.q.N * w.q.K : 0));
     return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
   }
@@ -1229,8 +1238,9 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
       // A pos-0 call (re)prefills → fresh cache. A pos>0 decode MUST match the cache's current length, else the
       // caller (a reconnect, a lost/evicted session, a coordinator bug) would attend over a zero-filled phantom
       // prefix and silently return wrong tokens — reject it so the coordinator resets + re-prefills instead.
-      if (past === 0) { kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); }
+      if (past === 0) { while (st.kv.size >= MAX_KV_SESSIONS && !st.kv.has(key)) { const old = st.kv.keys().next().value; if (old === undefined) break; st.kv.delete(old); } kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); } // LRU-evict the oldest idle session
       else if (!kv || (kv[0] && kv[0].len !== past)) throw new Error(`KV desync for session ${key}: ${kv?.[0]?.len ?? 'no'} tokens cached but pos=${past} — reset the session and re-prefill`);
+      else { st.kv.delete(key); st.kv.set(key, kv); } // LRU touch: this session is now most-recently-used
       h = await rt.cachedStage(h, past, st.weights, st.start, st.end, kv!, st.cfg);
     } else {
       const positions = Array.from({ length: seqNew }, (_, i) => i);
@@ -1239,8 +1249,12 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     // stage OUTPUT: last → logits + argmax; else → hidden for the next stage
     if (st.last) {
       const normW = w('model.norm.weight')!, headW = w('lm_head.weight') ?? w('model.embed_tokens.weight')!;
-      const logits = await rt.lmHead(h, normW, headW, seqNew, H, st.vocab, eps);
-      const lastRow = logits.subarray((seqNew - 1) * st.vocab, seqNew * st.vocab);
+      // Only the LAST token's logits drive argmax / return_logits, so run the LM head on just that row — saves
+      // O(seq·vocab) compute and a seq·vocab·4 output buffer (hundreds of MB for a long prefill on a 150k-vocab model,
+      // which could also trip maxStorageBufferBindingSize/maxBufferSize).
+      const hLast = seqNew > 1 ? h.subarray((seqNew - 1) * H, seqNew * H) : h;
+      const logits = await rt.lmHead(hLast, normW, headW, 1, H, st.vocab, eps);
+      const lastRow = logits.subarray(0, st.vocab);
       let argmax = 0, mx = -Infinity; for (let i = 0; i < st.vocab; i++) if (lastRow[i] > mx) { mx = lastRow[i]; argmax = i; }
       const res: Record<string, unknown> = { ok: true, argmax };
       if (p.return_logits) res.logits = f32ToB64(lastRow.slice(0));
@@ -1254,7 +1268,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     return res;
   }
   if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') st.kv.delete(String(p.session)); else st.kv.clear(); } return { ok: true }; }
-  if (op === 'shard_unload') { SHARD_STAGE.delete(id); SHARD_PUSH.delete(id); return { ok: true }; }
+  if (op === 'shard_unload') { SHARD_STAGE.delete(id); dropPush(id); return { ok: true }; }
   // TEXT ↔ ids on the FIRST stage's on-device tokenizer, so /model/shard_chat works when the first stage is a WebGPU
   // worker (mirrors worker_torch's shard_tok/shard_detok). Needs a tokenizer.json to have been streamed to this stage.
   if (op === 'shard_tok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard — the tokenizer.json streams to the first stage; a WebGPU first stage needs it'); return { ok: true, input_ids: st.tok.encode(String(p.prompt ?? '').slice(0, 8000)), eos: st.eos }; }
