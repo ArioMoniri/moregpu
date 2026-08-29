@@ -831,9 +831,23 @@ class ShardRuntime {
   private cache = new Map<string, GPUComputePipeline>();
   constructor(private dev: GPUDevice) {}
   private pipe(code: string): GPUComputePipeline { let p = this.cache.get(code); if (!p) { p = this.dev.createComputePipeline({ layout: 'auto', compute: { module: this.dev.createShaderModule({ code }), entryPoint: 'main' } }); this.cache.set(code, p); } return p; }
-  private async run(code: string, storage: ArrayBufferView[], uniform: ArrayBufferView, outLen: number, dispatch: [number, number, number]): Promise<Float32Array> {
+  // RESIDENT WEIGHTS: a weight tensor is uploaded to VRAM ONCE and reused across every forward, keyed by the weight
+  // array's identity — instead of being re-uploaded host→GPU on every matmul (the old behavior, which re-streamed a
+  // stage's whole weight set per decode token, so a "resident" shard was not actually resident). Freed on shard_unload.
+  private wcache = new Map<ArrayBufferView, GPUBuffer>();
+  private resident(arr: ArrayBufferView): GPUBuffer {
+    let b = this.wcache.get(arr);
+    if (!b) { b = this.dev.createBuffer({ size: Math.max(4, (arr.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); this.dev.queue.writeBuffer(b, 0, arr as BufferSource); this.wcache.set(arr, b); }
+    return b;
+  }
+  releaseWeights(weights: Map<string, WEntry>): void {
+    const free = (a?: ArrayBufferView) => { if (a) { const b = this.wcache.get(a); if (b) { b.destroy(); this.wcache.delete(a); } } };
+    for (const e of weights.values()) { free(e.data); if (e.q) { free(e.q.wq); free(e.q.scale); } }
+  }
+  private async run(code: string, storage: (ArrayBufferView | GPUBuffer)[], uniform: ArrayBufferView, outLen: number, dispatch: [number, number, number]): Promise<Float32Array> {
     const dev = this.dev;
-    const inBufs = storage.map((arr) => { const b = dev.createBuffer({ size: Math.max(4, (arr.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
+    const transient: GPUBuffer[] = []; // per-call input buffers (activations/uniforms) — resident weights are NOT in here
+    const inBufs = storage.map((arr) => { if (arr instanceof GPUBuffer) return arr; const b = dev.createBuffer({ size: Math.max(4, (arr.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(b, 0, arr as BufferSource); transient.push(b); return b; });
     const outBytes = Math.max(4, outLen * 4);
     const outBuf = dev.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const readBuf = dev.createBuffer({ size: outBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -846,7 +860,7 @@ class ShardRuntime {
     enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, outBytes); dev.queue.submit([enc.finish()]);
     await readBuf.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(readBuf.getMappedRange().slice(0, outLen * 4)); readBuf.unmap();
-    [...inBufs, outBuf, readBuf, uBuf].forEach((b) => b.destroy());
+    [...transient, outBuf, readBuf, uBuf].forEach((b) => b.destroy()); // destroy ONLY per-call buffers; resident weights persist
     return out;
   }
   private u32(...v: number[]) { return new Uint32Array(v); }
@@ -855,7 +869,7 @@ class ShardRuntime {
   // large prefill (e.g. 3B swiglu at seq≈400 → 66k workgroups) used to overflow one dimension and fail the stage.
   private d1(total: number): [number, number, number] { const wg = Math.ceil(total / 64), MAX = 65535; return wg <= MAX ? [wg, 1, 1] : [MAX, Math.ceil(wg / MAX), 1]; }
   private linear(x: Float32Array, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number) {
-    const args = [x, w, bias ?? new Float32Array(1)], uni = this.u32(R, N, Kk, bias ? 1 : 0);
+    const args = [x, this.resident(w), bias ? this.resident(bias) : new Float32Array(1)], uni = this.u32(R, N, Kk, bias ? 1 : 0);
     // vec4 loads are BIT-IDENTICAL to the naive kernel and ~1.6-2.3x faster (memory-bandwidth-bound GEMM; wider
     // loads beat shared-memory tiling on Apple's unified cache). Needs K%4==0 (every Qwen/Llama linear); vec4x4
     // (4 output cols/thread) wins for prefill (R>1), plain vec4 for a 1-row decode. Else fall back to the naive kernel.
@@ -865,11 +879,11 @@ class ShardRuntime {
     }
     return this.run(SHARD_WGSL.linear, args, uni, R * N, [Math.ceil(N / 16), Math.ceil(R / 16), 1]);
   }
-  private linearQ8(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ8, [x, q.wq, q.scale, bias ?? new Float32Array(1)], this.u32(R, q.N, q.K, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
-  private linearQ4(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ4, [x, q.wq, q.scale, bias ?? new Float32Array(1)], this.u32(R, q.N, q.K, q.group, q.ng, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
+  private linearQ8(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ8, [x, this.resident(q.wq), this.resident(q.scale), bias ? this.resident(bias) : new Float32Array(1)], this.u32(R, q.N, q.K, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
+  private linearQ4(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ4, [x, this.resident(q.wq), this.resident(q.scale), bias ? this.resident(bias) : new Float32Array(1)], this.u32(R, q.N, q.K, q.group, q.ng, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
   // Route one linear to fp32 or the int8/int4 kernel based on how the weight was loaded (see WEntry/assembleQuant).
   private matmul(x: Float32Array, e: WEntry, bias: Float32Array | null, R: number, N: number, K: number) { return e.q ? (e.q.kind === 'i8' ? this.linearQ8(x, e.q, bias, R) : this.linearQ4(x, e.q, bias, R)) : this.linear(x, e.data!, bias, R, N, K); }
-  private rmsnorm(x: Float32Array, w: Float32Array, R: number, H: number, eps: number) { const b = new ArrayBuffer(8); new Uint32Array(b, 0, 1)[0] = H; new Float32Array(b, 4, 1)[0] = eps; return this.run(SHARD_WGSL.rmsnorm, [x, w], new Uint8Array(b), R * H, [R, 1, 1]); }
+  private rmsnorm(x: Float32Array, w: Float32Array, R: number, H: number, eps: number) { const b = new ArrayBuffer(8); new Uint32Array(b, 0, 1)[0] = H; new Float32Array(b, 4, 1)[0] = eps; return this.run(SHARD_WGSL.rmsnorm, [x, this.resident(w)], new Uint8Array(b), R * H, [R, 1, 1]); }
   private rope(t: Float32Array, cos: Float32Array, sin: Float32Array, SEQ: number, nh: number, HD: number) { return this.run(SHARD_WGSL.rope, [t, cos, sin], this.u32(SEQ, nh, HD), SEQ * nh * HD, this.d1(SEQ * nh * HD)); }
   private async layer(h: Float32Array, g: (n: string, opt?: boolean) => WEntry | null, cos: Float32Array, sin: Float32Array, SEQ: number, c: ShardCfg): Promise<Float32Array> {
     const { H, NH, NKV, HD, INT, eps } = c;
@@ -899,7 +913,7 @@ class ShardRuntime {
   // FIRST stage: token ids → embeddings (gather rows of embed_tokens.weight). ids uploaded as u32 bit-patterns.
   embed(ids: number[], embW: Float32Array, H: number): Promise<Float32Array> {
     const idsF32 = new Float32Array(new Uint32Array(ids).buffer);
-    return this.run(SHARD_WGSL.embed, [idsF32, embW], this.u32(ids.length, H), ids.length * H, this.d1(ids.length * H));
+    return this.run(SHARD_WGSL.embed, [idsF32, this.resident(embW)], this.u32(ids.length, H), ids.length * H, this.d1(ids.length * H));
   }
   // LAST stage: final RMSNorm → lm_head → logits[seq,vocab]. headW is embed_tokens.weight when tied.
   async lmHead(hidden: Float32Array, normW: Float32Array, headW: Float32Array, seq: number, H: number, vocab: number, eps: number): Promise<Float32Array> {
@@ -1268,7 +1282,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     return res;
   }
   if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') st.kv.delete(String(p.session)); else st.kv.clear(); } return { ok: true }; }
-  if (op === 'shard_unload') { SHARD_STAGE.delete(id); dropPush(id); return { ok: true }; }
+  if (op === 'shard_unload') { const st = SHARD_STAGE.get(id); if (st && backend.shard) backend.shard.releaseWeights(st.weights); SHARD_STAGE.delete(id); dropPush(id); return { ok: true }; }
   // TEXT ↔ ids on the FIRST stage's on-device tokenizer, so /model/shard_chat works when the first stage is a WebGPU
   // worker (mirrors worker_torch's shard_tok/shard_detok). Needs a tokenizer.json to have been streamed to this stage.
   if (op === 'shard_tok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard — the tokenizer.json streams to the first stage; a WebGPU first stage needs it'); return { ok: true, input_ids: st.tok.encode(String(p.prompt ?? '').slice(0, 8000)), eos: st.eos }; }
