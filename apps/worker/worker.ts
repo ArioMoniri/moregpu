@@ -722,7 +722,7 @@ function readPreTokenizer(
 // ===== BPE TOKENIZER END =====
 
 // ===== SHARD RUNTIME (extractable for tests) BEGIN =====
-interface ShardCfg { H: number; NH: number; NKV: number; HD: number; INT: number; eps: number; theta: number }
+interface ShardCfg { H: number; NH: number; NKV: number; HD: number; INT: number; eps: number; theta: number; maxPos: number }
 // A loaded weight is EITHER dequantized fp32 (`data`) or QUANTIZED (`q`): packed int8/int4 (4/u32 or
 // 8-nibbles/u32) plus a per-row (int8) / per-group (int4) f32 scale. i8/u8 are transient raw forms held
 // between parse and assembleQuant. Quantized weights stay ~1 B/weight (int8) or ~0.5 B/weight (int4) in
@@ -826,7 +826,7 @@ const SHARD_WGSL = {
   linearQ4: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> wq:array<u32>;@group(0) @binding(2) var<storage,read> scale:array<f32>;@group(0) @binding(3) var<storage,read> bias:array<f32>;@group(0) @binding(4) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,group:u32,ng:u32,hasBias:u32};@group(0) @binding(5) var<uniform> u:U;
 @compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let n=g.x;if(r>=u.R||n>=u.N){return;}let rowBytes=u.K/2u;let byteBase=n*rowBytes;let xrow=r*u.K;let scBase=n*u.ng;var acc=0.0;for(var k=0u;k<u.K;k=k+1u){let bi=byteBase+(k>>1u);let word=wq[bi>>2u];let bv=(word>>((bi&3u)*8u))&0xFFu;var nib:u32;if((k&1u)==0u){nib=bv&0xFu;}else{nib=(bv>>4u)&0xFu;}var wi=i32(nib);if(wi>7){wi=wi-16;}let sc=scale[scBase+(k/u.group)];acc=acc+x[xrow+k]*(f32(wi)*sc);}if(u.hasBias==1u){acc=acc+bias[n];}y[r*u.N+n]=acc;}`,
 };
-interface LayerKV { K: Float32Array; V: Float32Array; len: number }
+interface LayerKV { K: GPUBuffer | null; V: GPUBuffer | null; len: number; cap: number }
 class ShardRuntime {
   private cache = new Map<string, GPUComputePipeline>();
   constructor(private dev: GPUDevice) {}
@@ -920,11 +920,25 @@ class ShardRuntime {
     const normed = await this.rmsnorm(hidden, normW, seq, H, eps);
     return await this.linear(normed, headW, null, seq, vocab, H);
   }
-  newCache(NL: number): LayerKV[] { return Array.from({ length: NL }, () => ({ K: new Float32Array(0), V: new Float32Array(0), len: 0 })); }
+  // RESIDENT KV (#11): each layer's K/V live in a persistent GPUBuffer grown by doubling; a decode step appends ONLY
+  // the new token rows (writeBuffer at the tail) instead of re-uploading the whole growing cache every step — the old
+  // concat-realloc was O(n) host copy + O(n) host→GPU upload per step, i.e. O(n²) over an n-token generation. These
+  // buffers no longer GC, so freeCache() is called at every session drop point (evict / re-prefill / reset / unload).
+  private allocKV(rowFloats: number, capRows: number): GPUBuffer { return this.dev.createBuffer({ size: Math.max(4, capRows * rowFloats * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }); }
+  private ensureKV(kv: LayerKV, needRows: number, rowFloats: number, maxPos: number): void {
+    if (kv.K && needRows <= kv.cap) return;
+    let cap = kv.cap === 0 ? Math.max(32, needRows) : kv.cap; while (cap < needRows) cap *= 2; if (cap > maxPos) cap = maxPos;
+    if (needRows > cap) throw new Error(`KV context ${needRows} exceeds cap ${maxPos} (raise MOREGPU_MAX_KV_CTX / model max_position_embeddings)`);
+    const nK = this.allocKV(rowFloats, cap), nV = this.allocKV(rowFloats, cap);
+    if (kv.K && kv.len > 0) { const bytes = kv.len * rowFloats * 4, enc = this.dev.createCommandEncoder(); enc.copyBufferToBuffer(kv.K, 0, nK, 0, bytes); enc.copyBufferToBuffer(kv.V!, 0, nV, 0, bytes); this.dev.queue.submit([enc.finish()]); } // grow: copy live rows GPU→GPU (never host)
+    kv.K?.destroy(); kv.V?.destroy(); kv.K = nK; kv.V = nV; kv.cap = cap;
+  }
+  freeCache(cache: LayerKV[]): void { for (const kv of cache) { kv.K?.destroy(); kv.V?.destroy(); kv.K = null; kv.V = null; kv.len = 0; kv.cap = 0; } }
+  newCache(NL: number): LayerKV[] { return Array.from({ length: NL }, () => ({ K: null, V: null, len: 0, cap: 0 })); }
   // One cached decoder block: `seqNew` new tokens at absolute position `past`; appends K/V to the layer cache
   // and attends over the full cache with online softmax (any length; used for both prefill and 1-token decode).
   private async cachedLayer(h: Float32Array, g: (n: string, opt?: boolean) => WEntry | null, seqNew: number, past: number, kvc: LayerKV, c: ShardCfg): Promise<Float32Array> {
-    const { H, NH, NKV, HD, INT, eps, theta } = c;
+    const { H, NH, NKV, HD, INT, eps, theta, maxPos } = c;
     const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
     const nf = (n: string) => req(n).data!;
     const bias = (n: string) => g(n, true)?.data ?? null;
@@ -935,10 +949,10 @@ class ShardRuntime {
     const positions = Array.from({ length: seqNew }, (_, i) => past + i);
     const { cos, sin } = computeCosSin(positions, HD, theta);
     const qR = await this.rope(q, cos, sin, seqNew, NH, HD), kR = await this.rope(k, cos, sin, seqNew, NKV, HD);
-    const Kfull = new Float32Array(kvc.K.length + kR.length); Kfull.set(kvc.K, 0); Kfull.set(kR, kvc.K.length);
-    const Vfull = new Float32Array(kvc.V.length + v.length); Vfull.set(kvc.V, 0); Vfull.set(v, kvc.V.length);
-    kvc.K = Kfull; kvc.V = Vfull; kvc.len = past + seqNew;
-    const ctx = await this.run(SHARD_WGSL.cachedAttn, [qR, Kfull, Vfull], this.u32(seqNew, NH, NKV, HD, past), seqNew * NH * HD, [seqNew, NH, 1]);
+    const rowFloats = NKV * HD; this.ensureKV(kvc, past + seqNew, rowFloats, maxPos); // grow the persistent K/V buffers if needed (doubling, GPU→GPU copy of live rows)
+    const tailByte = past * rowFloats * 4; this.dev.queue.writeBuffer(kvc.K!, tailByte, kR as BufferSource); this.dev.queue.writeBuffer(kvc.V!, tailByte, v as BufferSource); // append ONLY the new K/V rows at the tail
+    kvc.len = past + seqNew;
+    const ctx = await this.run(SHARD_WGSL.cachedAttn, [qR, kvc.K!, kvc.V!], this.u32(seqNew, NH, NKV, HD, past), seqNew * NH * HD, [seqNew, NH, 1]); // bind the resident K/V buffers directly (no re-upload)
     const attnOut = await this.matmul(ctx, req('self_attn.o_proj.weight'), null, seqNew, H, NH * HD);
     const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(seqNew * H), seqNew * H, this.d1(seqNew * H));
     const ln2 = await this.rmsnorm(hMid, nf('post_attention_layernorm.weight'), seqNew, H, eps);
@@ -1197,11 +1211,12 @@ const _envn = (k: string, d: number) => { const v = _D?.env.get(k); const n = v 
 const MAX_KV_SESSIONS = _envn('MOREGPU_MAX_KV_SESSIONS', 8);
 const MAX_STAGING = _envn('MOREGPU_MAX_STAGING', 4);
 const MAX_STAGING_BYTES = _envn('MOREGPU_MAX_STAGING_BYTES', 8 * 2 ** 30); // 8 GiB across all live pushes
+const MAX_KV_CTX = _envn('MOREGPU_MAX_KV_CTX', 131072); // resident-KV context hard cap (VRAM / storage-binding-size backstop); a model's own max_position_embeddings usually lowers it
 const dropPush = (id: string) => { SHARD_PUSH.delete(id); SHARD_PUSH_BYTES.delete(id); };
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
   const H = c.hidden_size, NH = c.num_attention_heads, NKV = c.num_key_value_heads ?? NH;
-  return { cfg: { H, NH, NKV, HD: c.head_dim ?? Math.floor(H / NH), INT: c.intermediate_size, eps: c.rms_norm_eps ?? 1e-6, theta: c.rope_theta ?? 10000 }, vocab: c.vocab_size };
+  return { cfg: { H, NH, NKV, HD: c.head_dim ?? Math.floor(H / NH), INT: c.intermediate_size, eps: c.rms_norm_eps ?? 1e-6, theta: c.rope_theta ?? 10000, maxPos: Math.min(c.max_position_embeddings ?? MAX_KV_CTX, MAX_KV_CTX) }, vocab: c.vocab_size };
 }
 async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Record<string, unknown>> {
   const id = String(p.id ?? p.model ?? '');
@@ -1225,6 +1240,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     const tokBytes = first ? join('tokenizer.json') : null;
     const tok = tokBytes ? BpeTokenizer.fromTokenizerJson(JSON.parse(new TextDecoder().decode(tokBytes))) : null;
     const eos = tok ? resolveEos(join, tok) : null;
+    const prevSt = SHARD_STAGE.get(id); if (prevSt && backend.shard) { for (const cc of prevSt.kv.values()) backend.shard.freeCache(cc); backend.shard.releaseWeights(prevSt.weights); } // re-load without an intervening unload: free the old stage's KV + resident weight VRAM first
     SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok, eos }); dropPush(id);
     let held = 0; for (const w of weights.values()) held += (w.data?.length ?? (w.q ? w.q.N * w.q.K : 0));
     return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
@@ -1252,7 +1268,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
       // A pos-0 call (re)prefills → fresh cache. A pos>0 decode MUST match the cache's current length, else the
       // caller (a reconnect, a lost/evicted session, a coordinator bug) would attend over a zero-filled phantom
       // prefix and silently return wrong tokens — reject it so the coordinator resets + re-prefills instead.
-      if (past === 0) { while (st.kv.size >= MAX_KV_SESSIONS && !st.kv.has(key)) { const old = st.kv.keys().next().value; if (old === undefined) break; st.kv.delete(old); } kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); } // LRU-evict the oldest idle session
+      if (past === 0) { while (st.kv.size >= MAX_KV_SESSIONS && !st.kv.has(key)) { const old = st.kv.keys().next().value; if (old === undefined) break; const oc = st.kv.get(old); if (oc) rt.freeCache(oc); st.kv.delete(old); } const prev = st.kv.get(key); if (prev) rt.freeCache(prev); kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); } // LRU-evict oldest idle session (freeing its KV VRAM); a re-prefill frees this key's prior cache first
       else if (!kv || (kv[0] && kv[0].len !== past)) throw new Error(`KV desync for session ${key}: ${kv?.[0]?.len ?? 'no'} tokens cached but pos=${past} — reset the session and re-prefill`);
       else { st.kv.delete(key); st.kv.set(key, kv); } // LRU touch: this session is now most-recently-used
       h = await rt.cachedStage(h, past, st.weights, st.start, st.end, kv!, st.cfg);
@@ -1281,8 +1297,8 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     if (cached) res.past = past + seqNew;
     return res;
   }
-  if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') st.kv.delete(String(p.session)); else st.kv.clear(); } return { ok: true }; }
-  if (op === 'shard_unload') { const st = SHARD_STAGE.get(id); if (st && backend.shard) backend.shard.releaseWeights(st.weights); SHARD_STAGE.delete(id); dropPush(id); return { ok: true }; }
+  if (op === 'shard_reset') { const st = SHARD_STAGE.get(id); if (st) { if (typeof p.session === 'string') { const cc = st.kv.get(String(p.session)); if (cc) backend.shard?.freeCache(cc); st.kv.delete(String(p.session)); } else { for (const cc of st.kv.values()) backend.shard?.freeCache(cc); st.kv.clear(); } } return { ok: true }; }
+  if (op === 'shard_unload') { const st = SHARD_STAGE.get(id); if (st && backend.shard) { for (const cc of st.kv.values()) backend.shard.freeCache(cc); backend.shard.releaseWeights(st.weights); } SHARD_STAGE.delete(id); dropPush(id); return { ok: true }; }
   // TEXT ↔ ids on the FIRST stage's on-device tokenizer, so /model/shard_chat works when the first stage is a WebGPU
   // worker (mirrors worker_torch's shard_tok/shard_detok). Needs a tokenizer.json to have been streamed to this stage.
   if (op === 'shard_tok') { const st = SHARD_STAGE.get(id); if (!st?.tok) throw new Error('no tokenizer for this shard — the tokenizer.json streams to the first stage; a WebGPU first stage needs it'); return { ok: true, input_ids: st.tok.encode(String(p.prompt ?? '').slice(0, 8000)), eos: st.eos }; }
