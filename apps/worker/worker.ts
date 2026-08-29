@@ -224,24 +224,518 @@ interface Backend {
 // Lets a WebGPU worker hold a pipeline MIDDLE stage: parse the coordinator's streamed per-stage safetensors
 // slice + config, then run a numerically-correct Llama/Qwen2-style decoder-block forward (hidden→hidden) in
 // WGSL. Verified against a torch oracle to ~1e-6 (RMSNorm, GQA attention + RoPE + causal mask, SwiGLU, residuals).
+// ===== BPE TOKENIZER (verified byte-level BPE) BEGIN =====
+// Lets a FIRST-stage worker (browser or Deno) turn TEXT -> token ids locally, so the client
+// need not pre-tokenize. Pure TS (TextEncoder/TextDecoder/RegExp) — runs under Deno AND a browser.
+// Loads a model tokenizer from a HF tokenizer.json OR a vocab.json + merges.txt pair. Verified to
+// EXACTLY reproduce the reference tokenizer (byte-level BPE: bytes<->unicode, regex pre-tokenize,
+// rank-based merges, special-token splitting; gpt2 + qwen2/gpt4 pre-tokenizer regex variants).
+// ---------------------------------------------------------------------------
+// Byte <-> unicode table (the exact GPT-2 construction).
+// ---------------------------------------------------------------------------
+
+function bytesToUnicode(): { byteToChar: string[]; charToByte: Map<string, number> } {
+  const bs: number[] = [];
+  for (let i = "!".charCodeAt(0); i <= "~".charCodeAt(0); i++) bs.push(i);
+  for (let i = "¡".charCodeAt(0); i <= "¬".charCodeAt(0); i++) bs.push(i);
+  for (let i = "®".charCodeAt(0); i <= "ÿ".charCodeAt(0); i++) bs.push(i);
+  const cs = bs.slice();
+  let n = 0;
+  for (let b = 0; b < 256; b++) {
+    if (!bs.includes(b)) {
+      bs.push(b);
+      cs.push(256 + n);
+      n += 1;
+    }
+  }
+  const byteToChar: string[] = new Array(256);
+  const charToByte = new Map<string, number>();
+  for (let i = 0; i < bs.length; i++) {
+    const ch = String.fromCharCode(cs[i]);
+    byteToChar[bs[i]] = ch;
+    charToByte.set(ch, bs[i]);
+  }
+  return { byteToChar, charToByte };
+}
+
+// ---------------------------------------------------------------------------
+// Pre-tokenizer regexes.
+// ---------------------------------------------------------------------------
+
+// Classic GPT-2 / RoBERTa pattern.
+const GPT2_PATTERN =
+  "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
+
+// Qwen2 / GPT-4-family pattern. The upstream tokenizer.json writes the contraction
+// group as `(?i:'s|'t|...)`; JS engines do not universally support inline `(?i:)`
+// modifiers, so we expand it into explicit ASCII case classes (exactly equivalent
+// for these ASCII-only contractions). Digits are isolated one at a time via \p{N}.
+const QWEN2_PATTERN =
+  "'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])" +
+  "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*" +
+  "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+const NAMED_PATTERNS: Record<string, string> = {
+  gpt2: GPT2_PATTERN,
+  qwen2: QWEN2_PATTERN,
+  gpt4: QWEN2_PATTERN, // same family
+};
+
+// Translate a pattern that came from a tokenizer.json Split rule into a JS-safe
+// source: expand any `(?i:...)` groups (ASCII letters -> [aA] classes) so the
+// pattern works in browsers that lack inline-modifier support.
+function toJsSafePattern(src: string): string {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    if (src.startsWith("(?i:", i)) {
+      // Find the matching close paren.
+      let depth = 1;
+      let j = i + 4;
+      let inner = "";
+      for (; j < src.length && depth > 0; j++) {
+        const c = src[j];
+        if (c === "\\") {
+          inner += c + (src[j + 1] ?? "");
+          j++;
+          continue;
+        }
+        if (c === "(") depth++;
+        else if (c === ")") {
+          depth--;
+          if (depth === 0) break;
+        }
+        inner += c;
+      }
+      out += "(?:" + expandAsciiCaseInsensitive(inner) + ")";
+      i = j + 1;
+    } else {
+      out += src[i];
+      i++;
+    }
+  }
+  return out;
+}
+
+function expandAsciiCaseInsensitive(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") {
+      out += c + (s[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (/[a-z]/.test(c)) out += "[" + c + c.toUpperCase() + "]";
+    else if (/[A-Z]/.test(c)) out += "[" + c.toLowerCase() + c + "]";
+    else out += c;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Types.
+// ---------------------------------------------------------------------------
+
+interface AddedToken {
+  id: number;
+  content: string;
+  special: boolean;
+  lstrip?: boolean;
+  rstrip?: boolean;
+  singleWord?: boolean;
+  normalized?: boolean;
+}
+
+type PretokVariant = "gpt2" | "qwen2" | "gpt4";
+
+interface TokenizerConfig {
+  vocab: Record<string, number>;
+  merges: Array<[string, string]>;
+  addedTokens?: AddedToken[];
+  /** Named pre-tokenizer variant. Ignored if `pretokenizerRegex` is given. */
+  pretokenizer?: PretokVariant;
+  /** Explicit pre-tokenizer regex source (as found in a tokenizer.json Split). */
+  pretokenizerRegex?: string;
+  /** ByteLevel add_prefix_space (GPT-2/Qwen2 default: false). */
+  addPrefixSpace?: boolean;
+  unkToken?: string;
+}
+
+// ---------------------------------------------------------------------------
+// The tokenizer.
+// ---------------------------------------------------------------------------
+
+class BpeTokenizer {
+  readonly vocab: Map<string, number>;
+  readonly idToToken: Map<number, string>;
+  readonly bpeRanks: Map<string, number>;
+  readonly addedTokens: AddedToken[];
+  readonly addPrefixSpace: boolean;
+  readonly unkToken?: string;
+
+  private readonly byteToChar: string[];
+  private readonly charToByte: Map<string, number>;
+  private readonly pat: RegExp;
+  private readonly specialById: Map<number, AddedToken>;
+  private readonly specialByContent: Map<string, AddedToken>;
+  private readonly splitRe: RegExp | null;
+  private readonly encoder = new TextEncoder();
+  private readonly decoder = new TextDecoder("utf-8");
+  private readonly cache = new Map<string, string[]>();
+
+  constructor(cfg: TokenizerConfig) {
+    // vocab / merges.
+    this.vocab = new Map(Object.entries(cfg.vocab));
+    this.idToToken = new Map();
+    for (const [tok, id] of this.vocab) this.idToToken.set(id, tok);
+
+    this.bpeRanks = new Map();
+    for (let i = 0; i < cfg.merges.length; i++) {
+      const [a, b] = cfg.merges[i];
+      this.bpeRanks.set(a + " " + b, i);
+    }
+
+    // byte-level table.
+    const bt = bytesToUnicode();
+    this.byteToChar = bt.byteToChar;
+    this.charToByte = bt.charToByte;
+
+    // pre-tokenizer regex.
+    let patternSrc: string;
+    if (cfg.pretokenizerRegex) {
+      patternSrc = toJsSafePattern(cfg.pretokenizerRegex);
+    } else {
+      const name = cfg.pretokenizer ?? "gpt2";
+      patternSrc = NAMED_PATTERNS[name];
+      if (!patternSrc) throw new Error("unknown pretokenizer variant: " + name);
+    }
+    this.pat = new RegExp(patternSrc, "gu");
+
+    this.addPrefixSpace = cfg.addPrefixSpace ?? false;
+    this.unkToken = cfg.unkToken;
+
+    // added / special tokens.
+    this.addedTokens = cfg.addedTokens ? cfg.addedTokens.slice() : [];
+    this.specialById = new Map();
+    this.specialByContent = new Map();
+    for (const t of this.addedTokens) {
+      this.specialById.set(t.id, t);
+      this.specialByContent.set(t.content, t);
+      if (!this.idToToken.has(t.id)) this.idToToken.set(t.id, t.content);
+      if (!this.vocab.has(t.content)) this.vocab.set(t.content, t.id);
+    }
+    // Build a splitter that keeps added-token contents as separate chunks
+    // (longest content first so overlapping tokens match greedily).
+    if (this.addedTokens.length) {
+      const contents = this.addedTokens
+        .map((t) => t.content)
+        .sort((a, b) => b.length - a.length)
+        .map(escapeRegex);
+      this.splitRe = new RegExp("(" + contents.join("|") + ")");
+    } else {
+      this.splitRe = null;
+    }
+  }
+
+  // ---- loaders ----------------------------------------------------------
+
+  /** Load from a parsed HuggingFace `tokenizer.json` object. */
+  static fromTokenizerJson(obj: any): BpeTokenizer {
+    const model = obj.model ?? {};
+    const vocab: Record<string, number> = model.vocab ?? {};
+    const merges = normalizeMerges(model.merges ?? []);
+
+    const added: AddedToken[] = (obj.added_tokens ?? []).map((t: any) => ({
+      id: t.id,
+      content: t.content,
+      special: !!t.special,
+      lstrip: !!t.lstrip,
+      rstrip: !!t.rstrip,
+      singleWord: !!t.single_word,
+      normalized: !!t.normalized,
+    }));
+
+    const { regex, addPrefixSpace } = readPreTokenizer(obj.pre_tokenizer);
+
+    return new BpeTokenizer({
+      vocab,
+      merges,
+      addedTokens: added,
+      pretokenizerRegex: regex ?? undefined,
+      pretokenizer: regex ? undefined : "gpt2",
+      addPrefixSpace,
+      unkToken: model.unk_token ?? undefined,
+    });
+  }
+
+  /**
+   * Load from a `vocab.json` object + raw `merges.txt` text.
+   * `opts.pretokenizer` selects the regex variant ("gpt2" default, or "qwen2").
+   */
+  static fromVocabAndMerges(
+    vocab: Record<string, number>,
+    mergesText: string,
+    opts: {
+      pretokenizer?: PretokVariant;
+      pretokenizerRegex?: string;
+      addedTokens?: AddedToken[];
+      addPrefixSpace?: boolean;
+      unkToken?: string;
+    } = {},
+  ): BpeTokenizer {
+    const merges: Array<[string, string]> = [];
+    for (const raw of mergesText.split("\n")) {
+      const line = raw.replace(/\r$/, "");
+      // Skip only the optional `#version:` header — NOT legitimate merges whose left
+      // piece is the '#' byte-token (e.g. `# #`, `## ##`, `#$ #$`), which are real BPE merges.
+      if (!line || line.startsWith("#version")) continue;
+      const sp = line.indexOf(" ");
+      if (sp < 0) continue;
+      merges.push([line.slice(0, sp), line.slice(sp + 1)]);
+    }
+    return new BpeTokenizer({
+      vocab,
+      merges,
+      addedTokens: opts.addedTokens,
+      pretokenizer: opts.pretokenizer ?? "gpt2",
+      pretokenizerRegex: opts.pretokenizerRegex,
+      addPrefixSpace: opts.addPrefixSpace,
+      unkToken: opts.unkToken,
+    });
+  }
+
+  // ---- core BPE ---------------------------------------------------------
+
+  private bpe(token: string): string[] {
+    const cached = this.cache.get(token);
+    if (cached) return cached;
+
+    let word = Array.from(token);
+    if (word.length < 2) {
+      this.cache.set(token, word);
+      return word;
+    }
+
+    for (;;) {
+      // find the lowest-rank adjacent pair.
+      let minRank = Infinity;
+      let first = "";
+      let second = "";
+      for (let i = 0; i < word.length - 1; i++) {
+        const rank = this.bpeRanks.get(word[i] + " " + word[i + 1]);
+        if (rank !== undefined && rank < minRank) {
+          minRank = rank;
+          first = word[i];
+          second = word[i + 1];
+        }
+      }
+      if (minRank === Infinity) break;
+
+      // merge every non-overlapping occurrence of (first, second).
+      const newWord: string[] = [];
+      let i = 0;
+      while (i < word.length) {
+        let j = -1;
+        for (let k = i; k < word.length; k++) {
+          if (word[k] === first) {
+            j = k;
+            break;
+          }
+        }
+        if (j === -1) {
+          for (let k = i; k < word.length; k++) newWord.push(word[k]);
+          break;
+        }
+        for (let k = i; k < j; k++) newWord.push(word[k]);
+        i = j;
+        if (i < word.length - 1 && word[i] === first && word[i + 1] === second) {
+          newWord.push(first + second);
+          i += 2;
+        } else {
+          newWord.push(word[i]);
+          i += 1;
+        }
+      }
+      word = newWord;
+      if (word.length === 1) break;
+    }
+
+    this.cache.set(token, word);
+    return word;
+  }
+
+  /** Encode one pre-token (already isolated by the regex) into ids. */
+  private encodePiece(piece: string, out: number[]): void {
+    const bytes = this.encoder.encode(piece);
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += this.byteToChar[bytes[i]];
+    for (const sub of this.bpe(s)) {
+      const id = this.vocab.get(sub);
+      if (id === undefined) {
+        if (this.unkToken && this.vocab.has(this.unkToken)) {
+          out.push(this.vocab.get(this.unkToken)!);
+          continue;
+        }
+        throw new Error("piece not in vocab: " + JSON.stringify(sub));
+      }
+      out.push(id);
+    }
+  }
+
+  private encodeNormal(text: string, out: number[]): void {
+    if (!text) return;
+    const matches = text.matchAll(this.pat);
+    for (const m of matches) this.encodePiece(m[0], out);
+  }
+
+  // ---- public API -------------------------------------------------------
+
+  encode(text: string): number[] {
+    if (this.addPrefixSpace && text.length && !/^\s/.test(text)) {
+      text = " " + text;
+    }
+    const out: number[] = [];
+    if (!this.splitRe) {
+      this.encodeNormal(text, out);
+      return out;
+    }
+    // Split on added/special tokens; odd chunks are the special tokens.
+    const parts = text.split(this.splitRe);
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!part) continue;
+      const special = this.specialByContent.get(part);
+      if (special) {
+        out.push(special.id);
+      } else {
+        this.encodeNormal(part, out);
+      }
+    }
+    return out;
+  }
+
+  decode(ids: number[], opts: { skipSpecialTokens?: boolean } = {}): string {
+    const skip = opts.skipSpecialTokens ?? false;
+    let bytes: number[] = [];
+    let result = "";
+    const flush = () => {
+      if (bytes.length) {
+        result += this.decoder.decode(new Uint8Array(bytes));
+        bytes = [];
+      }
+    };
+    for (const id of ids) {
+      const special = this.specialById.get(id);
+      if (special) {
+        flush();
+        if (!skip) result += special.content;
+        continue;
+      }
+      const tok = this.idToToken.get(id);
+      if (tok === undefined) continue;
+      for (const ch of tok) {
+        const b = this.charToByte.get(ch);
+        if (b !== undefined) bytes.push(b);
+      }
+    }
+    flush();
+    return result;
+  }
+
+  get vocabSize(): number {
+    return this.vocab.size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// helpers.
+// ---------------------------------------------------------------------------
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// merges can be ["a b", ...] or [["a","b"], ...] depending on tokenizer version.
+function normalizeMerges(merges: any[]): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const m of merges) {
+    if (typeof m === "string") {
+      const sp = m.indexOf(" ");
+      out.push([m.slice(0, sp), m.slice(sp + 1)]);
+    } else if (Array.isArray(m) && m.length === 2) {
+      out.push([m[0], m[1]]);
+    }
+  }
+  return out;
+}
+
+// Read a tokenizer.json pre_tokenizer node -> { explicit regex?, add_prefix_space }.
+function readPreTokenizer(
+  pt: any,
+): { regex: string | null; addPrefixSpace: boolean } {
+  let regex: string | null = null;
+  let addPrefixSpace = false;
+  const visit = (node: any) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const n of node) visit(n);
+      return;
+    }
+    switch (node.type) {
+      case "Sequence":
+        visit(node.pretokenizers);
+        break;
+      case "Split":
+        if (node.pattern && typeof node.pattern.Regex === "string") {
+          regex = node.pattern.Regex;
+        }
+        break;
+      case "ByteLevel":
+        if (typeof node.add_prefix_space === "boolean") {
+          addPrefixSpace = node.add_prefix_space;
+        }
+        break;
+      default:
+        // Some configs nest a list under `pretokenizers` without a Sequence type.
+        if (node.pretokenizers) visit(node.pretokenizers);
+        break;
+    }
+  };
+  visit(pt);
+  return { regex, addPrefixSpace };
+}
+// ===== BPE TOKENIZER END =====
+
+// ===== SHARD RUNTIME (extractable for tests) BEGIN =====
 interface ShardCfg { H: number; NH: number; NKV: number; HD: number; INT: number; eps: number; theta: number }
+// A loaded weight is EITHER dequantized fp32 (`data`) or QUANTIZED (`q`): packed int8/int4 (4/u32 or
+// 8-nibbles/u32) plus a per-row (int8) / per-group (int4) f32 scale. i8/u8 are transient raw forms held
+// between parse and assembleQuant. Quantized weights stay ~1 B/weight (int8) or ~0.5 B/weight (int4) in
+// host RAM and on the GPU upload — a browser/mobile tab holds a bigger slice; a push-streamed stage is smaller.
+interface QInfo { kind: 'i8' | 'i4'; wq: Uint32Array; scale: Float32Array; N: number; K: number; group: number; ng: number }
+interface WEntry { data?: Float32Array; i8?: Int8Array; u8?: Uint8Array; q?: QInfo; shape: number[] }
 function f16ToF32(h: number): number {
   const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x03ff;
   if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
   if (e === 0x1f) return f ? NaN : (s ? -Infinity : Infinity);
   return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
 }
-// safetensors bytes → { name: {data: Float32Array (dequantized F32/F16/BF16), shape} }
-function parseSafetensors(buf: Uint8Array): Map<string, { data: Float32Array; shape: number[] }> {
+// safetensors bytes → { name: WEntry }. F32/F16/BF16 → dequantized `data`; I8/U8 kept RAW (quantized weights,
+// paired with their `.scale` sibling by assembleQuant — never dequantized, so the shard stays small).
+function parseSafetensors(buf: Uint8Array): Map<string, WEntry> {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const headerLen = Number(dv.getBigUint64(0, true));
   const header = JSON.parse(new TextDecoder().decode(buf.subarray(8, 8 + headerLen)));
-  const dataStart = 8 + headerLen, out = new Map<string, { data: Float32Array; shape: number[] }>();
+  const dataStart = 8 + headerLen, out = new Map<string, WEntry>();
   for (const [name, meta] of Object.entries(header)) {
     if (name === '__metadata__') continue;
     const m = meta as { dtype: string; shape: number[]; data_offsets: [number, number] };
     const raw = buf.subarray(dataStart + m.data_offsets[0], dataStart + m.data_offsets[1]);
-    const n = m.shape.reduce((a, b) => a * b, 1); let data: Float32Array;
+    const n = m.shape.reduce((a, b) => a * b, 1);
+    if (m.dtype === 'I8') { out.set(name, { i8: new Int8Array(raw.slice().buffer), shape: m.shape }); continue; }
+    if (m.dtype === 'U8') { out.set(name, { u8: raw.slice(), shape: m.shape }); continue; }
+    let data: Float32Array;
     if (m.dtype === 'F32') data = new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
     else if (m.dtype === 'F16') { data = new Float32Array(n); const u = new Uint16Array(raw.buffer, raw.byteOffset, n); for (let i = 0; i < n; i++) data[i] = f16ToF32(u[i]); }
     else if (m.dtype === 'BF16') { data = new Float32Array(n); const u = new Uint16Array(raw.buffer, raw.byteOffset, n); const f = new Uint32Array(data.buffer); for (let i = 0; i < n; i++) f[i] = u[i] << 16; }
@@ -249,6 +743,27 @@ function parseSafetensors(buf: Uint8Array): Map<string, { data: Float32Array; sh
     out.set(name, { data, shape: m.shape });
   }
   return out;
+}
+// Pair each raw int8/int4 weight `NAME` with its `NAME.scale` sibling into a QInfo (packing the bytes 4/u32),
+// then drop the scale entry. A quantized checkpoint stores block Linear weights as I8 [N,K] (int8, per-row
+// scale [N]) or U8 [N,K/2] (packed int4, per-group scale [N,ng]); norms/embeddings/head stay fp32.
+function assembleQuant(weights: Map<string, WEntry>): void {
+  const toU32 = (bytes: Uint8Array): Uint32Array => { const pad = new Uint8Array(Math.ceil(bytes.length / 4) * 4); pad.set(bytes); return new Uint32Array(pad.buffer); };
+  for (const [name, e] of [...weights]) {
+    if (!e.i8 && !e.u8) continue;
+    const scaleE = weights.get(name + '.scale'); if (!scaleE?.data) throw new Error(`quantized weight ${name} has no ${name}.scale`);
+    const scale = scaleE.data;
+    if (e.i8) {
+      const [N, K] = e.shape; // int8 weight is [N,K]
+      weights.set(name, { q: { kind: 'i8', wq: toU32(new Uint8Array(e.i8.buffer, e.i8.byteOffset, e.i8.length)), scale, N, K, group: K, ng: 1 }, shape: [N, K] });
+    } else {
+      const N = e.shape[0], K = e.shape[1] * 2; // packed int4 is [N, K/2]
+      const ng = scale.length / N; const group = K / ng;
+      if (K % 2 !== 0 || K % group !== 0 || N <= 0) throw new Error(`int4 weight ${name}: needs K even and K%group==0 (N=${N} K=${K} group=${group})`);
+      weights.set(name, { q: { kind: 'i4', wq: toU32(e.u8!), scale, N, K, group, ng }, shape: [N, K] });
+    }
+    weights.delete(name + '.scale');
+  }
 }
 // HF rotary cos/sin from absolute positions (matches transformers to ~1e-7): inv_freq=theta^-(2i/HD), halves duplicated.
 function computeCosSin(positions: number[], HD: number, theta: number): { cos: Float32Array; sin: Float32Array } {
@@ -278,13 +793,20 @@ const SHARD_WGSL = {
   // over the full cache). causal: token i (abs pos past+i) attends 0..(past+i). GQA kv=h/(NH/NKV). dispatch [seqNew,NH,1].
   cachedAttn: `@group(0) @binding(0) var<storage,read> q:array<f32>;@group(0) @binding(1) var<storage,read> k:array<f32>;@group(0) @binding(2) var<storage,read> v:array<f32>;@group(0) @binding(3) var<storage,read_write> ctx:array<f32>;struct U{seqNew:u32,NH:u32,NKV:u32,HD:u32,past:u32};@group(0) @binding(4) var<uniform> u:U;
 @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;let h=g.y;if(i>=u.seqNew||h>=u.NH){return;}let kv=h/(u.NH/u.NKV);let scale=1.0/sqrt(f32(u.HD));let qbase=(i*u.NH+h)*u.HD;let limit=u.past+i;var m=-3.0e38;var l=0.0;var acc:array<f32,256>;for(var d=0u;d<u.HD;d=d+1u){acc[d]=0.0;}for(var j=0u;j<=limit;j=j+1u){let kb=(j*u.NKV+kv)*u.HD;var dot=0.0;for(var d=0u;d<u.HD;d=d+1u){dot=dot+q[qbase+d]*k[kb+d];}let s=dot*scale;let newm=max(m,s);let corr=exp(m-newm);let p=exp(s-newm);l=l*corr+p;let vb=(j*u.NKV+kv)*u.HD;for(var d=0u;d<u.HD;d=d+1u){acc[d]=acc[d]*corr+p*v[vb+d];}m=newm;}let ob=i*(u.NH*u.HD)+h*u.HD;for(var d=0u;d<u.HD;d=d+1u){ctx[ob+d]=acc[d]/l;}}`,
+  // QUANTIZED linears — dequantize in the shader (portable base-WebGPU int/float ops, NO packed-dot / 8-bit-storage
+  // feature). Weights packed 4/u32: int8 symmetric per-row (byte b of word = flat idx&3; scale[N]); int4 symmetric
+  // per-group (2 nibbles/byte along K, scale[N,ng]). Matches SHARD_WGSL.linear layout/dispatch [ceil(N/16),ceil(R/16),1].
+  linearQ8: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> wq:array<u32>;@group(0) @binding(2) var<storage,read> scale:array<f32>;@group(0) @binding(3) var<storage,read> bias:array<f32>;@group(0) @binding(4) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,hasBias:u32};@group(0) @binding(5) var<uniform> u:U;
+@compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let n=g.x;if(r>=u.R||n>=u.N){return;}let sc=scale[n];let wbase=n*u.K;let xrow=r*u.K;var acc=0.0;for(var k=0u;k<u.K;k=k+1u){let idx=wbase+k;let word=wq[idx>>2u];let bv=(word>>((idx&3u)*8u))&0xFFu;var wi=i32(bv);if(wi>127){wi=wi-256;}acc=acc+x[xrow+k]*(f32(wi)*sc);}if(u.hasBias==1u){acc=acc+bias[n];}y[r*u.N+n]=acc;}`,
+  linearQ4: `@group(0) @binding(0) var<storage,read> x:array<f32>;@group(0) @binding(1) var<storage,read> wq:array<u32>;@group(0) @binding(2) var<storage,read> scale:array<f32>;@group(0) @binding(3) var<storage,read> bias:array<f32>;@group(0) @binding(4) var<storage,read_write> y:array<f32>;struct U{R:u32,N:u32,K:u32,group:u32,ng:u32,hasBias:u32};@group(0) @binding(5) var<uniform> u:U;
+@compute @workgroup_size(16,16) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let n=g.x;if(r>=u.R||n>=u.N){return;}let rowBytes=u.K/2u;let byteBase=n*rowBytes;let xrow=r*u.K;let scBase=n*u.ng;var acc=0.0;for(var k=0u;k<u.K;k=k+1u){let bi=byteBase+(k>>1u);let word=wq[bi>>2u];let bv=(word>>((bi&3u)*8u))&0xFFu;var nib:u32;if((k&1u)==0u){nib=bv&0xFu;}else{nib=(bv>>4u)&0xFu;}var wi=i32(nib);if(wi>7){wi=wi-16;}let sc=scale[scBase+(k/u.group)];acc=acc+x[xrow+k]*(f32(wi)*sc);}if(u.hasBias==1u){acc=acc+bias[n];}y[r*u.N+n]=acc;}`,
 };
 interface LayerKV { K: Float32Array; V: Float32Array; len: number }
 class ShardRuntime {
   private cache = new Map<string, GPUComputePipeline>();
   constructor(private dev: GPUDevice) {}
   private pipe(code: string): GPUComputePipeline { let p = this.cache.get(code); if (!p) { p = this.dev.createComputePipeline({ layout: 'auto', compute: { module: this.dev.createShaderModule({ code }), entryPoint: 'main' } }); this.cache.set(code, p); } return p; }
-  private async run(code: string, storage: Float32Array[], uniform: ArrayBufferView, outLen: number, dispatch: [number, number, number]): Promise<Float32Array> {
+  private async run(code: string, storage: ArrayBufferView[], uniform: ArrayBufferView, outLen: number, dispatch: [number, number, number]): Promise<Float32Array> {
     const dev = this.dev;
     const inBufs = storage.map((arr) => { const b = dev.createBuffer({ size: Math.max(4, (arr.byteLength + 3) & ~3), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(b, 0, arr as BufferSource); return b; });
     const outBytes = Math.max(4, outLen * 4);
@@ -304,30 +826,35 @@ class ShardRuntime {
   }
   private u32(...v: number[]) { return new Uint32Array(v); }
   private linear(x: Float32Array, w: Float32Array, bias: Float32Array | null, R: number, N: number, Kk: number) { return this.run(SHARD_WGSL.linear, [x, w, bias ?? new Float32Array(1)], this.u32(R, N, Kk, bias ? 1 : 0), R * N, [Math.ceil(N / 16), Math.ceil(R / 16), 1]); }
+  private linearQ8(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ8, [x, q.wq, q.scale, bias ?? new Float32Array(1)], this.u32(R, q.N, q.K, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
+  private linearQ4(x: Float32Array, q: QInfo, bias: Float32Array | null, R: number) { return this.run(SHARD_WGSL.linearQ4, [x, q.wq, q.scale, bias ?? new Float32Array(1)], this.u32(R, q.N, q.K, q.group, q.ng, bias ? 1 : 0), R * q.N, [Math.ceil(q.N / 16), Math.ceil(R / 16), 1]); }
+  // Route one linear to fp32 or the int8/int4 kernel based on how the weight was loaded (see WEntry/assembleQuant).
+  private matmul(x: Float32Array, e: WEntry, bias: Float32Array | null, R: number, N: number, K: number) { return e.q ? (e.q.kind === 'i8' ? this.linearQ8(x, e.q, bias, R) : this.linearQ4(x, e.q, bias, R)) : this.linear(x, e.data!, bias, R, N, K); }
   private rmsnorm(x: Float32Array, w: Float32Array, R: number, H: number, eps: number) { const b = new ArrayBuffer(8); new Uint32Array(b, 0, 1)[0] = H; new Float32Array(b, 4, 1)[0] = eps; return this.run(SHARD_WGSL.rmsnorm, [x, w], new Uint8Array(b), R * H, [R, 1, 1]); }
   private rope(t: Float32Array, cos: Float32Array, sin: Float32Array, SEQ: number, nh: number, HD: number) { return this.run(SHARD_WGSL.rope, [t, cos, sin], this.u32(SEQ, nh, HD), SEQ * nh * HD, [Math.ceil(SEQ * nh * HD / 64), 1, 1]); }
-  private async layer(h: Float32Array, g: (n: string, opt?: boolean) => Float32Array | null, cos: Float32Array, sin: Float32Array, SEQ: number, c: ShardCfg): Promise<Float32Array> {
+  private async layer(h: Float32Array, g: (n: string, opt?: boolean) => WEntry | null, cos: Float32Array, sin: Float32Array, SEQ: number, c: ShardCfg): Promise<Float32Array> {
     const { H, NH, NKV, HD, INT, eps } = c;
     const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
-    const ln1 = await this.rmsnorm(h, req('input_layernorm.weight'), SEQ, H, eps);
-    // q/k/v bias is present on Qwen2/Qwen2.5, absent on Llama/SmolLM — optional (null → no bias add).
-    const q = await this.linear(ln1, req('self_attn.q_proj.weight'), g('self_attn.q_proj.bias', true), SEQ, NH * HD, H);
-    const k = await this.linear(ln1, req('self_attn.k_proj.weight'), g('self_attn.k_proj.bias', true), SEQ, NKV * HD, H);
-    const v = await this.linear(ln1, req('self_attn.v_proj.weight'), g('self_attn.v_proj.bias', true), SEQ, NKV * HD, H);
+    const nf = (n: string) => req(n).data!;                 // fp32-only weights (norms)
+    const bias = (n: string) => g(n, true)?.data ?? null;   // q/k/v bias present on Qwen2/2.5, absent on Llama/SmolLM
+    const ln1 = await this.rmsnorm(h, nf('input_layernorm.weight'), SEQ, H, eps);
+    const q = await this.matmul(ln1, req('self_attn.q_proj.weight'), bias('self_attn.q_proj.bias'), SEQ, NH * HD, H);
+    const k = await this.matmul(ln1, req('self_attn.k_proj.weight'), bias('self_attn.k_proj.bias'), SEQ, NKV * HD, H);
+    const v = await this.matmul(ln1, req('self_attn.v_proj.weight'), bias('self_attn.v_proj.bias'), SEQ, NKV * HD, H);
     const qR = await this.rope(q, cos, sin, SEQ, NH, HD), kR = await this.rope(k, cos, sin, SEQ, NKV, HD);
     const ctx = await this.run(SHARD_WGSL.attn, [qR, kR, v], this.u32(SEQ, NH, NKV, HD), SEQ * NH * HD, [SEQ, NH, 1]);
-    const attnOut = await this.linear(ctx, req('self_attn.o_proj.weight'), null, SEQ, H, NH * HD);
+    const attnOut = await this.matmul(ctx, req('self_attn.o_proj.weight'), null, SEQ, H, NH * HD);
     const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(SEQ * H), SEQ * H, [Math.ceil(SEQ * H / 64), 1, 1]);
-    const ln2 = await this.rmsnorm(hMid, req('post_attention_layernorm.weight'), SEQ, H, eps);
-    const gate = await this.linear(ln2, req('mlp.gate_proj.weight'), null, SEQ, INT, H);
-    const up = await this.linear(ln2, req('mlp.up_proj.weight'), null, SEQ, INT, H);
+    const ln2 = await this.rmsnorm(hMid, nf('post_attention_layernorm.weight'), SEQ, H, eps);
+    const gate = await this.matmul(ln2, req('mlp.gate_proj.weight'), null, SEQ, INT, H);
+    const up = await this.matmul(ln2, req('mlp.up_proj.weight'), null, SEQ, INT, H);
     const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(SEQ * INT), SEQ * INT, [Math.ceil(SEQ * INT / 64), 1, 1]);
-    const mlpOut = await this.linear(act, req('mlp.down_proj.weight'), null, SEQ, H, INT);
+    const mlpOut = await this.matmul(act, req('mlp.down_proj.weight'), null, SEQ, H, INT);
     return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(SEQ * H), SEQ * H, [Math.ceil(SEQ * H / 64), 1, 1]);
   }
-  async stage(hidden: Float32Array, positions: number[], weights: Map<string, { data: Float32Array }>, start: number, end: number, c: ShardCfg): Promise<Float32Array> {
+  async stage(hidden: Float32Array, positions: number[], weights: Map<string, WEntry>, start: number, end: number, c: ShardCfg): Promise<Float32Array> {
     const SEQ = positions.length; const { cos, sin } = computeCosSin(positions, c.HD, c.theta); let h = hidden;
-    for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w.data; }; h = await this.layer(h, g, cos, sin, SEQ, c); }
+    for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w; }; h = await this.layer(h, g, cos, sin, SEQ, c); }
     return h;
   }
   // FIRST stage: token ids → embeddings (gather rows of embed_tokens.weight). ids uploaded as u32 bit-patterns.
@@ -343,13 +870,15 @@ class ShardRuntime {
   newCache(NL: number): LayerKV[] { return Array.from({ length: NL }, () => ({ K: new Float32Array(0), V: new Float32Array(0), len: 0 })); }
   // One cached decoder block: `seqNew` new tokens at absolute position `past`; appends K/V to the layer cache
   // and attends over the full cache with online softmax (any length; used for both prefill and 1-token decode).
-  private async cachedLayer(h: Float32Array, g: (n: string, opt?: boolean) => Float32Array | null, seqNew: number, past: number, kvc: LayerKV, c: ShardCfg): Promise<Float32Array> {
+  private async cachedLayer(h: Float32Array, g: (n: string, opt?: boolean) => WEntry | null, seqNew: number, past: number, kvc: LayerKV, c: ShardCfg): Promise<Float32Array> {
     const { H, NH, NKV, HD, INT, eps, theta } = c;
     const req = (n: string) => { const w = g(n); if (!w) throw new Error(`missing weight ${n}`); return w; };
-    const ln1 = await this.rmsnorm(h, req('input_layernorm.weight'), seqNew, H, eps);
-    const q = await this.linear(ln1, req('self_attn.q_proj.weight'), g('self_attn.q_proj.bias', true), seqNew, NH * HD, H);
-    const k = await this.linear(ln1, req('self_attn.k_proj.weight'), g('self_attn.k_proj.bias', true), seqNew, NKV * HD, H);
-    const v = await this.linear(ln1, req('self_attn.v_proj.weight'), g('self_attn.v_proj.bias', true), seqNew, NKV * HD, H);
+    const nf = (n: string) => req(n).data!;
+    const bias = (n: string) => g(n, true)?.data ?? null;
+    const ln1 = await this.rmsnorm(h, nf('input_layernorm.weight'), seqNew, H, eps);
+    const q = await this.matmul(ln1, req('self_attn.q_proj.weight'), bias('self_attn.q_proj.bias'), seqNew, NH * HD, H);
+    const k = await this.matmul(ln1, req('self_attn.k_proj.weight'), bias('self_attn.k_proj.bias'), seqNew, NKV * HD, H);
+    const v = await this.matmul(ln1, req('self_attn.v_proj.weight'), bias('self_attn.v_proj.bias'), seqNew, NKV * HD, H);
     const positions = Array.from({ length: seqNew }, (_, i) => past + i);
     const { cos, sin } = computeCosSin(positions, HD, theta);
     const qR = await this.rope(q, cos, sin, seqNew, NH, HD), kR = await this.rope(k, cos, sin, seqNew, NKV, HD);
@@ -357,22 +886,23 @@ class ShardRuntime {
     const Vfull = new Float32Array(kvc.V.length + v.length); Vfull.set(kvc.V, 0); Vfull.set(v, kvc.V.length);
     kvc.K = Kfull; kvc.V = Vfull; kvc.len = past + seqNew;
     const ctx = await this.run(SHARD_WGSL.cachedAttn, [qR, Kfull, Vfull], this.u32(seqNew, NH, NKV, HD, past), seqNew * NH * HD, [seqNew, NH, 1]);
-    const attnOut = await this.linear(ctx, req('self_attn.o_proj.weight'), null, seqNew, H, NH * HD);
+    const attnOut = await this.matmul(ctx, req('self_attn.o_proj.weight'), null, seqNew, H, NH * HD);
     const hMid = await this.run(SHARD_WGSL.add, [h, attnOut], this.u32(seqNew * H), seqNew * H, [Math.ceil(seqNew * H / 64), 1, 1]);
-    const ln2 = await this.rmsnorm(hMid, req('post_attention_layernorm.weight'), seqNew, H, eps);
-    const gate = await this.linear(ln2, req('mlp.gate_proj.weight'), null, seqNew, INT, H);
-    const up = await this.linear(ln2, req('mlp.up_proj.weight'), null, seqNew, INT, H);
+    const ln2 = await this.rmsnorm(hMid, nf('post_attention_layernorm.weight'), seqNew, H, eps);
+    const gate = await this.matmul(ln2, req('mlp.gate_proj.weight'), null, seqNew, INT, H);
+    const up = await this.matmul(ln2, req('mlp.up_proj.weight'), null, seqNew, INT, H);
     const act = await this.run(SHARD_WGSL.swiglu, [gate, up], this.u32(seqNew * INT), seqNew * INT, [Math.ceil(seqNew * INT / 64), 1, 1]);
-    const mlpOut = await this.linear(act, req('mlp.down_proj.weight'), null, seqNew, H, INT);
+    const mlpOut = await this.matmul(act, req('mlp.down_proj.weight'), null, seqNew, H, INT);
     return await this.run(SHARD_WGSL.add, [hMid, mlpOut], this.u32(seqNew * H), seqNew * H, [Math.ceil(seqNew * H / 64), 1, 1]);
   }
   // Cached stage — same call serves PREFILL (past=0, seqNew=SEQ) and DECODE (past=M, seqNew=1). Mutates `cache`.
-  async cachedStage(hidden: Float32Array, past: number, weights: Map<string, { data: Float32Array }>, start: number, end: number, cache: LayerKV[], c: ShardCfg): Promise<Float32Array> {
+  async cachedStage(hidden: Float32Array, past: number, weights: Map<string, WEntry>, start: number, end: number, cache: LayerKV[], c: ShardCfg): Promise<Float32Array> {
     const seqNew = Math.floor(hidden.length / c.H); let h = hidden;
-    for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w.data; }; h = await this.cachedLayer(h, g, seqNew, past, cache[li - start], c); }
+    for (let li = start; li < end; li++) { const g = (n: string, opt?: boolean) => { const w = weights.get(`model.layers.${li}.${n}`); if (!w) { if (opt) return null; throw new Error(`missing weight model.layers.${li}.${n}`); } return w; }; h = await this.cachedLayer(h, g, seqNew, past, cache[li - start], c); }
     return h;
   }
 }
+// ===== SHARD RUNTIME END =====
 
 let gpuLost = false; // set if the GPU device is lost (Metal reset, driver crash) → we fall back to CPU
 async function makeGpuBackend(): Promise<Backend | null> {
@@ -577,7 +1107,7 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
 // The coordinator streams this stage's config.json + per-stage safetensors via push_begin/push_chunk (download-
 // free), then shard_load parses them into GPU-ready weights and shard_forward runs the stage's decoder blocks
 // (hidden→hidden). This is what makes a WebGPU device a real shard host (not just an offloaded-kernel donor).
-const SHARD_STAGE = new Map<string, { weights: Map<string, { data: Float32Array }>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]> }>();
+const SHARD_STAGE = new Map<string, { weights: Map<string, WEntry>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]>; tok: BpeTokenizer | null }>();
 const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
@@ -597,11 +1127,16 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     const cfgBytes = join('config.json'); if (!cfgBytes) throw new Error('no config.json staged');
     const stBytes = join('model.safetensors'); if (!stBytes) throw new Error('no model.safetensors staged');
     const { cfg, vocab } = cfgFromJson(new TextDecoder().decode(cfgBytes)); const weights = parseSafetensors(stBytes);
+    assembleQuant(weights); // pair any int8/int4 block weights with their .scale (quantized checkpoints); fp32 shards untouched
     const first = !!p.first, last = !!p.last;
     if (first && !weights.get('model.embed_tokens.weight')) throw new Error('first stage needs model.embed_tokens.weight (not streamed)');
     if (last && !weights.get('model.norm.weight')) throw new Error('last stage needs model.norm.weight (not streamed)');
-    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map() }); SHARD_PUSH.delete(id);
-    let held = 0; for (const w of weights.values()) held += w.data.length;
+    // Optional: a FIRST stage may carry the model's tokenizer.json so it can accept raw TEXT (encode on-stage),
+    // making a browser/Deno tab a self-contained first stage — no client-side tokenizer needed. Ids still work too.
+    const tokBytes = first ? join('tokenizer.json') : null;
+    const tok = tokBytes ? BpeTokenizer.fromTokenizerJson(JSON.parse(new TextDecoder().decode(tokBytes))) : null;
+    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok }); SHARD_PUSH.delete(id);
+    let held = 0; for (const w of weights.values()) held += (w.data?.length ?? (w.q ? w.q.N * w.q.K : 0));
     return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
   }
   if (op === 'shard_forward') {
@@ -612,7 +1147,14 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     const w = (n: string) => st.weights.get(n)?.data;
     // stage INPUT → hidden [seqNew, H]
     let h: Float32Array, seqNew: number;
-    if (st.first) { const ids = p.input_ids as number[]; seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H); }
+    if (st.first) {
+      // input_ids from the client, OR raw text tokenized on-stage (if a tokenizer.json was staged with this first stage).
+      let ids: number[];
+      if (Array.isArray(p.input_ids)) ids = p.input_ids as number[];
+      else if (typeof p.prompt === 'string' && st.tok) ids = st.tok.encode(p.prompt);
+      else throw new Error('first stage: need input_ids, or prompt text + a staged tokenizer.json');
+      seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H);
+    }
     else { seqNew = Number(p.seq); h = b64ToF32(String(p.hidden)); }
     // run this stage's decoder blocks (cached KV or uncached full-sequence)
     if (cached) {
