@@ -224,6 +224,489 @@ interface Backend {
 // Lets a WebGPU worker hold a pipeline MIDDLE stage: parse the coordinator's streamed per-stage safetensors
 // slice + config, then run a numerically-correct Llama/Qwen2-style decoder-block forward (hidden→hidden) in
 // WGSL. Verified against a torch oracle to ~1e-6 (RMSNorm, GQA attention + RoPE + causal mask, SwiGLU, residuals).
+// ===== BPE TOKENIZER (verified byte-level BPE) BEGIN =====
+// Lets a FIRST-stage worker (browser or Deno) turn TEXT -> token ids locally, so the client
+// need not pre-tokenize. Pure TS (TextEncoder/TextDecoder/RegExp) — runs under Deno AND a browser.
+// Loads a model tokenizer from a HF tokenizer.json OR a vocab.json + merges.txt pair. Verified to
+// EXACTLY reproduce the reference tokenizer (byte-level BPE: bytes<->unicode, regex pre-tokenize,
+// rank-based merges, special-token splitting; gpt2 + qwen2/gpt4 pre-tokenizer regex variants).
+// ---------------------------------------------------------------------------
+// Byte <-> unicode table (the exact GPT-2 construction).
+// ---------------------------------------------------------------------------
+
+function bytesToUnicode(): { byteToChar: string[]; charToByte: Map<string, number> } {
+  const bs: number[] = [];
+  for (let i = "!".charCodeAt(0); i <= "~".charCodeAt(0); i++) bs.push(i);
+  for (let i = "¡".charCodeAt(0); i <= "¬".charCodeAt(0); i++) bs.push(i);
+  for (let i = "®".charCodeAt(0); i <= "ÿ".charCodeAt(0); i++) bs.push(i);
+  const cs = bs.slice();
+  let n = 0;
+  for (let b = 0; b < 256; b++) {
+    if (!bs.includes(b)) {
+      bs.push(b);
+      cs.push(256 + n);
+      n += 1;
+    }
+  }
+  const byteToChar: string[] = new Array(256);
+  const charToByte = new Map<string, number>();
+  for (let i = 0; i < bs.length; i++) {
+    const ch = String.fromCharCode(cs[i]);
+    byteToChar[bs[i]] = ch;
+    charToByte.set(ch, bs[i]);
+  }
+  return { byteToChar, charToByte };
+}
+
+// ---------------------------------------------------------------------------
+// Pre-tokenizer regexes.
+// ---------------------------------------------------------------------------
+
+// Classic GPT-2 / RoBERTa pattern.
+const GPT2_PATTERN =
+  "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
+
+// Qwen2 / GPT-4-family pattern. The upstream tokenizer.json writes the contraction
+// group as `(?i:'s|'t|...)`; JS engines do not universally support inline `(?i:)`
+// modifiers, so we expand it into explicit ASCII case classes (exactly equivalent
+// for these ASCII-only contractions). Digits are isolated one at a time via \p{N}.
+const QWEN2_PATTERN =
+  "'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])" +
+  "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*" +
+  "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+const NAMED_PATTERNS: Record<string, string> = {
+  gpt2: GPT2_PATTERN,
+  qwen2: QWEN2_PATTERN,
+  gpt4: QWEN2_PATTERN, // same family
+};
+
+// Translate a pattern that came from a tokenizer.json Split rule into a JS-safe
+// source: expand any `(?i:...)` groups (ASCII letters -> [aA] classes) so the
+// pattern works in browsers that lack inline-modifier support.
+function toJsSafePattern(src: string): string {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    if (src.startsWith("(?i:", i)) {
+      // Find the matching close paren.
+      let depth = 1;
+      let j = i + 4;
+      let inner = "";
+      for (; j < src.length && depth > 0; j++) {
+        const c = src[j];
+        if (c === "\\") {
+          inner += c + (src[j + 1] ?? "");
+          j++;
+          continue;
+        }
+        if (c === "(") depth++;
+        else if (c === ")") {
+          depth--;
+          if (depth === 0) break;
+        }
+        inner += c;
+      }
+      out += "(?:" + expandAsciiCaseInsensitive(inner) + ")";
+      i = j + 1;
+    } else {
+      out += src[i];
+      i++;
+    }
+  }
+  return out;
+}
+
+function expandAsciiCaseInsensitive(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") {
+      out += c + (s[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (/[a-z]/.test(c)) out += "[" + c + c.toUpperCase() + "]";
+    else if (/[A-Z]/.test(c)) out += "[" + c.toLowerCase() + c + "]";
+    else out += c;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Types.
+// ---------------------------------------------------------------------------
+
+interface AddedToken {
+  id: number;
+  content: string;
+  special: boolean;
+  lstrip?: boolean;
+  rstrip?: boolean;
+  singleWord?: boolean;
+  normalized?: boolean;
+}
+
+type PretokVariant = "gpt2" | "qwen2" | "gpt4";
+
+interface TokenizerConfig {
+  vocab: Record<string, number>;
+  merges: Array<[string, string]>;
+  addedTokens?: AddedToken[];
+  /** Named pre-tokenizer variant. Ignored if `pretokenizerRegex` is given. */
+  pretokenizer?: PretokVariant;
+  /** Explicit pre-tokenizer regex source (as found in a tokenizer.json Split). */
+  pretokenizerRegex?: string;
+  /** ByteLevel add_prefix_space (GPT-2/Qwen2 default: false). */
+  addPrefixSpace?: boolean;
+  unkToken?: string;
+}
+
+// ---------------------------------------------------------------------------
+// The tokenizer.
+// ---------------------------------------------------------------------------
+
+class BpeTokenizer {
+  readonly vocab: Map<string, number>;
+  readonly idToToken: Map<number, string>;
+  readonly bpeRanks: Map<string, number>;
+  readonly addedTokens: AddedToken[];
+  readonly addPrefixSpace: boolean;
+  readonly unkToken?: string;
+
+  private readonly byteToChar: string[];
+  private readonly charToByte: Map<string, number>;
+  private readonly pat: RegExp;
+  private readonly specialById: Map<number, AddedToken>;
+  private readonly specialByContent: Map<string, AddedToken>;
+  private readonly splitRe: RegExp | null;
+  private readonly encoder = new TextEncoder();
+  private readonly decoder = new TextDecoder("utf-8");
+  private readonly cache = new Map<string, string[]>();
+
+  constructor(cfg: TokenizerConfig) {
+    // vocab / merges.
+    this.vocab = new Map(Object.entries(cfg.vocab));
+    this.idToToken = new Map();
+    for (const [tok, id] of this.vocab) this.idToToken.set(id, tok);
+
+    this.bpeRanks = new Map();
+    for (let i = 0; i < cfg.merges.length; i++) {
+      const [a, b] = cfg.merges[i];
+      this.bpeRanks.set(a + " " + b, i);
+    }
+
+    // byte-level table.
+    const bt = bytesToUnicode();
+    this.byteToChar = bt.byteToChar;
+    this.charToByte = bt.charToByte;
+
+    // pre-tokenizer regex.
+    let patternSrc: string;
+    if (cfg.pretokenizerRegex) {
+      patternSrc = toJsSafePattern(cfg.pretokenizerRegex);
+    } else {
+      const name = cfg.pretokenizer ?? "gpt2";
+      patternSrc = NAMED_PATTERNS[name];
+      if (!patternSrc) throw new Error("unknown pretokenizer variant: " + name);
+    }
+    this.pat = new RegExp(patternSrc, "gu");
+
+    this.addPrefixSpace = cfg.addPrefixSpace ?? false;
+    this.unkToken = cfg.unkToken;
+
+    // added / special tokens.
+    this.addedTokens = cfg.addedTokens ? cfg.addedTokens.slice() : [];
+    this.specialById = new Map();
+    this.specialByContent = new Map();
+    for (const t of this.addedTokens) {
+      this.specialById.set(t.id, t);
+      this.specialByContent.set(t.content, t);
+      if (!this.idToToken.has(t.id)) this.idToToken.set(t.id, t.content);
+      if (!this.vocab.has(t.content)) this.vocab.set(t.content, t.id);
+    }
+    // Build a splitter that keeps added-token contents as separate chunks
+    // (longest content first so overlapping tokens match greedily).
+    if (this.addedTokens.length) {
+      const contents = this.addedTokens
+        .map((t) => t.content)
+        .sort((a, b) => b.length - a.length)
+        .map(escapeRegex);
+      this.splitRe = new RegExp("(" + contents.join("|") + ")");
+    } else {
+      this.splitRe = null;
+    }
+  }
+
+  // ---- loaders ----------------------------------------------------------
+
+  /** Load from a parsed HuggingFace `tokenizer.json` object. */
+  static fromTokenizerJson(obj: any): BpeTokenizer {
+    const model = obj.model ?? {};
+    const vocab: Record<string, number> = model.vocab ?? {};
+    const merges = normalizeMerges(model.merges ?? []);
+
+    const added: AddedToken[] = (obj.added_tokens ?? []).map((t: any) => ({
+      id: t.id,
+      content: t.content,
+      special: !!t.special,
+      lstrip: !!t.lstrip,
+      rstrip: !!t.rstrip,
+      singleWord: !!t.single_word,
+      normalized: !!t.normalized,
+    }));
+
+    const { regex, addPrefixSpace } = readPreTokenizer(obj.pre_tokenizer);
+
+    return new BpeTokenizer({
+      vocab,
+      merges,
+      addedTokens: added,
+      pretokenizerRegex: regex ?? undefined,
+      pretokenizer: regex ? undefined : "gpt2",
+      addPrefixSpace,
+      unkToken: model.unk_token ?? undefined,
+    });
+  }
+
+  /**
+   * Load from a `vocab.json` object + raw `merges.txt` text.
+   * `opts.pretokenizer` selects the regex variant ("gpt2" default, or "qwen2").
+   */
+  static fromVocabAndMerges(
+    vocab: Record<string, number>,
+    mergesText: string,
+    opts: {
+      pretokenizer?: PretokVariant;
+      pretokenizerRegex?: string;
+      addedTokens?: AddedToken[];
+      addPrefixSpace?: boolean;
+      unkToken?: string;
+    } = {},
+  ): BpeTokenizer {
+    const merges: Array<[string, string]> = [];
+    for (const raw of mergesText.split("\n")) {
+      const line = raw.replace(/\r$/, "");
+      // Skip only the optional `#version:` header — NOT legitimate merges whose left
+      // piece is the '#' byte-token (e.g. `# #`, `## ##`, `#$ #$`), which are real BPE merges.
+      if (!line || line.startsWith("#version")) continue;
+      const sp = line.indexOf(" ");
+      if (sp < 0) continue;
+      merges.push([line.slice(0, sp), line.slice(sp + 1)]);
+    }
+    return new BpeTokenizer({
+      vocab,
+      merges,
+      addedTokens: opts.addedTokens,
+      pretokenizer: opts.pretokenizer ?? "gpt2",
+      pretokenizerRegex: opts.pretokenizerRegex,
+      addPrefixSpace: opts.addPrefixSpace,
+      unkToken: opts.unkToken,
+    });
+  }
+
+  // ---- core BPE ---------------------------------------------------------
+
+  private bpe(token: string): string[] {
+    const cached = this.cache.get(token);
+    if (cached) return cached;
+
+    let word = Array.from(token);
+    if (word.length < 2) {
+      this.cache.set(token, word);
+      return word;
+    }
+
+    for (;;) {
+      // find the lowest-rank adjacent pair.
+      let minRank = Infinity;
+      let first = "";
+      let second = "";
+      for (let i = 0; i < word.length - 1; i++) {
+        const rank = this.bpeRanks.get(word[i] + " " + word[i + 1]);
+        if (rank !== undefined && rank < minRank) {
+          minRank = rank;
+          first = word[i];
+          second = word[i + 1];
+        }
+      }
+      if (minRank === Infinity) break;
+
+      // merge every non-overlapping occurrence of (first, second).
+      const newWord: string[] = [];
+      let i = 0;
+      while (i < word.length) {
+        let j = -1;
+        for (let k = i; k < word.length; k++) {
+          if (word[k] === first) {
+            j = k;
+            break;
+          }
+        }
+        if (j === -1) {
+          for (let k = i; k < word.length; k++) newWord.push(word[k]);
+          break;
+        }
+        for (let k = i; k < j; k++) newWord.push(word[k]);
+        i = j;
+        if (i < word.length - 1 && word[i] === first && word[i + 1] === second) {
+          newWord.push(first + second);
+          i += 2;
+        } else {
+          newWord.push(word[i]);
+          i += 1;
+        }
+      }
+      word = newWord;
+      if (word.length === 1) break;
+    }
+
+    this.cache.set(token, word);
+    return word;
+  }
+
+  /** Encode one pre-token (already isolated by the regex) into ids. */
+  private encodePiece(piece: string, out: number[]): void {
+    const bytes = this.encoder.encode(piece);
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += this.byteToChar[bytes[i]];
+    for (const sub of this.bpe(s)) {
+      const id = this.vocab.get(sub);
+      if (id === undefined) {
+        if (this.unkToken && this.vocab.has(this.unkToken)) {
+          out.push(this.vocab.get(this.unkToken)!);
+          continue;
+        }
+        throw new Error("piece not in vocab: " + JSON.stringify(sub));
+      }
+      out.push(id);
+    }
+  }
+
+  private encodeNormal(text: string, out: number[]): void {
+    if (!text) return;
+    const matches = text.matchAll(this.pat);
+    for (const m of matches) this.encodePiece(m[0], out);
+  }
+
+  // ---- public API -------------------------------------------------------
+
+  encode(text: string): number[] {
+    if (this.addPrefixSpace && text.length && !/^\s/.test(text)) {
+      text = " " + text;
+    }
+    const out: number[] = [];
+    if (!this.splitRe) {
+      this.encodeNormal(text, out);
+      return out;
+    }
+    // Split on added/special tokens; odd chunks are the special tokens.
+    const parts = text.split(this.splitRe);
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!part) continue;
+      const special = this.specialByContent.get(part);
+      if (special) {
+        out.push(special.id);
+      } else {
+        this.encodeNormal(part, out);
+      }
+    }
+    return out;
+  }
+
+  decode(ids: number[], opts: { skipSpecialTokens?: boolean } = {}): string {
+    const skip = opts.skipSpecialTokens ?? false;
+    let bytes: number[] = [];
+    let result = "";
+    const flush = () => {
+      if (bytes.length) {
+        result += this.decoder.decode(new Uint8Array(bytes));
+        bytes = [];
+      }
+    };
+    for (const id of ids) {
+      const special = this.specialById.get(id);
+      if (special) {
+        flush();
+        if (!skip) result += special.content;
+        continue;
+      }
+      const tok = this.idToToken.get(id);
+      if (tok === undefined) continue;
+      for (const ch of tok) {
+        const b = this.charToByte.get(ch);
+        if (b !== undefined) bytes.push(b);
+      }
+    }
+    flush();
+    return result;
+  }
+
+  get vocabSize(): number {
+    return this.vocab.size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// helpers.
+// ---------------------------------------------------------------------------
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// merges can be ["a b", ...] or [["a","b"], ...] depending on tokenizer version.
+function normalizeMerges(merges: any[]): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const m of merges) {
+    if (typeof m === "string") {
+      const sp = m.indexOf(" ");
+      out.push([m.slice(0, sp), m.slice(sp + 1)]);
+    } else if (Array.isArray(m) && m.length === 2) {
+      out.push([m[0], m[1]]);
+    }
+  }
+  return out;
+}
+
+// Read a tokenizer.json pre_tokenizer node -> { explicit regex?, add_prefix_space }.
+function readPreTokenizer(
+  pt: any,
+): { regex: string | null; addPrefixSpace: boolean } {
+  let regex: string | null = null;
+  let addPrefixSpace = false;
+  const visit = (node: any) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const n of node) visit(n);
+      return;
+    }
+    switch (node.type) {
+      case "Sequence":
+        visit(node.pretokenizers);
+        break;
+      case "Split":
+        if (node.pattern && typeof node.pattern.Regex === "string") {
+          regex = node.pattern.Regex;
+        }
+        break;
+      case "ByteLevel":
+        if (typeof node.add_prefix_space === "boolean") {
+          addPrefixSpace = node.add_prefix_space;
+        }
+        break;
+      default:
+        // Some configs nest a list under `pretokenizers` without a Sequence type.
+        if (node.pretokenizers) visit(node.pretokenizers);
+        break;
+    }
+  };
+  visit(pt);
+  return { regex, addPrefixSpace };
+}
+// ===== BPE TOKENIZER END =====
+
 interface ShardCfg { H: number; NH: number; NKV: number; HD: number; INT: number; eps: number; theta: number }
 function f16ToF32(h: number): number {
   const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x03ff;
@@ -577,7 +1060,7 @@ async function computeShard(req: { kernel: string; a: string; b?: string; bRef?:
 // The coordinator streams this stage's config.json + per-stage safetensors via push_begin/push_chunk (download-
 // free), then shard_load parses them into GPU-ready weights and shard_forward runs the stage's decoder blocks
 // (hidden→hidden). This is what makes a WebGPU device a real shard host (not just an offloaded-kernel donor).
-const SHARD_STAGE = new Map<string, { weights: Map<string, { data: Float32Array }>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]> }>();
+const SHARD_STAGE = new Map<string, { weights: Map<string, { data: Float32Array }>; cfg: ShardCfg; start: number; end: number; first: boolean; last: boolean; vocab: number; kv: Map<string, LayerKV[]>; tok: BpeTokenizer | null }>();
 const SHARD_PUSH = new Map<string, Map<string, Uint8Array[]>>(); // id → filename → streamed chunks (in-memory staging)
 function cfgFromJson(txt: string): { cfg: ShardCfg; vocab: number } {
   const c = JSON.parse(txt) as Record<string, number>;
@@ -600,7 +1083,11 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     const first = !!p.first, last = !!p.last;
     if (first && !weights.get('model.embed_tokens.weight')) throw new Error('first stage needs model.embed_tokens.weight (not streamed)');
     if (last && !weights.get('model.norm.weight')) throw new Error('last stage needs model.norm.weight (not streamed)');
-    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map() }); SHARD_PUSH.delete(id);
+    // Optional: a FIRST stage may carry the model's tokenizer.json so it can accept raw TEXT (encode on-stage),
+    // making a browser/Deno tab a self-contained first stage — no client-side tokenizer needed. Ids still work too.
+    const tokBytes = first ? join('tokenizer.json') : null;
+    const tok = tokBytes ? BpeTokenizer.fromTokenizerJson(JSON.parse(new TextDecoder().decode(tokBytes))) : null;
+    SHARD_STAGE.set(id, { weights, cfg, start: Number(p.start), end: Number(p.end), first, last, vocab, kv: new Map(), tok }); SHARD_PUSH.delete(id);
     let held = 0; for (const w of weights.values()) held += w.data.length;
     return { ok: true, params_held: held, layers: Number(p.end) - Number(p.start) };
   }
@@ -612,7 +1099,14 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
     const w = (n: string) => st.weights.get(n)?.data;
     // stage INPUT → hidden [seqNew, H]
     let h: Float32Array, seqNew: number;
-    if (st.first) { const ids = p.input_ids as number[]; seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H); }
+    if (st.first) {
+      // input_ids from the client, OR raw text tokenized on-stage (if a tokenizer.json was staged with this first stage).
+      let ids: number[];
+      if (Array.isArray(p.input_ids)) ids = p.input_ids as number[];
+      else if (typeof p.prompt === 'string' && st.tok) ids = st.tok.encode(p.prompt);
+      else throw new Error('first stage: need input_ids, or prompt text + a staged tokenizer.json');
+      seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H);
+    }
     else { seqNew = Number(p.seq); h = b64ToF32(String(p.hidden)); }
     // run this stage's decoder blocks (cached KV or uncached full-sequence)
     if (cached) {
