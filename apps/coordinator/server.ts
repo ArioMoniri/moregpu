@@ -623,7 +623,7 @@ const shardLoads = new Map<string, ShardLoadState>();
 // the ordered stages (which worker owns which layer range + which is first/last); /model/shard_forward
 // pipes the hidden state stage→stage (only [seq×hidden] activations cross the wire, never the weights).
 interface ShardStage { worker: string; start: number; end: number; first: boolean; last: boolean }
-const shardPlans = new Map<string, { model: string; stages: ShardStage[]; fp16?: boolean; quant?: string }>();
+const shardPlans = new Map<string, { model: string; stages: ShardStage[]; fp16?: boolean; quant?: string; actq?: string }>();
 // POST-LOAD failover keeps the download-free streaming inputs beside each ready plan, so ONE stage can be re-streamed
 // to a fresh worker without redoing the /model/shard preflight. push:false shards carry nulls. Lifecycle = shardPlans.
 type ShardStream = { model: string; push: boolean; configText: string | null; stPlan: STPlan | null };
@@ -1219,9 +1219,15 @@ async function shardPipe(sid: string, input_ids: number[], returnLogits: boolean
       const st = plan.stages[i]; const w = workers.get(st.worker);
       if (!w) { failedIdx = i; failErr = `stage worker ${st.worker} disconnected`; break; }
       const payload: Record<string, unknown> = { id: sid, first: st.first, last: st.last };
-      if (st.first) payload.input_ids = ids; else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
+      if (st.first) payload.input_ids = ids;
+      else if (carry.actq === 'int8') { payload.actq = 'int8'; payload.hidden_q = carry.hidden_q; payload.seq = carry.seq; } // int8 activation wire (relayed opaquely)
+      else { payload.hidden = carry.hidden; payload.seq = carry.seq; }
       if (cache) { payload.cached = true; payload.session = cache.session; payload.pos = epos; }
       if (st.last && returnLogits) payload.return_logits = true;
+      // opt-in int8 activation wire: this stage int8-encodes its output ONLY when the NEXT stage exists and is not
+      // the last (keep fp32 into the head boundary — logits are the most argmax-sensitive, and quant error compounds).
+      const next = plan.stages[i + 1];
+      if (plan.actq === 'int8' && next && !next.last) payload.actq_out = 'int8';
       ringStat(sid).shardForwards++; // PEER-TRANSPORT proof counter: one per-token activation RELAYED through the coordinator
       const r = await modelRPC(w, 'shard_forward', payload);
       if (!r.ok) {
@@ -2019,8 +2025,9 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       backbone: plan?.backbone, holders: plan?.holders.map((h) => h.worker) ?? [], injects: st.injects, completes: st.completes, dispatches: st.dispatches });
   }
   if (req.method === 'POST' && url.pathname === '/model/shard') {
-    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; split?: number[]; push?: boolean; async?: boolean; fp16?: boolean; quant?: string };
+    const body = await req.json().catch(() => ({})) as { model?: string; id?: string; layers?: number; workers?: string[]; split?: number[]; push?: boolean; async?: boolean; fp16?: boolean; quant?: string; actq?: string };
     if (!body.model) return json({ error: 'need {model} (GPT-2 / Llama-family)' }, 400);
+    if (body.actq !== undefined && body.actq !== 'int8') return json({ error: `bad {actq} "${body.actq}" — only "int8" (opt-in int8 activation wire between middle stages; ~4x smaller, lossy — fp32 is kept into the last stage)` }, 400);
     if (body.push && !HF_REPO_RE.test(body.model)) return json({ error: `bad model ref "${body.model}" for download-free shard` }, 400);
     // int8 / nf4 (bitsandbytes) — CUDA-only, and NON-PUSH only: a quantized stage is built by the worker's own
     // from_pretrained, so it can't be assembled from a streamed per-stage safetensors. Reject bad combos up front.
@@ -2041,7 +2048,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     if (cands.length === 0) return json({ error: 'no shard-capable worker connected — start apps/worker/worker_torch.py (or a WebGPU worker advertising the "shard" cap); pipeline sharding needs ≥1 (≥2 for a real split)' }, 503);
     const sid = body.id ?? body.model;
     if (shardPlans.has(sid)) return json({ error: `shard ${sid} already loaded — POST /model/shard_unload first`, id: sid }, 409);
-    shardPlans.set(sid, { model: body.model, stages: [], fp16: !!body.fp16, quant: body.quant }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
+    shardPlans.set(sid, { model: body.model, stages: [], fp16: !!body.fp16, quant: body.quant, actq: body.actq }); // RESERVE synchronously so a concurrent same-id shard 409s (TOCTOU)
     const fail = (msg: string, code: number) => { shardPlans.delete(sid); shardStreams.delete(sid); return json({ error: msg, id: sid }, code); };
     // DOWNLOAD-FREE: fetch config + the safetensors header ON THE COORDINATOR (no worker download), so the
     // fleet gets only its per-stage slice. Also gives the real layer count without a worker-side model_load.
@@ -2133,7 +2140,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       }
       if (shardLoads.get(sid)?.aborted) { await unloadAll(); throw new Error('shard load aborted (deadline)'); }
       shardStreams.set(sid, { model, push, configText, stPlan }); // keep streaming inputs so a POST-LOAD failover can re-stream one stage to a fresh worker
-      shardPlans.set(sid, { model, stages, fp16: !!body.fp16, quant: body.quant }); // finalize the reservation with the real plan (unblocks shard_forward)
+      shardPlans.set(sid, { model, stages, fp16: !!body.fp16, quant: body.quant, actq: body.actq }); // finalize the reservation with the real plan (unblocks shard_forward)
       log('info', `sharded ${model} (${nLayer} layers) → ${nStages} stages${push ? ' [download-free]' : ''}: ${stages.map((s) => `${s.worker}[${s.start}-${s.end})`).join(' → ')}`);
       if (PEER_TRANSPORT) { try { await wireRing(sid); } catch (e) { log('warn', `ring wiring failed for ${sid}: ${e instanceof Error ? e.message : e}`); } } // opt-in: wire the worker->worker ring (relay stays the fallback)
       return info;

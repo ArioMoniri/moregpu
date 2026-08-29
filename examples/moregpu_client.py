@@ -244,7 +244,7 @@ class MoreGPU:
     # one per torch worker; each worker holds ONLY its stage. Needs apps/worker/worker_torch.py (≥2 for a real split). ----
     def shard_load(self, model: str, layers: int | None = None, workers: Sequence[str] | None = None,
                    id: str | None = None, push: bool = False, quant: str | None = None,
-                   split: Sequence[int] | None = None, fp16: bool = False) -> dict:
+                   split: Sequence[int] | None = None, fp16: bool = False, actq: str | None = None) -> dict:
         """Split `model`'s transformer layers into contiguous stages across the workers. GPT-2 / Llama-family.
         push=True → download-free: the coordinator streams each worker only its stage's weights (no fleet download).
         quant → smaller stages: "wq8"/"wq4" (the coordinator quantizes each stage to int8/int4 + scale before
@@ -266,6 +266,8 @@ class MoreGPU:
             body["split"] = list(split)
         if fp16:
             body["fp16"] = True
+        if actq:
+            body["actq"] = actq
         return self._req("/model/shard", "POST", body)
 
     def shard_chat(self, prompt: str, id: str | None = None, max_new_tokens: int = 64) -> dict:

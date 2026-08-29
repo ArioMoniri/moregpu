@@ -109,7 +109,7 @@ class Pool:
                          {"input_ids": list(ids), "max_new_tokens": max_new_tokens}).get("tokens", [])
 
     # ---- pipeline sharding (split a model across workers; optionally quantized) ----
-    def shard_load(self, model, push=True, quant=None, split=None, layers=None):
+    def shard_load(self, model, push=True, quant=None, split=None, layers=None, actq=None):
         body = {"model": model, "push": bool(push), "async": True}
         if quant:
             body["quant"] = quant
@@ -117,6 +117,8 @@ class Pool:
             body["split"] = split
         if layers:
             body["layers"] = layers
+        if actq:
+            body["actq"] = actq
         return self._req("/model/shard", "POST", body)
 
     def shard_status(self, sid=None):
@@ -341,8 +343,8 @@ def cmd_shard(args) -> int:
     if args.quant in ("int8", "nf4", "auto"):
         push = False
     split = [int(x) for x in args.split.split(",")] if args.split else None
-    print(f"sharding {args.model}" + (f" · quant={args.quant}" if args.quant else "") + (" · download-free" if push else "") + " …")
-    r = pool.shard_load(args.model, push=push, quant=args.quant, split=split, layers=args.layers)
+    print(f"sharding {args.model}" + (f" · quant={args.quant}" if args.quant else "") + (f" · actq={args.actq}" if args.actq else "") + (" · download-free" if push else "") + " …")
+    r = pool.shard_load(args.model, push=push, quant=args.quant, split=split, layers=args.layers, actq=args.actq)
     sid = r.get("id", args.model)
     if r.get("error") and not r.get("stages"):
         print("shard failed:", r.get("error"))
@@ -427,6 +429,8 @@ def main(argv=None) -> int:
     sh.add_argument("--quant", choices=["wq8", "wq4", "int8", "nf4", "auto"],
                     help="wq8/wq4: the coordinator quantizes each stage to int8/int4 + scale and streams it (any "
                          "WebGPU worker, download-free); int8/nf4/auto: bitsandbytes on a CUDA torch worker (non-push)")
+    sh.add_argument("--actq", choices=["int8"], help="int8 activation wire between MIDDLE stages (~4x smaller "
+                    "per-hop; lossy, kept fp32 into the last stage) — cuts the recurring per-token bandwidth")
     sh.add_argument("--split", help="explicit per-stage layer counts for a heterogeneous fleet, e.g. 12,24")
     sh.add_argument("--layers", type=int, help="override the model's layer count (if config can't be read)")
     sh.add_argument("--prompt", help="after sharding, run this prompt through the pipeline (text in → text out)")

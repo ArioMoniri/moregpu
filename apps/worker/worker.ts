@@ -1029,6 +1029,25 @@ async function seal(key: Uint8Array, plain: Uint8Array) { const iv = crypto.getR
 async function unseal(key: Uint8Array, blob: { iv: string; ct: string }) { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(blob.iv) as BufferSource }, await importKey(key), b64d(blob.ct) as BufferSource)); }
 const f32ToB64 = (a: Float32Array) => b64e(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
 const b64ToF32 = (s: string) => new Float32Array(b64d(s).buffer);
+// INT8 ACTIVATION WIRE (opt-in) — a stage's [seq,H] hidden crosses the wire as symmetric per-ROW (per-token)
+// int8 + one f32 scale/row instead of fp32 (~4x smaller). BYTE-IDENTICAL with worker_torch.py's actq_encode
+// (both stages of a boundary must agree): scale = fround(maxAbs/127) [f64 divide → f32], q = round-half-away-
+// from-zero of the f64 quotient, clamp [-127,127]. Lossy (per-hop, compounds) — used only where the plan enables it.
+function actqEncode(h: Float32Array, seq: number, H: number): { qB64: string; scaleB64: string } {
+  const q = new Int8Array(seq * H), scale = new Float32Array(seq);
+  for (let i = 0; i < seq; i++) {
+    const base = i * H; let maxAbs = 0;
+    for (let j = 0; j < H; j++) { const a = Math.abs(h[base + j]); if (a > maxAbs) maxAbs = a; }
+    const s = Math.fround(maxAbs / 127); scale[i] = s; const denom = s === 0 ? 1 : s;
+    for (let j = 0; j < H; j++) { const v = h[base + j] / denom; let qi = Math.floor(Math.abs(v) + 0.5); if (v < 0) qi = -qi; q[base + j] = qi > 127 ? 127 : qi < -127 ? -127 : qi; }
+  }
+  return { qB64: b64e(new Uint8Array(q.buffer)), scaleB64: b64e(new Uint8Array(scale.buffer)) };
+}
+function actqDecode(qB64: string, scaleB64: string, seq: number, H: number): Float32Array {
+  const q = new Int8Array(b64d(qB64).buffer), scale = new Float32Array(b64d(scaleB64).buffer), out = new Float32Array(seq * H);
+  for (let i = 0; i < seq; i++) { const s = scale[i], base = i * H; for (let j = 0; j < H; j++) out[base + j] = Math.fround(q[base + j] * s); }
+  return out;
+}
 
 // ---------- Ed25519 result signing (per-worker authenticity + tamper-evidence) ----------
 // The worker signs every result with a fresh keypair; the coordinator verifies against the public key
@@ -1178,7 +1197,7 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
       else throw new Error('first stage: need input_ids, or prompt text + a staged tokenizer.json');
       seqNew = ids.length; const embW = w('model.embed_tokens.weight')!; h = await rt.embed(ids, embW, H);
     }
-    else { seqNew = Number(p.seq); h = b64ToF32(String(p.hidden)); }
+    else { seqNew = Number(p.seq); h = (p.actq === 'int8' && p.hidden_q) ? actqDecode((p.hidden_q as { qB64: string }).qB64, (p.hidden_q as { scaleB64: string }).scaleB64, seqNew, H) : b64ToF32(String(p.hidden)); }
     // run this stage's decoder blocks (cached KV or uncached full-sequence)
     if (cached) {
       const key = String(p.session); let kv = st.kv.get(key); if (!kv || past === 0) { kv = rt.newCache(st.end - st.start); st.kv.set(key, kv); }
@@ -1198,7 +1217,9 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
       if (cached) res.past = past + seqNew;
       return res;
     }
-    const res: Record<string, unknown> = { ok: true, hidden: f32ToB64(h), seq: seqNew, hidden_dim: H };
+    // hidden → next stage: opt-in int8 activation wire (p.actq_out set by the coordinator for non-last-input boundaries).
+    const res: Record<string, unknown> = { ok: true, seq: seqNew, hidden_dim: H };
+    if (p.actq_out === 'int8') { res.hidden_q = actqEncode(h, seqNew, H); res.actq = 'int8'; } else res.hidden = f32ToB64(h);
     if (cached) res.past = past + seqNew;
     return res;
   }
