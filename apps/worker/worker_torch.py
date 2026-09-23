@@ -182,7 +182,7 @@ TORCH_POOL = ThreadPoolExecutor(max_workers=1)
 # Compute ops that count toward the node's DUTY (the admin slider's ceiling throttles these — a kernel shard,
 # a resident/pipeline forward, a training step). Transfer/control ops (push_*/ping/load/unload/arch) are never
 # throttled (throttling a weight stream would just make loading slower for no benefit).
-_PACED_OPS = {"forward", "generate", "chat", "shard_forward", "inner", "step", "task_inner"}
+_PACED_OPS = {"forward", "generate", "chat", "shard_forward", "inner", "step", "task_inner", "vision_predict", "vision_infer"}
 def _paced(fn, args, ceil_val, pace_it=True):
     """Run a compute op on the TORCH_POOL thread, then, if the duty ceiling < 100%, sleep so the thread is busy
     at most `ceil_val` of the time — a real duty-cycle throttle. Since the pool is single-threaded, sleeping here
@@ -405,9 +405,12 @@ from moregpu_worker.data.plane import DataPlane  # noqa: E402
 from moregpu_worker.data import ops as DATA_OPS  # noqa: E402
 DATA = DataPlane()   # policy from MOREGPU_DATA_ROOTS / MOREGPU_DATA_HOSTS / MOREGPU_DATA_BUCKETS; cache created lazily
 RUNNER = TaskRunner(SESSIONS, DEV, data_plane=DATA)
+from moregpu_worker.vision.infer import InferenceStore, OPS as VISION_OPS  # noqa: E402
+VISION = InferenceStore(DEV, plane=DATA)   # exported segment/classify/encoder models; outputs under MOREGPU_OUTPUT_DIR
 
 def train_dispatch(op: str, payload: dict) -> dict:
     if op in DATA_OPS.OPS: return DATA_OPS.handle(DATA, op, payload)                # vision data plane (ADR-0110)
+    if op in VISION_OPS: return VISION.handle(op, payload)                          # vision inference (ADR-0112)
     if op.startswith("task_"): return RUNNER.handle(op, payload)   # generic TrainTask sessions (ADR-0105)
     if op == "load": return train_load(payload)
     if op == "step": return train_step(payload)
