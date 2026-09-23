@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "examples"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "apps", "worker"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "clients", "python"))
 from _pool import Pool, Checks  # noqa: E402
 import segment_finetune, vision_batch  # noqa: E402
 from moregpu_worker.train.synthetic import SyntheticSeg  # noqa: E402
@@ -45,6 +46,18 @@ def main():
         dices = [x["data"]["dice"]["1"] for x in full["results"] if x["ok"]]
         ck(all(d is not None and 0 <= d <= 1 for d in dices) and np.mean(dices) > 0.4, f"per-volume organ Dice reported (mean {np.mean(dices):.3f})")
         ck(any(t["kind"] == "job" for t in full["telemetry"]), "job telemetry record emitted")
+        # tile sharding: each volume split across the live workers; output must equal the case-level prediction
+        from moregpu import MoreGPU
+        sdk = MoreGPU(f"http://127.0.0.1:{pool.port}", pool.admin)
+        tj = sdk.vision_batch("seg", [{"ref": {"uri": f"file://v{v}.npy"}, "out": f"tiled_{v}", "mask": {"uri": f"file://g{v}.npy"}} for v in range(3)],
+                              split="tiles", tta="none")
+        tr = sdk.vision_wait(tj["job"], poll_s=0.3)
+        tfull = sdk.vision_job(tj["job"], results=True)
+        cj = sdk.vision_wait(sdk.vision_batch("seg", [{"ref": {"uri": f"file://v{v}.npy"}, "out": f"case_{v}"} for v in range(3)], tta="none")["job"], poll_s=0.3)
+        cfull = sdk.vision_job(cj["id"], results=True)
+        agree = [float((np.load(a["data"]["path"]) == np.load(b["data"]["path"])).mean()) for a, b in zip(tfull["results"], cfull["results"])]
+        ck(tr["status"] == "done" and min(agree) == 1.0 and all(x["data"]["n_parts"] >= 2 for x in tfull["results"]),
+           f"tile-sharded prediction == case-level prediction on {tfull['results'][0]['data']['n_parts']} workers (agreement {min(agree):.4f})")
     ck.finish()
 
 

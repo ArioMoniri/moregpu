@@ -112,3 +112,30 @@ def test_published_model_via_adapter_predicts_volume(tmp_path, monkeypatch):
         ref = m.eval()(torch.from_numpy(vol)[None, None]).argmax(1)[0].numpy()
     assert (np.load(r["path"]) == ref).mean() > 0.999
     MO.handle("vision_unload", {"id": "pub"})
+
+
+def _b64(a):
+    return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
+
+
+@pytest.mark.parametrize("kind", ["2p5d", "3d"])
+def test_tile_sharded_prediction_equals_single_node(exported, tmp_path, kind):
+    if kind == "3d":
+        cfg = {**SEG, "kind": "3d", "synthetic": {"kind": "3d", "n": 2, "size": [16, 16, 16], "channels": 1, "seed": 0},
+               "encoder": {"init": "random", "model": "micro", "patch": [4, 8, 8]}}
+        t = R.create("segment"); t.init(cfg, TaskContext(device="cpu", amp="fp32")); t.export("safetensors", str(tmp_path / "m"))
+        path = str(tmp_path / "m"); vol = np.random.default_rng(0).standard_normal((30, 20, 24)).astype("float32")
+    else:
+        _, path = exported; vol = np.random.default_rng(0).standard_normal((11, 40, 36)).astype("float32")
+    root = tmp_path / "dd"; root.mkdir(); np.save(root / "v.npy", vol); np.save(root / "g.npy", (vol > 0).astype("uint8"))
+    stores = [InferenceStore(device="cpu", plane=_plane(root), out_root=str(tmp_path / "o")) for _ in range(3)]
+    for s in stores:
+        s.handle("vision_infer_load", {"id": "m", "export": path})
+    single = stores[0].handle("vision_predict", {"id": "m", "ref": {"uri": "file://v.npy"}, "out": "single", "overlap": 0.5})
+    parts = [s.handle("vision_predict_part", {"id": "m", "ref": {"uri": "file://v.npy"}, "part": [k, 3], "overlap": 0.5})
+             for k, s in enumerate(stores)]
+    assert sum(p["n_units"] for p in parts) > 0
+    w = stores[0].handle("vision_merge_write", {"id": "m", "parts": parts, "out": "tiled", "mask": {"uri": "file://g.npy"}})
+    a, b = np.load(single["path"]), np.load(w["path"])
+    assert a.shape == b.shape and (a == b).mean() >= 0.9999
+    assert "dice" in w and w["n_parts"] == 3

@@ -1819,14 +1819,14 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
       return r.ok ? json({ ok: true, worker: w, ...r.data }) : json({ error: r.error }, 502);
     }
     if (action === 'batch' && req.method === 'POST') {
-      const body = await req.json().catch(() => ({})) as { id?: string; items?: BatchItem[]; workers?: string[]; tta?: string; overlap?: number; sw_batch?: number; blend?: string; normalize?: unknown; steal_after_ms?: number; max_attempts?: number };
+      const body = await req.json().catch(() => ({})) as { id?: string; items?: BatchItem[]; workers?: string[]; tta?: string; overlap?: number; sw_batch?: number; blend?: string; normalize?: unknown; steal_after_ms?: number; max_attempts?: number; split?: 'cases' | 'tiles' };
       const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model — POST /vision/load first' }, 404);
       if (!Array.isArray(body.items) || !body.items.length) return json({ error: 'items must be a non-empty array of {ref, out, mask?}' }, 400);
       const ws = (body.workers?.length ? body.workers.filter((w) => m.workers.includes(w)) : m.workers).filter((w) => workers.has(w));
       if (!ws.length) return json({ error: 'no live worker holds this model' }, 503);
       const id = `vj-${crypto.randomUUID().slice(0, 8)}`;
       const job = new VisionBatch(id, body.id!, body.items, ws, tsRpc, { tta: body.tta, overlap: body.overlap, sw_batch: body.sw_batch, blend: body.blend,
-        normalize: body.normalize, stealAfterMs: body.steal_after_ms, maxAttempts: body.max_attempts, telemetry: tsTelemetrySink(id) });
+        normalize: body.normalize, split: body.split, stealAfterMs: body.steal_after_ms, maxAttempts: body.max_attempts, telemetry: tsTelemetrySink(id) });
       visionJobs.set(id, job);
       job.run().catch((e) => log('warn', `vision job ${id}: ${(e as Error).message}`));
       return json({ ok: true, job: id, workers: ws, items: body.items.length });

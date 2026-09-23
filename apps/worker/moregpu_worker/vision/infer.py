@@ -14,11 +14,19 @@ import torch
 import torch.nn.functional as F
 
 from . import losses as L
-from .sliding import predict as sw_predict
+from .sliding import predict as sw_predict, sliding_window_part, merge_parts
 from .models import load_exported
 
 OPS = frozenset({"vision_infer_load", "vision_infer", "vision_predict", "vision_infer_describe", "vision_infer_unload",
-                 "vision_infer_list"})
+                 "vision_infer_list", "vision_predict_part", "vision_merge_write"})
+
+
+def _b64(a: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
+
+
+def _unb64(s: str, dtype, shape) -> np.ndarray:
+    return np.frombuffer(base64.b64decode(s), dtype=dtype).reshape(shape)
 
 
 class _AdapterModule(torch.nn.Module):
@@ -103,6 +111,76 @@ class InferenceStore:
         os.makedirs(os.path.dirname(path) or self.out_root, exist_ok=True)
         return path
 
+    # -------------------------------------------------------------- tile sharding (one volume across workers)
+    def _load_volume(self, p):
+        from ..data.refs import Ref
+        vol = np.asarray(self.plane.read(Ref.from_json(p["ref"])), dtype=np.float32)
+        norm = p.get("normalize")
+        if norm:
+            vol = (vol - float(norm.get("mean", 0.0))) / float(norm.get("std", 1.0))
+        return vol
+
+    @torch.no_grad()
+    def _predict_part(self, p):
+        """Part k of n of one volume. 3D: this worker's share of the sliding-window tiles → weighted-sum accumulators
+        over the z-slab they touch (f32). 2.5D: a contiguous slice range → uint8 labels. Merged by vision_merge_write."""
+        t0 = time.perf_counter()
+        m = self._get(p["id"]); meta = m["meta"]
+        k, n = (int(v) for v in p["part"])
+        vol = self._load_volume(p)
+        t1 = time.perf_counter()
+        if meta["kind"] == "3d":
+            roi = tuple(meta["encoder"]["img_size"])
+            r = sliding_window_part(torch.from_numpy(vol)[None, None].to(self.device), roi, int(p.get("sw_batch", 4)), m["model"],
+                                    float(p.get("overlap", 0.5)), p.get("blend", "gaussian"), part=(k, n))
+            out = {"ok": True, "kind": "3d", "k": k, "n": n, "n_units": r["n_tiles"], "z0": r["z0"], "vol_shape": list(vol.shape),
+                   "roi": list(roi), "padded_shape": r["padded_shape"]}
+            if r["sum"] is not None:
+                out.update(sum_shape=list(r["sum"].shape), sum=_b64(r["sum"].cpu().numpy().astype("<f4")),
+                           cnt=_b64(r["cnt"].cpu().numpy().astype("<f4")))
+        else:
+            Z = vol.shape[0]; z0, z1 = (Z * k) // n, (Z * (k + 1)) // n
+            labels = self._predict_2p5d(m, vol, range(z0, z1), p.get("tta", "none"), int(p.get("sw_batch", 8)))
+            out = {"ok": True, "kind": "2p5d", "k": k, "n": n, "n_units": z1 - z0, "z0": z0, "vol_shape": list(vol.shape),
+                   "labels_shape": list(labels.shape), "labels": _b64(labels.astype(np.uint8))}
+        out["timings"] = {"data_s": t1 - t0, "compute_s": time.perf_counter() - t1}
+        return out
+
+    def _merge_write(self, p):
+        from ..data.refs import Ref
+        m = self._get(p["id"]); parts = sorted(p["parts"], key=lambda q: q["k"])
+        shape = tuple(parts[0]["vol_shape"])
+        if parts[0]["kind"] == "3d":
+            ps = [{"z0": q["z0"], "n_tiles": q["n_units"],
+                   "sum": torch.from_numpy(_unb64(q["sum"], "<f4", q["sum_shape"]).copy()) if q.get("sum") else None,
+                   "cnt": torch.from_numpy(_unb64(q["cnt"], "<f4", [1, 1] + q["sum_shape"][2:]).copy()) if q.get("cnt") else None}
+                  for q in parts]
+            pred = merge_parts(ps, (1, 1) + shape, tuple(parts[0]["roi"]))[0].argmax(0).numpy().astype(np.uint8)
+        else:
+            pred = np.concatenate([_unb64(q["labels"], np.uint8, q["labels_shape"]) for q in parts if q["n_units"]], axis=0)
+        out_path = self._out_path(p["out"] + (".npy" if not p["out"].endswith(".npy") else ""))
+        np.save(out_path, pred)
+        res = {"ok": True, "path": out_path, "shape": list(pred.shape), "n_parts": len(parts)}
+        if p.get("mask"):
+            gt = torch.as_tensor(np.asarray(self.plane.read(Ref.from_json(p["mask"]))).astype(np.int64))
+            d = L.dice_per_class(torch.from_numpy(pred.astype(np.int64))[None, None], gt[None, None], m["meta"]["num_classes"])[0]
+            res["dice"] = {str(i + 1): (None if torch.isnan(d[i]) else float(d[i])) for i in range(d.shape[0])}
+        return res
+
+    def _predict_2p5d(self, m, vol: np.ndarray, zs, tta: str, sw_batch: int) -> np.ndarray:
+        meta, model = m["meta"], m["model"]
+        size = tuple(meta["encoder"]["img_size"])
+        c = int(meta["encoder"]["in_chans"]); Z, H, W = vol.shape; half = c // 2
+        v = torch.from_numpy(vol); zs = list(zs); preds = []
+        for i in range(0, len(zs), sw_batch):
+            chunk = zs[i:i + sw_batch]
+            win = torch.stack([v[[min(Z - 1, max(0, z + kk)) for kk in range(-half, c - half)]] for z in chunk])
+            win = F.interpolate(win, size=size, mode="bilinear", align_corners=False).to(self.device)
+            lg = sw_predict(win, model, roi=None, tta=tta)
+            lg = F.interpolate(lg.float(), size=(H, W), mode="bilinear", align_corners=False)
+            preds.append(lg.argmax(1).cpu())
+        return (torch.cat(preds) if preds else torch.zeros((0, H, W), dtype=torch.long)).numpy()
+
     @torch.no_grad()
     def _predict(self, p):
         from ..data.refs import Ref
@@ -125,18 +203,7 @@ class InferenceStore:
                                 mode=p.get("blend", "gaussian"), tta=tta)[0]
             pred = logits.argmax(0)
         else:
-            c = int(meta["encoder"]["in_chans"]); Z, H, W = vol.shape
-            v = torch.from_numpy(vol)
-            half = c // 2
-            preds = []
-            for z0 in range(0, Z, sw_batch):
-                zs = range(z0, min(Z, z0 + sw_batch))
-                win = torch.stack([v[[min(Z - 1, max(0, z + k)) for k in range(-half, c - half)]] for z in zs])
-                win = F.interpolate(win, size=size, mode="bilinear", align_corners=False).to(self.device)
-                lg = sw_predict(win, model, roi=None, tta=tta)
-                lg = F.interpolate(lg.float(), size=(H, W), mode="bilinear", align_corners=False)
-                preds.append(lg.argmax(1).cpu())
-            pred = torch.cat(preds)
+            pred = torch.from_numpy(self._predict_2p5d(m, vol, range(vol.shape[0]), tta, sw_batch))
         t2 = time.perf_counter()
         pred_np = pred.cpu().numpy().astype(np.uint8)
         np.save(out_path, pred_np)

@@ -56,3 +56,30 @@ describe('VisionBatch (pull-based work queue with stealing + churn retry)', () =
     expect(recs.at(-1).kind).toBe('job'); expect(recs.at(-1).items).toBe(50);
   });
 });
+
+describe('VisionBatch split=tiles (one volume across all workers)', () => {
+  it('each item is split into one part per worker, merged once, part failures retried on another worker', async () => {
+    const calls: Array<[string, string, any]> = [];
+    let failOnce = true;
+    const rpc: Rpc = async (w, op, p) => {
+      calls.push([w, op, p]);
+      await new Promise((r) => setTimeout(r, 2));
+      if (op === 'vision_predict_part') {
+        if (w === 'b' && failOnce) { failOnce = false; return { ok: false, error: 'worker disconnected' }; }
+        return { ok: true, data: { k: p.part[0], n: p.part[1], n_units: 1, kind: '3d', timings: { compute_s: 0.001 } } };
+      }
+      if (op === 'vision_merge_write') return { ok: true, data: { path: `/out/${p.out}.npy`, n_parts: p.parts.length, dice: { '1': 0.9 } } };
+      return { ok: false, error: 'unexpected' };
+    };
+    const b = new VisionBatch('j', 'm', items(2), ['a', 'b', 'c'], rpc, { split: 'tiles' });
+    const r = await b.run();
+    expect(r.done).toBe(2); expect(r.failed).toBe(0);
+    const merges = calls.filter((c) => c[1] === 'vision_merge_write');
+    expect(merges).toHaveLength(2);
+    expect(merges[0]![2].parts.map((x: any) => x.k).sort()).toEqual([0, 1, 2]);   // 3 live workers → 3 parts
+    expect(merges[1]![2].parts.map((x: any) => x.k).sort()).toEqual([0, 1]);      // b died → re-split across 2
+    expect(b.deadWorkers).toEqual(['b']);
+    expect(b.results[0]!.data!.latency_s).toBeGreaterThan(0);
+    expect(r.retries).toBeGreaterThan(0);
+  });
+});

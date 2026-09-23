@@ -52,3 +52,25 @@ def test_flip_tta_is_average_of_flipped_predictions():
     assert torch.allclose(y, ref, atol=1e-6)
     with torch.no_grad():
         assert torch.allclose(SW.predict(x, conv, roi=(8, 8), overlap=0.5, mode="constant"), SW.sliding_window(x, (8, 8), 4, conv, 0.5), atol=1e-6)
+
+
+@pytest.mark.parametrize("n_parts", [1, 2, 3, 5])
+def test_tile_sharded_sliding_window_equals_single_node(n_parts):
+    conv = _conv(3)
+    x = torch.from_numpy(G["sw3_x"])
+    with torch.no_grad():
+        ref = SW.sliding_window(x, (8, 8, 8), 3, conv, overlap=0.5, mode="gaussian")
+        parts = [SW.sliding_window_part(x, (8, 8, 8), 3, conv, 0.5, "gaussian", part=(k, n_parts)) for k in range(n_parts)]
+        got = SW.merge_parts(parts, x.shape, (8, 8, 8))
+    assert torch.allclose(got, ref, atol=1e-5)
+    assert sum(p["n_tiles"] for p in parts) == SW.count_tiles(x.shape, (8, 8, 8), 0.5)
+
+
+def test_tile_parts_with_padding_small_volume():
+    conv = _conv(3)
+    x = torch.randn(1, 1, 5, 20, 9)
+    with torch.no_grad():
+        ref = SW.sliding_window(x, (8, 8, 8), 2, conv, overlap=0.25, mode="constant")
+        got = SW.merge_parts([SW.sliding_window_part(x, (8, 8, 8), 2, conv, 0.25, "constant", part=(k, 2)) for k in range(2)],
+                             x.shape, (8, 8, 8))
+    assert torch.allclose(got, ref, atol=1e-5)

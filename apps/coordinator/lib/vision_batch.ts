@@ -8,6 +8,7 @@ export interface RpcResult { ok: boolean; data?: Record<string, unknown>; error?
 export type Rpc = (workerId: string, op: string, payload: Record<string, unknown>) => Promise<RpcResult>;
 export interface BatchItem { ref: unknown; out: string; mask?: unknown }
 export interface BatchOpts { tta?: string; overlap?: number; sw_batch?: number; blend?: string; normalize?: unknown;
+  split?: 'cases' | 'tiles';
   maxAttempts?: number; deadAfter?: number; stealAfterMs?: number; telemetry?: (r: Record<string, unknown>) => void; now?: () => number }
 export interface ItemResult { index: number; worker?: string; ok: boolean; data?: Record<string, unknown>; error?: string; attempts: number; ms?: number }
 
@@ -79,8 +80,44 @@ export class VisionBatch {
     }
   }
 
+  /** split='tiles': items run one after another, each volume split into one part per live worker (lowest latency per
+   * study); a failed part is retried on another worker; the first worker merges the parts and writes the label map. */
+  private async runTiled() {
+    const maxAttempts = this.o.maxAttempts ?? 3;
+    let live = [...this.workers];
+    for (let idx = 0; idx < this.items.length && !this.cancelled; idx++) {
+      const it = this.items[idx]!; const t = this.now(); const n = live.length;
+      const base = { id: this.model, ref: it.ref, overlap: this.o.overlap ?? 0.5, sw_batch: this.o.sw_batch ?? 8, blend: this.o.blend ?? 'gaussian', normalize: this.o.normalize };
+      const parts: Array<Record<string, unknown> | undefined> = new Array(n);
+      let err = '';
+      await Promise.all(Array.from({ length: n }, async (_, k) => {
+        for (let a = 0; a < maxAttempts; a++) {
+          const w = live[(k + a) % live.length]!;
+          const r = await this.rpc(w, 'vision_predict_part', { ...base, part: [k, n] });
+          if (r.ok) { parts[k] = r.data; this.perWorker.set(w, (this.perWorker.get(w) ?? 0) + 1); return; }
+          this.retries++; err = r.error ?? 'part failed';
+          if (/disconnect|closed|timeout/i.test(err)) { live = live.filter((x) => x !== w); if (!this.deadWorkers.includes(w)) this.deadWorkers.push(w); if (!live.length) return; }
+        }
+      }));
+      if (parts.some((x) => !x) || !live.length) { this.results.push({ index: idx, ok: false, error: err || 'no live worker left', attempts: maxAttempts }); continue; }
+      const mw = live[0]!;
+      const r = await this.rpc(mw, 'vision_merge_write', { id: this.model, parts, out: it.out, mask: it.mask });
+      const lat = (this.now() - t) / 1000;
+      this.results.push(r.ok ? { index: idx, worker: mw, ok: true, data: { ...r.data, latency_s: lat, n_parts: n }, attempts: 1, ms: lat * 1000 }
+        : { index: idx, worker: mw, ok: false, error: r.error, attempts: 1 });
+    }
+  }
+
   async run() {
     this.status = 'running'; this.t0 = this.now();
+    if (this.o.split === 'tiles') {
+      await this.runTiled();
+      const p = this.progress(); const wall = (this.now() - this.t0) / 1000;
+      this.status = this.cancelled ? 'cancelled' : p.failed && !p.done ? 'failed' : 'done';
+      this.o.telemetry?.({ schema: 'moregpu.telemetry/1', kind: 'job', ts: new Date().toISOString(), job: this.id, op: 'vision_batch_tiles', session: null,
+        worker: null, items: this.items.length, items_done: p.done, items_failed: p.failed, retries: this.retries, wall_s: wall });
+      return { ...this.progress(), wall_s: wall };
+    }
     // finish as soon as every item has a result — a straggler whose item was stolen and completed elsewhere is not waited on
     const allLoops = Promise.all(this.workers.map((w) => this.loop(w)));
     const allDone = new Promise<void>((res) => { const t = setInterval(() => { if (this.finished.size === this.items.length || this.cancelled) { clearInterval(t); res(); } }, 5); allLoops.then(() => { clearInterval(t); res(); }); });
