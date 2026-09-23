@@ -385,6 +385,181 @@ def _chat_ids(tok, line: str) -> list[int]:
     return tok(line)["input_ids"]
 
 
+# ----------------------------------------------------------------------------- training sessions / vision (v0.7)
+def _die_on_error(r: dict) -> dict:
+    if isinstance(r, dict) and r.get("error"):
+        sys.exit(f"[moregpu] {r['error']}")
+    return r
+
+
+def _csv(v):
+    return [x for x in (v or "").split(",") if x] or None
+
+
+def _manifest_len(path: str | None) -> int | None:
+    if path and os.path.exists(path):
+        return sum(1 for line in open(path) if line.strip())
+    return None
+
+
+def _drive(pool: Pool, sid: str, rounds: int | None, quiet: bool = False) -> dict:
+    """Run one round per request until the stopping rule (or `rounds`), printing progress."""
+    last, i = None, 0
+    while rounds is None or i < rounds:
+        r = _die_on_error(pool._req(f"/train/sessions/{sid}/round", "POST", {"rounds": 1}))
+        last = r["rounds"][-1] if r.get("rounds") else None
+        i += 1
+        if last and not quiet:
+            mon = last.get("monitors") or {}
+            extra = f" rankme {mon['rankme']:.1f} std {mon['std_mean']:.3f}" if "rankme" in mon else ""
+            ev = f" eval {json.dumps(last['eval'])}" if last.get("eval") else ""
+            print(f"round {last['round']:4d}  loss {last['avg_last_loss']:.4f}  lr {last['lr']:.2e}  samples {last['samples_seen']}"
+                  f"  {last['wall_s']:.1f}s{extra}{ev}", flush=True)
+            for a in last.get("alarms") or []:
+                print(f"  ALARM: {a}", flush=True)
+        if not last or last.get("done"):
+            break
+    return last or {}
+
+
+def _session_common(a) -> dict:
+    body = {"manifest_len": a.manifest_len, "batch": a.batch, "inner_steps": a.inner_steps, "lr": a.lr, "amp": a.amp,
+            "seed": a.seed, "outer_lr": a.outer_lr, "outer_momentum": a.outer_momentum, "alloc": a.alloc,
+            "sync_dtype": a.sync_dtype}
+    if a.target_samples:
+        body["target_samples"] = a.target_samples
+    if a.max_rounds:
+        body["max_rounds"] = a.max_rounds
+    if a.cosine:
+        body["lr_schedule"] = {"kind": "cosine", "warmup_frac": a.warmup, "min_lr": a.min_lr}
+    if a.checkpoint_every:
+        body["checkpoint_every"] = a.checkpoint_every
+    if _csv(a.workers):
+        body["workers"] = _csv(a.workers)
+    if a.id:
+        body["id"] = a.id
+    return body
+
+
+def cmd_train(a) -> int:
+    pool = discover(a)
+    if a.kind in ("jepa", "segment", "classify"):
+        data = None
+        if a.data:
+            data = {"manifest": a.data if "://" in a.data else f"file://{a.data}", "spec": {"size": [int(x) for x in a.size.split(",")],
+                                                                                         "channels": a.channels}}
+            if a.sha256:
+                data["sha256"] = a.sha256
+        a.manifest_len = a.manifest_len or _manifest_len(a.data) or (a.synthetic_n if a.synthetic else None)
+        if not a.manifest_len:
+            sys.exit("[moregpu] --manifest-len is required (number of lines in the refs manifest on the workers)")
+        synthetic = {"kind": {"jepa_3d": "3d", "ijepa_2d": "2d"}.get(a.task, "2p5d"), "n": a.synthetic_n,
+                     "size": [int(x) for x in a.size.split(",")], "channels": a.channels, "seed": 0} if a.synthetic else None
+        if a.kind == "jepa":
+            cfg = {"model": a.model, "patch": int(a.patch) if a.patch.isdigit() else [int(x) for x in a.patch.split(",")],
+                   "n_targets": a.n_targets, "ema": [a.ema, 1.0], "grad_checkpointing": a.grad_checkpointing}
+            if a.target_samples:
+                cfg["total_steps"] = max(1, a.target_samples // a.batch)
+            task = a.task
+        else:
+            enc = {"init": "export", "path": a.encoder} if a.encoder else {"init": "random", "model": a.model, "patch": int(a.patch)}
+            cfg = {"kind": a.task.split("_")[-1] if a.task in ("seg_2d", "seg_3d") else "2p5d", "num_classes": a.num_classes,
+                   "encoder": enc, "mode": a.mode}
+            task = a.kind
+        if data:
+            cfg["data"] = data
+        if synthetic:
+            cfg["synthetic"] = synthetic
+        body = {"task": task, "cfg": cfg, **_session_common(a)}
+        r = _die_on_error(pool._req("/train/sessions", "POST", body))
+        sid = r["session"]
+        print(f"[moregpu] session {sid}: {task} on {', '.join(r['workers'])} · {r['params']:,} synced params", flush=True)
+        if a.background:
+            _die_on_error(pool._req(f"/train/sessions/{sid}/run", "POST", {}))
+            print(f"[moregpu] running in the background — `moregpu train status {sid}`")
+            return 0
+        last = _drive(pool, sid, a.rounds)
+        if a.export:
+            ex = _die_on_error(pool._req(f"/train/sessions/{sid}/export", "POST", {"fmt": a.export_format, "path": a.export}))
+            print(f"[moregpu] exported → {ex.get('weights') or ex.get('path')} (on worker)")
+        if a.telemetry_out:
+            recs = pool._req(f"/train/sessions/{sid}/telemetry?n=2000").get("records", [])
+            with open(a.telemetry_out, "w") as f:
+                f.writelines(json.dumps(x) + "\n" for x in recs)
+            print(f"[moregpu] {len(recs)} telemetry records → {a.telemetry_out}")
+        print(json.dumps({"session": sid, "round": last.get("round"), "samples_seen": last.get("samples_seen"),
+                          "loss": last.get("avg_last_loss")}))
+        return 0
+    if a.kind == "status":
+        r = pool._req(f"/train/sessions/{a.sid}") if a.sid else pool._req("/train/sessions")
+        print(json.dumps(r, indent=2)); return 0
+    if a.kind == "round":
+        _drive(pool, a.sid, a.rounds); return 0
+    if a.kind in ("stop", "checkpoint"):
+        print(json.dumps(_die_on_error(pool._req(f"/train/sessions/{a.sid}/{a.kind}", "POST", {})))); return 0
+    if a.kind == "resume":
+        print(json.dumps(_die_on_error(pool._req("/train/sessions/resume", "POST", {"id": a.sid})), indent=2)); return 0
+    if a.kind == "rm":
+        print(json.dumps(pool._req(f"/train/sessions/{a.sid}", "DELETE"))); return 0
+    if a.kind == "export":
+        print(json.dumps(_die_on_error(pool._req(f"/train/sessions/{a.sid}/export", "POST", {"fmt": a.export_format, "path": a.export})), indent=2))
+        return 0
+    if a.kind == "telemetry":
+        recs = pool._req(f"/train/sessions/{a.sid}/telemetry?n=2000").get("records", [])
+        out = open(a.telemetry_out, "w") if a.telemetry_out else sys.stdout
+        out.writelines(json.dumps(x) + "\n" for x in recs)
+        return 0
+    sys.exit(f"unknown train command {a.kind}")
+
+
+def cmd_vision(a) -> int:
+    pool = discover(a)
+    if a.kind == "load":
+        body = {"id": a.id}
+        if a.spec:
+            body.update(spec=json.load(open(a.spec)), task=a.task, num_classes=a.num_classes, kind=a.vkind)
+        else:
+            body["export"] = a.export
+        if _csv(a.workers):
+            body["workers"] = _csv(a.workers)
+        print(json.dumps(_die_on_error(pool._req("/vision/load", "POST", body)), indent=2)); return 0
+    if a.kind == "batch":
+        items = [{"ref": {"uri": v if "://" in v else f"file://{v}"}, "out": f"pred_{os.path.splitext(os.path.basename(v))[0]}"} for v in a.volumes]
+        for i, m in enumerate(a.masks or []):
+            items[i]["mask"] = {"uri": m if "://" in m else f"file://{m}"}
+        r = _die_on_error(pool._req("/vision/batch", "POST", {"id": a.id, "items": items, "split": a.split, "tta": a.tta}))
+        import time
+        while True:
+            j = pool._req(f"/vision/jobs/{r['job']}")
+            print(f"\r[moregpu] {j['done']}/{j['items']} done · {j['failed']} failed · retries {j['retries']} · stolen {j['stolen']}", end="", flush=True)
+            if j["status"] not in ("running", "pending"):
+                print(); break
+            time.sleep(1)
+        print(json.dumps(pool._req(f"/vision/jobs/{r['job']}?results=1"), indent=2)); return 0
+    if a.kind == "jobs":
+        print(json.dumps(pool._req(f"/vision/jobs/{a.id}?results=1" if a.id else "/vision/jobs"), indent=2)); return 0
+    if a.kind == "unload":
+        print(json.dumps(pool._req("/vision/unload", "POST", {"id": a.id}))); return 0
+    if a.kind == "models":
+        print(json.dumps(pool._req("/vision/models"), indent=2)); return 0
+    sys.exit(f"unknown vision command {a.kind}")
+
+
+def cmd_models(a) -> int:
+    pool = discover(a)
+    if a.kind == "describe":
+        print(json.dumps(pool._req("/vision/capabilities"), indent=2)); return 0
+    if a.kind == "lower":
+        print(json.dumps(_die_on_error(pool._req("/vision/lower", "POST", {"id": a.id, "target": a.target})), indent=2)); return 0
+    sys.exit(f"unknown models command {a.kind}")
+
+
+def cmd_net(a) -> int:
+    pool = discover(a, need_torch=False)
+    print(json.dumps(pool._req(f"/net?pings={a.pings}&sustained_mb={a.sustained_mb}"), indent=2)); return 0
+
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="moregpu_ml", description="no-code fine-tuning + inference on a MoreGPU pool")
     p.add_argument("--url"); p.add_argument("--token")
@@ -438,6 +613,53 @@ def main(argv=None) -> int:
     sh.add_argument("--no-push", action="store_true", help="disable download-free streaming (the worker self-loads from HF)")
     sh.add_argument("--unload", action="store_true", help="unload the sharded model (pass its id/model) instead of loading")
     sh.set_defaults(fn=cmd_shard)
+
+    t = sub.add_parser("train", help="training sessions: JEPA pretraining, segment/classify fine-tuning (DiLoCo across torch workers)")
+    t.add_argument("kind", choices=["jepa", "segment", "classify", "status", "round", "stop", "checkpoint", "resume", "rm", "export", "telemetry"])
+    t.add_argument("sid", nargs="?", help="session id (status/round/stop/checkpoint/resume/rm/export/telemetry)")
+    t.add_argument("--task", default="jepa_2p5d", help="jepa_2p5d | ijepa_2d | jepa_3d (jepa); seg_2d | seg_2p5d | seg_3d (segment)")
+    t.add_argument("--data", help="refs.jsonl manifest path/URI ON THE WORKERS (file:// under MOREGPU_DATA_ROOTS, or pushed://id)")
+    t.add_argument("--sha256"); t.add_argument("--manifest-len", dest="manifest_len", type=int)
+    t.add_argument("--synthetic", action="store_true", help="synthetic structured data (smoke test, no data needed)")
+    t.add_argument("--synthetic-n", dest="synthetic_n", type=int, default=64)
+    t.add_argument("--size", default="224,224"); t.add_argument("--channels", type=int, default=3)
+    t.add_argument("--model", default="tiny"); t.add_argument("--patch", default="16")
+    t.add_argument("--n-targets", dest="n_targets", type=int, default=4); t.add_argument("--ema", type=float, default=0.996)
+    t.add_argument("--grad-checkpointing", dest="grad_checkpointing", action="store_true")
+    t.add_argument("--encoder", help="(segment/classify) JEPA encoder export dir on the workers")
+    t.add_argument("--num-classes", dest="num_classes", type=int, default=3); t.add_argument("--mode", default="full", choices=["full", "frozen", "lora"])
+    t.add_argument("--workers", help="comma-separated worker ids (default: all torch workers)")
+    t.add_argument("--rounds", type=int, help="stop after N rounds (default: until the stopping rule)")
+    t.add_argument("--inner-steps", dest="inner_steps", type=int, default=50)
+    t.add_argument("--batch", type=int, default=32); t.add_argument("--lr", type=float, default=1e-3)
+    t.add_argument("--target-samples", dest="target_samples", type=int); t.add_argument("--max-rounds", dest="max_rounds", type=int)
+    t.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "fp32"]); t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--outer-lr", dest="outer_lr", type=float, default=0.7); t.add_argument("--outer-momentum", dest="outer_momentum", type=float, default=0.9)
+    t.add_argument("--alloc", default="proportional", choices=["fixed", "proportional"])
+    t.add_argument("--sync-dtype", dest="sync_dtype", default="f32", choices=["f32", "bf16", "fp16", "int8delta"])
+    t.add_argument("--cosine", action="store_true"); t.add_argument("--warmup", type=float, default=0.05); t.add_argument("--min-lr", dest="min_lr", type=float, default=1e-6)
+    t.add_argument("--checkpoint-every", dest="checkpoint_every", type=int, default=0)
+    t.add_argument("--id"); t.add_argument("--background", action="store_true")
+    t.add_argument("--export", help="export directory ON THE WORKER after training"); t.add_argument("--export-format", dest="export_format", default="safetensors")
+    t.add_argument("--telemetry-out", dest="telemetry_out", help="write the session's telemetry JSONL here")
+    t.set_defaults(fn=cmd_train)
+
+    v = sub.add_parser("vision", help="vision inference on the pool: load exports/published models, batch-segment volumes")
+    v.add_argument("kind", choices=["load", "batch", "jobs", "unload", "models"])
+    v.add_argument("id", nargs="?", help="model id (load/batch/unload) or job id (jobs)")
+    v.add_argument("--export", help="MoreGPU export dir on the workers"); v.add_argument("--spec", help="published-model spec JSON (docs/MODELS.md)")
+    v.add_argument("--task", default="segment"); v.add_argument("--num-classes", dest="num_classes", type=int); v.add_argument("--kind", dest="vkind", default="3d")
+    v.add_argument("--workers"); v.add_argument("--volumes", nargs="*", default=[]); v.add_argument("--masks", nargs="*", default=[])
+    v.add_argument("--split", default="cases", choices=["cases", "tiles"]); v.add_argument("--tta", default="flip", choices=["none", "flip"])
+    v.set_defaults(fn=cmd_vision)
+
+    mo = sub.add_parser("models", help="published-model capabilities per worker; lower a loaded model for WebGPU")
+    mo.add_argument("kind", choices=["describe", "lower"]); mo.add_argument("id", nargs="?"); mo.add_argument("--target", default="wgsl")
+    mo.set_defaults(fn=cmd_models)
+
+    ne = sub.add_parser("net", help="per-worker RTT percentiles + (sustained) bandwidth")
+    ne.add_argument("--pings", type=int, default=20); ne.add_argument("--sustained-mb", dest="sustained_mb", type=int, default=0)
+    ne.set_defaults(fn=cmd_net)
 
     args = p.parse_args(argv)
     return args.fn(args)

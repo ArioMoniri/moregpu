@@ -221,7 +221,13 @@ case "$cmd" in
   join)    need_deno; exec deno run --unstable-webgpu --allow-net --allow-env --allow-sys "$WORKER_TS" "$@" ;;
   install) exec sh -c "curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVICE=1 sh" ;;
 
-  finetune|generate|chat|shard) ml_run "$cmd" "$@" ;;
+  finetune|generate|chat|shard|train|vision|models|net) ml_run "$cmd" "$@" ;;
+
+  torch-join)   # the native torch worker (training, JEPA, vision) — python3 + torch required
+    command -v python3 >/dev/null 2>&1 || { echo "[moregpu] torch-join needs python3 + torch" >&2; exit 1; }
+    tj_dir="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
+    [ -f "$tj_dir/apps/worker/worker_torch.py" ] || { echo "[moregpu] torch-join runs from a clone (apps/worker/worker_torch.py not found)" >&2; exit 1; }
+    exec python3 "$tj_dir/apps/worker/worker_torch.py" "$@" ;;
   bench)   bench_run "$@" ;;
 
   isolate) need_deno
@@ -282,6 +288,13 @@ case "$cmd" in
     moregpu install | stop | status | logs     the local worker service
 
   FINE-TUNE & RUN MODELS   (no code; needs a torch worker + python3 with torch/transformers)
+    moregpu torch-join --server URL --token T   start a native torch worker here (training / JEPA / vision)
+    moregpu train jepa --data refs.jsonl --size 224,224 --workers a,b --inner-steps 50 --target-samples N --export DIR
+                                        JEPA self-supervised pretraining (DiLoCo across torch workers)
+    moregpu train segment --encoder DIR --data refs.jsonl --num-classes 3   fine-tune a segmenter (full|frozen|lora)
+    moregpu train status|round|stop|checkpoint|resume|rm|export|telemetry [SESSION]
+    moregpu vision load ID --export DIR | --spec spec.json ; moregpu vision batch ID --volumes a.npy b.npy [--split tiles]
+    moregpu models describe | lower ID      moregpu net [--pings 50 --sustained-mb 64]      moregpu bench …
     moregpu finetune MODEL [--data FILE] [--steps N] [--out FILE]
                                                LoRA fine-tune on your text; saves the adapter, shows before/after
     moregpu generate MODEL --prompt "…" [--from-training]

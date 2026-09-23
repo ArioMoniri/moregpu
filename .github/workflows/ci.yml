@@ -101,6 +101,9 @@ jobs:
       - name: Published model — MONAI state_dict served natively via /vision, malicious pickle + sha mismatch refused
         run: python3 tests/e2e/published_model.py
 
+      - name: CLI — moregpu train jepa|segment|status, net, models describe, vision load/batch --split tiles
+        run: python3 tests/e2e/cli_train.py
+
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh
 
