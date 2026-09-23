@@ -12,7 +12,7 @@ native BLAS / Apple-MPS speed per kernel, resident weights held as on-device ten
 This is ADR-0007's native-accelerator tier: a signed, admin-installed binary on owned hardware, NOT the
 zero-install invisible WebGPU worker. Run it where you trust the machine.
 
-    pip install torch cryptography websockets
+    pip install "torch>=2.6" cryptography websockets
     python3 apps/worker/worker_torch.py --server wss://ADMIN:8787/ws --token <join-token> --pin <sha256> [--cpu]
     # --pin (or MOREGPU_PIN) is the coordinator's cert fingerprint from its join banner. Plaintext ws:// still
     # works for a trusted LAN/CI (the coordinator must run with MOREGPU_INSECURE=1); no pin is used there.
