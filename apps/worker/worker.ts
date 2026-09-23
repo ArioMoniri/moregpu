@@ -17,6 +17,12 @@
  *   deno run --unstable-webgpu --allow-net --allow-env --allow-sys <this-url> \
  *     --server wss://ADMIN:8787/ws --token <join-token>
  */
+// WebGPU VISION executor (M6, ADR-0114): op-graph + safetensors → WGSL conv/norm/pool/upsample/attention inference,
+// routed from the sealed 'model' RPC for every `vision_*` op (docs/WEBGPU_VISION.md). It is imported LAZILY: the
+// signed single-file install (scripts/install.sh fetches + verifies worker.ts only) must still start when the sibling
+// module is absent. In that case the 'vision' capability is simply not advertised.
+type VisionModule = typeof import('./vision_wgsl.ts');
+const loadVision = (): Promise<VisionModule | null> => import('./vision_wgsl.ts').catch((e) => { console.log(`[worker] vision module unavailable (${String(e).slice(0, 120)}) — vision_* ops disabled`); return null; });
 
 // PLATFORM SHIM: this one file runs BOTH under Deno (CLI) and in a BROWSER TAB (served as a bundle by an
 // HTML page). Only the host APIs differ — everything below (WebSocket, WebGPU, crypto.subtle, WGSL) is
@@ -218,6 +224,7 @@ interface Backend {
   elementwise?(kernel: string, a: Float32Array, b: Float32Array | null, scalar: number): Promise<Float32Array>;
   rowwise?(kernel: string, a: Float32Array, cols: number): Promise<Float32Array>;
   shard?: ShardRuntime; // present on a GPU backend: lets this worker HOLD a pipeline MIDDLE stage (WGSL transformer forward)
+  device?: GPUDevice; // present on a GPU backend: the vision executor (vision_wgsl.ts) builds its own pipelines on it
 }
 
 // ════════════ WEBGPU MODEL-SHARD RUNTIME ════════════════════════════════════════════════════════════════
@@ -1137,6 +1144,7 @@ async function makeGpuBackend(): Promise<Backend | null> {
   const ELEM_PER = MAXW * 64;   // max elements per elementwise dispatch (workgroup_size 64)
   return { kind: 'gpu', label: `gpu:${info.vendor || 'webgpu'}/${info.architecture || 'native'}${hasF16 ? '+f16' : ''}`, hasF16,
     shard: new ShardRuntime(device), // this GPU worker can HOLD a pipeline middle-stage
+    device, // → vision_* ops (vision_wgsl.ts)
     matmul: (a, b, M, N, K) => run(WGSL.matmul, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1]),
     matmulF16: hasF16 ? ((a, b, M, N, K) => run(WGSL.matmulF16, [a, b], new Uint32Array([M, N, K, 0]), M * N, [Math.ceil(N / 16), Math.ceil(M / 16), 1])) : undefined,
     elementwise: async (kernel, a, b, scalar) => {
@@ -1275,6 +1283,8 @@ function runRowwise(kernel: string, a: Float32Array, cols: number): Float32Array
 // ---------- work loop ----------
 const FORCE_CPU = args.has('cpu') || PLAT.env('MOREGPU_FORCE_CPU') === '1';
 let backend = (FORCE_CPU ? null : await makeGpuBackend().catch(() => null)) ?? makeCpuBackend();
+const VISION = loadVision(); // started once at boot; vision_* ops await it
+const visionReady = (await VISION) !== null;
 console.log(`[worker] ${NAME} · backend=${backend.label} · server=${SERVER}`);
 
 /** Run one shard on the current backend; on a GPU failure/device-loss, permanently fall back to CPU and retry. */
@@ -1342,6 +1352,13 @@ async function modelDispatch(op: string, p: Record<string, unknown>): Promise<Re
   if (op === 'push_begin') { while (SHARD_PUSH.size >= MAX_STAGING && !SHARD_PUSH.has(id)) { const oldest = SHARD_PUSH.keys().next().value; if (oldest === undefined) break; dropPush(oldest); } SHARD_PUSH.set(id, new Map()); SHARD_PUSH_BYTES.set(id, 0); return { ok: true, id, staging: 'ram', resumed: false, sizes: {} }; }
   if (op === 'push_chunk') { const files = SHARD_PUSH.get(id) ?? new Map<string, Uint8Array[]>(); SHARD_PUSH.set(id, files); const chunk = b64d(String(p.data)); let total = chunk.length; for (const b of SHARD_PUSH_BYTES.values()) total += b; if (total > MAX_STAGING_BYTES) throw new Error(`push staging exceeded ${MAX_STAGING_BYTES} bytes across pushes — raise MOREGPU_MAX_STAGING_BYTES`); SHARD_PUSH_BYTES.set(id, (SHARD_PUSH_BYTES.get(id) ?? 0) + chunk.length); const name = String(p.name); const arr = files.get(name) ?? []; arr.push(chunk); files.set(name, arr); return { ok: true }; }
   if (op === 'push_end') return { ok: true };
+  // WebGPU VISION (vision_caps/load/plan/infer/sliding_window/unload): graph.json + model.safetensors are staged via the
+  // same push_begin/push_chunk path under the model id; without a GPU device the vision module runs its CPU reference.
+  if (op.startsWith('vision_')) {
+    const takeStaged = (sid: string) => { const f = SHARD_PUSH.get(sid); if (!f) return null; const m = new Map<string, Uint8Array>(); for (const [n, parts] of f) { const out = new Uint8Array(parts.reduce((a, b) => a + b.length, 0)); let o = 0; for (const pt of parts) { out.set(pt, o); o += pt.length; } m.set(n, out); } dropPush(sid); return m; };
+    const vision = await VISION; if (!vision) throw new Error('vision module (vision_wgsl.ts) is not available on this worker');
+    return vision.visionDispatch(op, p, { device: (!gpuLost && backend.device) || null, takeStaged });
+  }
   if (op === 'shard_load') {
     if (!backend.shard) throw new Error('this worker has no GPU shard runtime (CPU-only backend)');
     const files = SHARD_PUSH.get(id); if (!files) throw new Error('shard weights not staged — push_begin/push_chunk must precede shard_load');
@@ -1441,6 +1458,7 @@ function connect() {
     // ends ('shardEnds': embedding gather on the first stage, final norm + LM head + argmax on the last), so it
     // can even host a whole small model solo. No autograd (NOT 'train') and no torch whole-model residency path.
     const caps = backend.shard ? ['kernel', 'shard', 'shardEnds'] : ['kernel'];
+    if (backend.device && visionReady) caps.push('vision'); // WGSL vision inference (vision_* ops) — only with a real WebGPU device
     ws.send(JSON.stringify({ t: 'register', joinToken: TOKEN, pubkey: PUBKEY_B64, node: { id: NAME, backend: backend.kind, label: backend.label, os: PLAT.os, caps } }));
     // Heartbeat: report live load, adaptive duty, the ceiling, and why (if) we're paused.
     hb = setInterval(() => {
