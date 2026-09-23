@@ -401,9 +401,13 @@ def train_generate(payload: dict) -> dict:
     return {"ok": True, "tokens": new, "n": len(new), "step": task.step}
 
 from moregpu_worker.train.runner import TaskRunner  # noqa: E402
-RUNNER = TaskRunner(SESSIONS, DEV)
+from moregpu_worker.data.plane import DataPlane  # noqa: E402
+from moregpu_worker.data import ops as DATA_OPS  # noqa: E402
+DATA = DataPlane()   # policy from MOREGPU_DATA_ROOTS / MOREGPU_DATA_HOSTS / MOREGPU_DATA_BUCKETS; cache created lazily
+RUNNER = TaskRunner(SESSIONS, DEV, data_plane=DATA)
 
 def train_dispatch(op: str, payload: dict) -> dict:
+    if op in DATA_OPS.OPS: return DATA_OPS.handle(DATA, op, payload)                # vision data plane (ADR-0110)
     if op.startswith("task_"): return RUNNER.handle(op, payload)   # generic TrainTask sessions (ADR-0105)
     if op == "load": return train_load(payload)
     if op == "step": return train_step(payload)

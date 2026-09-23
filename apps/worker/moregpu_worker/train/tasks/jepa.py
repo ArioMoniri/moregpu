@@ -46,10 +46,10 @@ class EmaSchedule:
 
 class DataPlaneSource:
     """Adapter over moregpu_worker.data.DataPlane: manifest indices → batches (+ optional labels in ref.meta)."""
-    def __init__(self, plane, spec: dict):
+    def __init__(self, plane, spec: dict, kind: str = "2p5d"):
         self.plane = plane
         self.manifest = plane.open_manifest(spec["manifest"], spec.get("sha256"))
-        self.spec = spec.get("spec", {})
+        self.spec = {"kind": kind, **spec.get("spec", {})}
 
     def __len__(self):
         return len(self.manifest)
@@ -76,7 +76,7 @@ class _JepaBase(TrainTask):
         elif cfg.get("data"):
             if ctx.data is None:
                 raise RuntimeError("this worker has no data plane configured (MOREGPU_DATA_ROOTS)")
-            self.data = DataPlaneSource(ctx.data, cfg["data"])
+            self.data = DataPlaneSource(ctx.data, cfg["data"], self.kind)
             sp = cfg["data"].get("spec", {})
             size, chans = tuple(sp["size"]), int(sp.get("channels", 1))
         else:

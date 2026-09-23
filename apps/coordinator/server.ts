@@ -1790,7 +1790,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   }
   if (url.pathname === '/help') return json({ kernels: KERNELS, endpoints: ['/ (dashboard)', '/health', '/device', '/gpu', '/workers', 'POST /workers/:id/control', 'POST /submit (?async=1)', '/jobs', '/jobs/:id', '/logs', '/metrics'], workerSchedule: 'MOREGPU_SCHEDULE=always|idle-only|HH:MM-HH:MM', auth: 'admin endpoints require Authorization: Bearer <admin token>' });
   // admin-gated
-  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights', '/net'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || url.pathname.startsWith('/train/') || url.pathname.startsWith('/model/') || (req.method === 'POST' && url.pathname === '/submit')) {
+  if (['/gpu', '/device', '/workers', '/jobs', '/logs', '/metrics', '/weights', '/net'].some((p) => url.pathname === p || url.pathname.startsWith('/jobs/')) || url.pathname.startsWith('/workers/') || url.pathname.startsWith('/train/') || url.pathname.startsWith('/model/') || url.pathname.startsWith('/data/') || url.pathname.startsWith('/vision/') || (req.method === 'POST' && url.pathname === '/submit')) {
     if (!authOk(req)) return json({ error: 'unauthorized — send Authorization: Bearer <admin token>' }, 401);
   }
   if (url.pathname === '/gpu') return json(virtualGpu());
@@ -2077,6 +2077,39 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   //   GET    /train/sessions/:id/telemetry    → recent telemetry records
   //   DELETE /train/sessions/:id
   if (url.pathname === '/train/sessions' || url.pathname.startsWith('/train/sessions/')) return trainSessionRoute(req, url);
+  // ---- vision data plane (ADR-0110): per-worker data capabilities and pushed:// blobs ----
+  //   GET  /workers/:id/caps                       → readers, data roots/hosts counts, cache stats, train sessions
+  //   POST /data/push {id, sha256, data_b64, suffix?, workers?}  → streamed to each worker as pushed://<id>
+  //   POST /data/drop {id, workers?}
+  if (req.method === 'GET' && /^\/workers\/[^/]+\/caps$/.test(url.pathname)) {
+    const w = workers.get(decodeURIComponent(url.pathname.split('/')[2]!));
+    if (!w) return json({ error: 'no such worker' }, 404);
+    if (!w.label.includes('torch')) return json({ ok: true, id: w.id, label: w.label, caps: [...w.caps], data: null, note: 'data plane runs on native torch workers' });
+    const [d, t] = await Promise.all([trainRPC(w, 'data_caps', {}), trainRPC(w, 'task_list', {})]);
+    return json({ ok: true, id: w.id, label: w.label, caps: [...w.caps], data: d.ok ? d.data : { error: d.error }, train: t.ok ? t.data : { error: t.error } });
+  }
+  if (req.method === 'POST' && (url.pathname === '/data/push' || url.pathname === '/data/drop')) {
+    const body = await req.json().catch(() => ({})) as { id?: string; sha256?: string; data_b64?: string; suffix?: string; workers?: string[] };
+    if (!body.id || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(body.id)) return json({ error: 'id must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}' }, 400);
+    const targets = (body.workers?.length ? body.workers.map((id) => workers.get(id)).filter((w): w is Worker => !!w) : torchWorkers());
+    if (!targets.length) return json({ error: 'no target torch workers' }, 503);
+    if (url.pathname === '/data/drop') { const r = await Promise.all(targets.map((w) => trainRPC(w, 'blob_drop', { id: body.id }))); return json({ ok: r.every((x) => x.ok), workers: targets.map((w) => w.id) }); }
+    if (!body.sha256 || !/^[0-9a-f]{64}$/.test(body.sha256) || typeof body.data_b64 !== 'string') return json({ error: 'sha256 (hex) and data_b64 are required' }, 400);
+    const bytes = b64d(body.data_b64);
+    const res = await Promise.all(targets.map(async (w) => {
+      const b = await trainRPC(w, 'blob_begin', { id: body.id, sha256: body.sha256, size: bytes.length, suffix: body.suffix ?? '' });
+      if (!b.ok) return { worker: w.id, ok: false, error: b.error };
+      const CH = 4 << 20;
+      for (let k = 0, off = 0; off < bytes.length || k === 0; k++, off += CH) {
+        const c = await trainRPC(w, 'blob_chunk', { id: body.id, k, data: b64e(bytes.subarray(off, off + CH)) });
+        if (!c.ok) return { worker: w.id, ok: false, error: c.error };
+        if (off + CH >= bytes.length) break;
+      }
+      const e = await trainRPC(w, 'blob_end', { id: body.id });
+      return { worker: w.id, ok: e.ok, error: e.error };
+    }));
+    return json({ ok: res.every((r) => r.ok), uri: `pushed://${body.id}`, results: res }, res.every((r) => r.ok) ? 200 : 502);
+  }
   // Resident-model serving: hold a whole model on a torch worker and run the ENTIRE forward per call —
   // ONE round-trip per token instead of the ~500 the fine-grained kernel path needs. THIS is fast serving.
   //   POST /model/load     { model, id?, fp16?, worker? }
