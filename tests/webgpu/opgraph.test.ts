@@ -146,11 +146,11 @@ describe('memory planner', () => {
     const a = runCpu(base.model, inputsOf(base.io)), b = runCpu(small.model, inputsOf(small.io));
     expect(Array.from(b.mask.data)).toEqual(Array.from(a.mask.data));
   });
-  it('every kernel golden under a 1 KiB binding limit either tiles bit-identically or refuses clearly', () => {
-    const LIM = 1024;
-    let tiled = 0, refused = 0;
+  it('every kernel golden under 1 KiB / 512 B binding limits either tiles bit-identically or refuses clearly', () => {
+    let tiled = 0, refused = 0, tried = 0;
     const strategies = new Set<string>();
-    for (const c of G.cases) {
+    for (const LIM of [1024, 512]) for (const c of G.cases) {
+      tried++;
       const w = new Map(Object.entries(c.tensors).map(([k, v]) => [k, tensorOf(v)]));
       const inputs = Object.fromEntries(Object.entries(c.inputs).map(([k, v]) => [k, tensorOf(v)]));
       let small: VisionModel;
@@ -163,10 +163,10 @@ describe('memory planner', () => {
       if (small.plan.tiled.length) tiled++;
       for (const t of small.plan.tiled) strategies.add(t.strategy);
       const a = runCpu(VisionModel.compile(c.graph, w), inputs), b = runCpu(small, inputs);
-      for (const k of Object.keys(a)) expect(Array.from(b[k].data), `${c.name}:${k}`).toEqual(Array.from(a[k].data));
+      for (const k of Object.keys(a)) expect(Array.from(b[k].data), `${c.name}@${LIM}:${k}`).toEqual(Array.from(a[k].data));
     }
-    expect(tiled).toBeGreaterThanOrEqual(25);
-    expect(refused).toBeLessThan(G.cases.length / 3);
+    expect(tiled).toBeGreaterThanOrEqual(40);
+    expect(refused).toBeLessThan(tried / 3);
     for (const s of ['spatial-slab', 'flat', 'rows', 'inner-chunk']) expect(strategies, s).toContain(s);
   }, 60_000);
   it('refuses clearly when a single unit cannot fit a binding', () => {

@@ -1,7 +1,7 @@
 // Browser entry for tests/webgpu/browser.spec.ts. The spec bundles it with esbuild and loads it in a page served over
 // http://127.0.0.1 (WebGPU needs a secure context). It then runs the kernel goldens and the model parity cases on
 // navigator.gpu with the SAME vision_wgsl.ts that worker.ts ships.
-import { VisionModel, createGpuRunner, parseSafetensors, type OpGraph } from '../../apps/worker/vision_wgsl.ts';
+import { VisionModel, createGpuRunner, parseSafetensors, wgslSource, WGSL_KERNELS, type OpGraph } from '../../apps/worker/vision_wgsl.ts';
 import { type KernelGoldens, type TJson, tensorMap, tensorOf, relErr, shapeEq } from './golden_util.ts';
 
 interface Result { name: string; ok: boolean; err: number | string }
@@ -19,6 +19,13 @@ async function run(opts: { limit?: number } = {}): Promise<Result[]> {
   const a = (await (navigator as Navigator & { gpu: GPU }).gpu.requestAdapter())!;
   const device = await a.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: a.limits.maxStorageBufferBindingSize, maxBufferSize: a.limits.maxBufferSize } });
   const res: Result[] = [];
+  // Tint (Dawn) is stricter than naga (wgpu): compile every kernel here too and report errors by name.
+  // (f32 variants; the device is requested without shader-f16 — the Deno test covers the f16 variants)
+  for (const k of Object.keys(WGSL_KERNELS)) {
+    const info = await device.createShaderModule({ code: wgslSource(k, false) }).getCompilationInfo();
+    const errs = info.messages.filter((m) => m.type === 'error').map((m) => `${m.lineNum}:${m.linePos} ${m.message}`);
+    res.push({ name: `compile:${k}`, ok: errs.length === 0, err: errs.length ? errs.join('; ') : 0 });
+  }
   const G = (await (await fetch('/goldens/kernels.json')).json()) as KernelGoldens;
   const cases = opts.limit ? G.cases.slice(0, opts.limit) : G.cases;
   for (const c of cases) {

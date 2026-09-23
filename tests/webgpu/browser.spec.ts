@@ -47,5 +47,5 @@ test('WGSL vision kernels + model parity in the browser (skipped without WebGPU)
   const bad = res.filter((r) => !r.ok);
   console.log(`[browser] ${res.length - bad.length}/${res.length} passed`);
   expect(bad, JSON.stringify(bad, null, 1)).toEqual([]);
-  expect(res.length).toBeGreaterThanOrEqual(90);
+  expect(res.length).toBeGreaterThanOrEqual(90 + 13 + 3); // kernel goldens + kernel compiles + 3 models
 });

@@ -69,12 +69,12 @@ Deno.test({ name: 'webgpu: kernel goldens on the GPU (fp32, ≤1e-5 rel)', ...T,
   console.log(`[webgpu] ${G.cases.length} kernel cases passed on the GPU`);
 } });
 
-Deno.test({ name: 'webgpu: binding-limit tiling on the GPU (1 KiB limit) matches the goldens', ...T, fn: async () => {
+Deno.test({ name: 'webgpu: binding-limit tiling on the GPU (1 KiB / 512 B limits) matches the goldens', ...T, fn: async () => {
   const fails: string[] = [];
   let tiled = 0;
-  for (const c of G.cases) {
+  for (const LIM of [1024, 512]) for (const c of G.cases) {
     let model: VisionModel;
-    try { model = VisionModel.compile(c.graph, tensorMap(c.tensors), { maxBindingBytes: 1024 }); } catch { continue; }
+    try { model = VisionModel.compile(c.graph, tensorMap(c.tensors), { maxBindingBytes: LIM }); } catch { continue; }
     if (!model.plan.tiled.length) continue;
     tiled++;
     const gpu = await createGpuRunner(device!, model);
@@ -83,11 +83,11 @@ Deno.test({ name: 'webgpu: binding-limit tiling on the GPU (1 KiB limit) matches
       for (const [name, exp] of Object.entries(c.expected)) {
         const e = tensorOf(exp);
         const err = c.name.startsWith('argmax') ? (out[name].data.every((v, i) => v === e.data[i]) ? 0 : 1) : relErr(out[name].data, e.data);
-        if (!(err <= c.tol)) fails.push(`${c.name}:${name} err=${err}`);
+        if (!(err <= c.tol)) fails.push(`${c.name}@${LIM}:${name} err=${err}`);
       }
     } finally { gpu.destroy(); }
   }
-  assert(tiled >= 25, `only ${tiled} tiled cases`);
+  assert(tiled >= 40, `only ${tiled} tiled cases`);
   assert(fails.length === 0, fails.join('\n'));
 } });
 

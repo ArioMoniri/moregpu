@@ -69,3 +69,6 @@ clients/python/build/
 *.tgz
 
 *.tar.gz
+# Playwright (tests/webgpu/browser.spec.ts)
+test-results/
+playwright-report/

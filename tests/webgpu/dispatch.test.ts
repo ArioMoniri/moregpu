@@ -65,12 +65,13 @@ describe('visionDispatch (CPU fallback path)', () => {
 
 describe('worker.ts wiring (static)', () => {
   const src = readFileSync(here('../../apps/worker/worker.ts'), 'utf8');
-  it('imports the vision module and routes vision_* ops to it', () => {
-    expect(src).toMatch(/import\s*\{[^}]*visionDispatch[^}]*\}\s*from\s*'\.\/vision_wgsl\.ts'/);
+  it('imports the vision module LAZILY (signed single-file installs must still start) and routes vision_* ops to it', () => {
+    expect(src).toMatch(/import\('\.\/vision_wgsl\.ts'\)\.catch\(/);
+    expect(src).not.toMatch(/^import .*vision_wgsl/m); // no static import: a missing sibling would abort startup
     expect(src).toMatch(/op\.startsWith\('vision_'\)/);
+    expect(src).toMatch(/vision\.visionDispatch\(op, p,/);
   });
-  it("advertises the 'vision' capability only when a WebGPU device exists", () => {
-    expect(src).toMatch(/caps\.push\('vision'\)/);
-    expect(src).toMatch(/if \(backend\.device\) caps\.push\('vision'\)/);
+  it("advertises the 'vision' capability only when a WebGPU device exists and the module loaded", () => {
+    expect(src).toMatch(/if \(backend\.device && visionReady\) caps\.push\('vision'\)/);
   });
 });
