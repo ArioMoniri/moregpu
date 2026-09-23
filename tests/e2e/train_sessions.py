@@ -85,6 +85,10 @@ def main():
         pool.kill_worker("w2"); time.sleep(1.5)
         rr = pool.api("/train/sessions/churn/round", "POST", {"rounds": 2})
         ck(rr.get("ok") and rr.get("workers") == ["w1"] and rr.get("round") == 3, f"survivor keeps training ({rr.get('workers')}, round {rr.get('round')})")
+        net = pool.api("/net?pings=10&sustained_mb=4")
+        w0 = (net.get("workers") or [{}])[0]
+        ck(w0.get("rtt_p50_ms") is not None and w0.get("rtt_p99_ms") >= w0.get("rtt_p50_ms") and (w0.get("sustained") or {}).get("down_mbps"),
+           f"/net reports RTT percentiles + sustained up/down ({w0.get('rtt_p50_ms')} ms, {w0.get('sustained')})")
         ls = pool.api("/train/sessions")
         ck(ls.get("ok") and any(s["id"] == "churn" for s in ls["sessions"]), "session listed")
     ck.finish()

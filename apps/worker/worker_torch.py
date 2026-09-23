@@ -1252,7 +1252,10 @@ def model_chat(payload: dict) -> dict:
     return {"ok": True, "text": reply, "n": int(out.shape[1] - seq), "ms": (time.perf_counter() - t0) * 1000}
 
 def model_dispatch(op: str, payload: dict) -> dict:
-    if op == "ping": return {"ok": True, "pong": True, "n": len(payload.get("blob", ""))}  # echo → coordinator times RTT (empty blob) or throughput (large blob)
+    if op == "ping":
+        # echo → coordinator times RTT (empty blob), upload throughput (large blob) or download throughput (echo_bytes)
+        eb = max(0, min(int(payload.get("echo_bytes", 0)), 64 << 20))
+        return {"ok": True, "pong": True, "n": len(payload.get("blob", "")), **({"blob": b64e(os.urandom(eb))} if eb else {})}  # echo → coordinator times RTT (empty blob) or throughput (large blob)
     if op == "load": return model_load(payload)
     if op == "push_begin": return model_push_begin(payload)
     if op == "push_chunk": return model_push_chunk(payload)

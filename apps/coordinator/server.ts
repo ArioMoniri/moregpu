@@ -1800,6 +1800,8 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   // and give an HONEST, latency-aware recommendation — no guessing whether your fleet can host a big model.
   if (url.pathname === '/net') {
     const cands = torchWorkers();
+    const NET_PINGS = Math.max(1, Math.min(Number(url.searchParams.get('pings') ?? 20), 1000));
+    const NET_SUSTAINED_MB = Math.max(0, Math.min(Number(url.searchParams.get('sustained_mb') ?? 0), 4096));
     const BW_BYTES = 512 << 10; // 512 KiB probe — enough to gauge throughput, small enough not to stall a slow link
     const bwBuf = new Uint8Array(BW_BYTES); // getRandomValues caps at 64 KiB/call → fill in chunks (entropy avoids any deflate skew)
     for (let o = 0; o < BW_BYTES; o += 65536) crypto.getRandomValues(bwBuf.subarray(o, Math.min(o + 65536, BW_BYTES)));
@@ -1814,7 +1816,27 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
       if (br.ok) { const secs = Math.max(1e-3, (performance.now() - t1 - (Number.isFinite(rtt) ? rtt : 0)) / 1000); mbps = +((BW_BYTES / 1e6) / secs).toFixed(1); }
       // if the probe didn't finish in the cap, the link is slower than 512KB/10s ≈ 0.4 Mbps → report that honestly
       const slowNote = (mbps == null && Number.isFinite(rtt)) ? `< ${((BW_BYTES * 8 / 1e6) / (BW_CAP_MS / 1000)).toFixed(1)} Mbps (probe capped at ${BW_CAP_MS / 1000}s)` : undefined;
-      return { id: w.id, backend: w.label, rtt_ms: Number.isFinite(rtt) ? +rtt.toFixed(2) : null, up_mbps: mbps, up_note: slowNote };
+      // RTT distribution (p50/p90/p99 over K pings) + optional SUSTAINED throughput both directions (N × 4 MiB),
+      // for experiments that must report link quality (e.g. LAN-like vs WAN-like runs): /net?pings=50&sustained_mb=64
+      const samples: number[] = [];
+      for (let i = 0; i < NET_PINGS; i++) { const t0 = performance.now(); const r = await cap(modelRPC(w, 'ping', {}), 4000); if (!r.ok) break; samples.push(performance.now() - t0); }
+      samples.sort((a, b) => a - b);
+      const pct = (q: number) => samples.length ? +samples[Math.min(samples.length - 1, Math.floor(q * samples.length))]!.toFixed(3) : null;
+      let sustained: Record<string, number | null> | undefined;
+      if (NET_SUSTAINED_MB > 0) {
+        const CH = 4 << 20, n = Math.max(1, Math.round(NET_SUSTAINED_MB / 4));
+        const big = new Uint8Array(CH); for (let o = 0; o < CH; o += 65536) crypto.getRandomValues(big.subarray(o, Math.min(o + 65536, CH)));
+        const bigB64 = b64e(big);
+        let t0 = performance.now(), okUp = 0;
+        for (let i = 0; i < n; i++) { const r = await cap(modelRPC(w, 'ping', { blob: bigB64 }), 60_000); if (!r.ok) break; okUp++; }
+        const upS = (performance.now() - t0) / 1000;
+        t0 = performance.now(); let okDown = 0;
+        for (let i = 0; i < n; i++) { const r = await cap(modelRPC(w, 'ping', { echo_bytes: CH }), 60_000); if (!r.ok) break; okDown++; }
+        const downS = (performance.now() - t0) / 1000;
+        sustained = { up_mbps: okUp ? +((okUp * CH * 8 / 1e6) / upS).toFixed(1) : null, down_mbps: okDown ? +((okDown * CH * 8 / 1e6) / downS).toFixed(1) : null, bytes_each_way: n * CH };
+      }
+      return { id: w.id, backend: w.label, rtt_ms: Number.isFinite(rtt) ? +rtt.toFixed(2) : null, up_mbps: mbps, up_note: slowNote,
+        rtt_p50_ms: pct(0.5), rtt_p90_ms: pct(0.9), rtt_p99_ms: pct(0.99), rtt_samples: samples.length, sustained };
     }));
     const rtts = rows.map((r) => r.rtt_ms).filter((x): x is number => x != null).sort((a, b) => a - b);
     const median = rtts.length ? rtts[Math.floor(rtts.length / 2)] : null;
