@@ -17,6 +17,7 @@
  * (persisted beside MOREGPU_CONFIG) and serves wss:// + https, printing the cert's SHA-256 fingerprint as the
  * worker pin (MOREGPU_PIN). Set MOREGPU_INSECURE=1 to opt back into plaintext ws:// for a simple local/CI run.
  */
+import { VisionBatch, type BatchItem } from './lib/vision_batch.ts';
 import { TrainSession, type Rpc, type RoundSummary, type SessionConfig, type CheckpointStore } from './lib/train_session.ts';
 if (Deno.args.includes('--help') || Deno.args.includes('-h')) { printHelp(); Deno.exit(0); }
 
@@ -1768,6 +1769,62 @@ async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
   }
 }
 
+// ---------- distributed vision inference (apps/coordinator/lib/vision_batch.ts) ----------
+const visionModels = new Map<string, { workers: string[]; meta: Record<string, unknown>; rr: number }>();
+const visionJobs = new Map<string, VisionBatch>();
+async function visionRoute(req: Request, url: URL): Promise<Response> {
+  const parts = url.pathname.split('/').filter(Boolean);   // ['vision', action, id?]
+  const action = parts[1], jid = parts[2];
+  try {
+    if (action === 'models' && req.method === 'GET') return json({ ok: true, models: Object.fromEntries([...visionModels].map(([k, v]) => [k, { workers: v.workers, ...v.meta }])) });
+    if (action === 'load' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; export?: string; workers?: string[] };
+      if (!body.id || !body.export) return json({ error: 'id and export (a MoreGPU export dir on the workers) are required' }, 400);
+      const targets = body.workers?.length ? body.workers : torchWorkers().map((w) => w.id);
+      const res = await Promise.all(targets.map((id) => tsRpc(id, 'vision_infer_load', { id: body.id, export: body.export })));
+      const ok = targets.filter((_, i) => res[i]!.ok);
+      if (!ok.length) return json({ error: `load failed everywhere: ${res[0]?.error}` }, 502);
+      visionModels.set(body.id, { workers: ok, meta: res[targets.indexOf(ok[0]!)]!.data ?? {}, rr: 0 });
+      return json({ ok: true, id: body.id, workers: ok, failed: targets.filter((_, i) => !res[i]!.ok), meta: visionModels.get(body.id)!.meta });
+    }
+    if (action === 'unload' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string };
+      const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model' }, 404);
+      await Promise.all(m.workers.map((w) => tsRpc(w, 'vision_infer_unload', { id: body.id })));
+      visionModels.delete(body.id!); return json({ ok: true });
+    }
+    if (action === 'infer' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; shape?: number[]; data?: string; pool?: string; worker?: string };
+      const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model — POST /vision/load first' }, 404);
+      const live = m.workers.filter((w) => workers.has(w)); if (!live.length) return json({ error: 'no live worker holds this model' }, 503);
+      const w = body.worker && live.includes(body.worker) ? body.worker : live[m.rr++ % live.length]!;
+      const r = await tsRpc(w, 'vision_infer', { id: body.id, shape: body.shape, data: body.data, pool: body.pool });
+      return r.ok ? json({ ok: true, worker: w, ...r.data }) : json({ error: r.error }, 502);
+    }
+    if (action === 'batch' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; items?: BatchItem[]; workers?: string[]; tta?: string; overlap?: number; sw_batch?: number; blend?: string; normalize?: unknown; steal_after_ms?: number; max_attempts?: number };
+      const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model — POST /vision/load first' }, 404);
+      if (!Array.isArray(body.items) || !body.items.length) return json({ error: 'items must be a non-empty array of {ref, out, mask?}' }, 400);
+      const ws = (body.workers?.length ? body.workers.filter((w) => m.workers.includes(w)) : m.workers).filter((w) => workers.has(w));
+      if (!ws.length) return json({ error: 'no live worker holds this model' }, 503);
+      const id = `vj-${crypto.randomUUID().slice(0, 8)}`;
+      const job = new VisionBatch(id, body.id!, body.items, ws, tsRpc, { tta: body.tta, overlap: body.overlap, sw_batch: body.sw_batch, blend: body.blend,
+        normalize: body.normalize, stealAfterMs: body.steal_after_ms, maxAttempts: body.max_attempts, telemetry: tsTelemetrySink(id) });
+      visionJobs.set(id, job);
+      job.run().catch((e) => log('warn', `vision job ${id}: ${(e as Error).message}`));
+      return json({ ok: true, job: id, workers: ws, items: body.items.length });
+    }
+    if (action === 'jobs' && !jid && req.method === 'GET') return json({ ok: true, jobs: [...visionJobs.values()].map((j) => j.progress()) });
+    if (action === 'jobs' && jid) {
+      const j = visionJobs.get(jid); if (!j) return json({ error: 'no such job' }, 404);
+      if (req.method === 'DELETE') { j.cancel(); return json({ ok: true, cancelling: true }); }
+      const done = j.status !== 'running' && j.status !== 'pending';
+      return json({ ok: true, ...j.progress(), results: done || url.searchParams.get('results') ? j.results : undefined, telemetry: tsTelemetry.get(jid) ?? [] });
+    }
+    return json({ error: 'not found' }, 404);
+  } catch (e) { return json({ error: (e as Error).message }, 500); }
+}
+
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o, null, 2), { status, headers: { 'content-type': 'application/json' } });
 const authOk = (req: Request) => constEq((req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '') || (req.headers.get('x-admin-token') ?? ''), cfg.adminToken);
 const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu', 'softmax', 'layernorm'];
@@ -2099,6 +2156,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   //   GET    /train/sessions/:id/telemetry    → recent telemetry records
   //   DELETE /train/sessions/:id
   if (url.pathname === '/train/sessions' || url.pathname.startsWith('/train/sessions/')) return trainSessionRoute(req, url);
+  if (url.pathname.startsWith('/vision/')) return visionRoute(req, url);
   // ---- vision data plane (ADR-0110): per-worker data capabilities and pushed:// blobs ----
   //   GET  /workers/:id/caps                       → readers, data roots/hosts counts, cache stats, train sessions
   //   POST /data/push {id, sha256, data_b64, suffix?, workers?}  → streamed to each worker as pushed://<id>

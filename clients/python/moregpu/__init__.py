@@ -344,6 +344,64 @@ class MoreGPU:
         return self.train_session_create(task, cfg, manifest_len=manifest_len, batch=batch, inner_steps=inner_steps,
                                          lr=lr, workers=workers, **opts)
 
+    # ---- vision inference (native torch workers; MoreGPU exports) + data plane ----
+    def vision_load(self, id: str, export: str, workers: Sequence[str] | None = None) -> dict:
+        """Load a MoreGPU export (segment/classify model dir, or a JEPA encoder dir) on the workers (path ON the workers)."""
+        body: dict[str, Any] = {"id": id, "export": export}
+        if workers:
+            body["workers"] = list(workers)
+        return self._req("/vision/load", "POST", body)
+
+    def vision_models(self) -> dict:
+        return self._req("/vision/models").get("models", {})
+
+    def vision_infer(self, id: str, x: Sequence[float], shape: Sequence[int], pool: str | None = None) -> tuple[list[float], list[int]]:
+        """One forward on a flat f32 input of `shape` (e.g. [1,3,224,224]) → (flat output, output shape)."""
+        body: dict[str, Any] = {"id": id, "shape": list(shape), "data": _f32_b64(x)}
+        if pool:
+            body["pool"] = pool
+        r = self._req("/vision/infer", "POST", body)
+        return _b64_f32(r["data"]), r["shape"]
+
+    def vision_batch(self, id: str, items: Sequence[dict], **opts: Any) -> dict:
+        """Distributed whole-volume prediction. items: [{ref: {uri, ...}, out: "<name under MOREGPU_OUTPUT_DIR>",
+        mask?: {uri}}]. opts: tta ('none'|'flip'), overlap, sw_batch, blend, normalize, workers, steal_after_ms, max_attempts."""
+        return self._req("/vision/batch", "POST", {"id": id, "items": list(items), **opts})
+
+    def vision_job(self, job: str, results: bool = False) -> dict:
+        return self._req(f"/vision/jobs/{job}" + ("?results=1" if results else ""))
+
+    def vision_wait(self, job: str, poll_s: float = 1.0, timeout_s: float | None = None) -> dict:
+        import time
+        t0 = time.time()
+        while True:
+            j = self.vision_job(job)
+            if j.get("status") not in ("running", "pending") or (timeout_s and time.time() - t0 > timeout_s):
+                return j
+            time.sleep(poll_s)
+
+    def vision_cancel(self, job: str) -> dict:
+        return self._req(f"/vision/jobs/{job}", "DELETE")
+
+    def vision_unload(self, id: str) -> dict:
+        return self._req("/vision/unload", "POST", {"id": id})
+
+    def data_push(self, id: str, data: bytes, suffix: str = "", workers: Sequence[str] | None = None) -> dict:
+        """Stream bytes to the workers' RAM-staged blob store; refer to them as pushed://<id> in manifests."""
+        import hashlib
+        body: dict[str, Any] = {"id": id, "sha256": hashlib.sha256(data).hexdigest(), "data_b64": base64.b64encode(data).decode(),
+                                "suffix": suffix}
+        if workers:
+            body["workers"] = list(workers)
+        return self._req("/data/push", "POST", body)
+
+    def worker_caps(self, worker: str) -> dict:
+        return self._req(f"/workers/{worker}/caps")
+
+    def net(self, pings: int = 20, sustained_mb: int = 0) -> dict:
+        """Per-worker RTT (min + p50/p90/p99) and bandwidth; sustained_mb>0 adds sustained up/down throughput."""
+        return self._req(f"/net?pings={pings}&sustained_mb={sustained_mb}")
+
     # ---- resident-model serving (fast: the WHOLE forward runs on the worker, one round-trip per token) ----
     def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None,
                    push: bool = False) -> dict:
