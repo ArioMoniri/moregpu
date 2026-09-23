@@ -1,0 +1,12 @@
+# Reviewed exceptions to tests/security/pickle_ban_test.py (ADR-0113). Format: path<TAB>rule<TAB>substring of the call.
+# Every entry must still match a real call, or the ban test fails as "stale" — delete the line when the code is fixed.
+#
+# TEMPORARY (M4): the legacy LLM loaders in worker_torch.py call AutoModelForCausalLM.from_pretrained without
+# use_safetensors=True (BASELINE §6.2). The parent PR adds use_safetensors=True to each of these calls (test-first) and
+# deletes these lines. Do not add new entries without a security review.
+apps/worker/worker_torch.py	from-pretrained-safetensors	from_pretrained(cfg["model"], dtype=torch.float16 if fp16_effective else torch.float32)
+apps/worker/worker_torch.py	from-pretrained-safetensors	d, dtype=torch.float16 if fp16_effective else torch.float32, local_files_only=True)
+apps/worker/worker_torch.py	from-pretrained-safetensors	from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True)
+apps/worker/worker_torch.py	from-pretrained-safetensors	from_pretrained(cfg["model"], device_map={"": 0}, low_cpu_mem_usage=True)
+apps/worker/worker_torch.py	from-pretrained-safetensors	from_pretrained(cfg["model"], quantization_config=_bnb_config(_qm),
+apps/worker/worker_torch.py	from-pretrained-safetensors	from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True)

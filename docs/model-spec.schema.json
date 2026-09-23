@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moregpu.dev/schemas/model-spec-v1.json",
+  "title": "MoreGPU model spec v1",
+  "description": "How a worker fetches, verifies, builds and runs a published vision model (ADR-0113).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "state_dict",
+        "safetensors",
+        "plugin",
+        "torch_export",
+        "torchscript",
+        "onnx"
+      ]
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^(hf://[^/]+/.+|https://.+|pushed://[A-Za-z0-9._-]+|file:///.+)$",
+      "description": "hf://org/repo[@rev]/file, https://\u2026 (sha256 required), pushed://<id> (sha256 required) or file:///path under the worker's MOREGPU_MODEL_ROOTS"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "arch": {
+      "type": "object",
+      "required": [
+        "registry",
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "registry": {
+          "type": "string",
+          "enum": [
+            "torchvision",
+            "timm",
+            "monai",
+            "hf",
+            "plugin"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kwargs": {
+          "type": "object"
+        }
+      }
+    },
+    "dtype": {
+      "type": "string",
+      "enum": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ]
+    },
+    "io": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tensor"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tensor"
+          }
+        }
+      }
+    },
+    "preprocess": {
+      "type": "object"
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "full",
+            "sliding_window"
+          ]
+        },
+        "sliding_window": {
+          "type": "object",
+          "required": [
+            "roi"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "roi": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "overlap": {
+              "type": "number",
+              "minimum": 0,
+              "exclusiveMaximum": 1
+            },
+            "blend": {
+              "type": "string",
+              "enum": [
+                "gaussian",
+                "constant"
+              ]
+            },
+            "sw_batch": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "tta": {
+          "type": "string",
+          "enum": [
+            "none",
+            "flip"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "sliding_window"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "required": [
+          "sliding_window"
+        ]
+      }
+    },
+    "postprocess": {
+      "type": "object"
+    },
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "cpu",
+            "cuda",
+            "mps"
+          ]
+        },
+        "min_vram_gb": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "licence": {
+      "type": "string"
+    },
+    "citation": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "pattern": "^(https|pushed)://"
+          }
+        },
+        "required": [
+          "source"
+        ]
+      },
+      "then": {
+        "required": [
+          "sha256"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "format": {
+            "enum": [
+              "state_dict",
+              "safetensors",
+              "plugin"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "arch"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "format": {
+            "const": "plugin"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arch": {
+            "properties": {
+              "registry": {
+                "const": "plugin"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "required": [
+          "source"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "tensor": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "description": "null marks a dynamic dimension (e.g. batch)"
+        },
+        "dtype": {
+          "type": "string",
+          "enum": [
+            "float32",
+            "float16",
+            "bfloat16",
+            "uint8",
+            "int64"
+          ]
+        }
+      }
+    }
+  }
+}
