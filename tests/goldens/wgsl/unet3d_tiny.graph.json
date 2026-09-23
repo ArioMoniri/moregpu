@@ -1,0 +1,1574 @@
+{
+ "version": 1,
+ "inputs": [
+  {
+   "name": "x",
+   "shape": [
+    1,
+    1,
+    32,
+    32,
+    32
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "x",
+    "net.conv_0.conv_0.conv.weight",
+    "net.conv_0.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d",
+    "net.conv_0.conv_0.adn.N.weight",
+    "net.conv_0.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu_"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu_",
+    "net.conv_0.conv_1.conv.weight",
+    "net.conv_0.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_1"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_1",
+    "net.conv_0.conv_1.adn.N.weight",
+    "net.conv_0.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_1"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_1"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_1"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_1"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__1"
+  },
+  {
+   "op": "aten.max_pool3d.default",
+   "inputs": [
+    "leaky_relu__1"
+   ],
+   "attrs": {
+    "kernel_size": [
+     2,
+     2,
+     2
+    ],
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "ceil_mode": false
+   },
+   "output": "max_pool3d"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "max_pool3d",
+    "net.down_1.convs.conv_0.conv.weight",
+    "net.down_1.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_2"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_2",
+    "net.down_1.convs.conv_0.adn.N.weight",
+    "net.down_1.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_2"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_2"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_2"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_2"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__2"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__2",
+    "net.down_1.convs.conv_1.conv.weight",
+    "net.down_1.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_3"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_3",
+    "net.down_1.convs.conv_1.adn.N.weight",
+    "net.down_1.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_3"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_3"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_3"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_3"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__3"
+  },
+  {
+   "op": "aten.max_pool3d.default",
+   "inputs": [
+    "leaky_relu__3"
+   ],
+   "attrs": {
+    "kernel_size": [
+     2,
+     2,
+     2
+    ],
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "ceil_mode": false
+   },
+   "output": "max_pool3d_1"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "max_pool3d_1",
+    "net.down_2.convs.conv_0.conv.weight",
+    "net.down_2.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_4"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_4",
+    "net.down_2.convs.conv_0.adn.N.weight",
+    "net.down_2.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_4"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_4"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_4"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_4"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__4"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__4",
+    "net.down_2.convs.conv_1.conv.weight",
+    "net.down_2.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_5"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_5",
+    "net.down_2.convs.conv_1.adn.N.weight",
+    "net.down_2.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_5"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_5"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_5"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_5"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__5"
+  },
+  {
+   "op": "aten.max_pool3d.default",
+   "inputs": [
+    "leaky_relu__5"
+   ],
+   "attrs": {
+    "kernel_size": [
+     2,
+     2,
+     2
+    ],
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "ceil_mode": false
+   },
+   "output": "max_pool3d_2"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "max_pool3d_2",
+    "net.down_3.convs.conv_0.conv.weight",
+    "net.down_3.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_6"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_6",
+    "net.down_3.convs.conv_0.adn.N.weight",
+    "net.down_3.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_6"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_6"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_6"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_6"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__6"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__6",
+    "net.down_3.convs.conv_1.conv.weight",
+    "net.down_3.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_7"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_7",
+    "net.down_3.convs.conv_1.adn.N.weight",
+    "net.down_3.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_7"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_7"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_7"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_7"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__7"
+  },
+  {
+   "op": "aten.max_pool3d.default",
+   "inputs": [
+    "leaky_relu__7"
+   ],
+   "attrs": {
+    "kernel_size": [
+     2,
+     2,
+     2
+    ],
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "ceil_mode": false
+   },
+   "output": "max_pool3d_3"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "max_pool3d_3",
+    "net.down_4.convs.conv_0.conv.weight",
+    "net.down_4.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_8"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_8",
+    "net.down_4.convs.conv_0.adn.N.weight",
+    "net.down_4.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_8"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_8"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_8"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_8"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__8"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__8",
+    "net.down_4.convs.conv_1.conv.weight",
+    "net.down_4.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_9"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_9",
+    "net.down_4.convs.conv_1.adn.N.weight",
+    "net.down_4.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_9"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_9"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_9"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_9"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__9"
+  },
+  {
+   "op": "aten.conv_transpose3d.input",
+   "inputs": [
+    "leaky_relu__9",
+    "net.upcat_4.upsample.deconv.weight",
+    "net.upcat_4.upsample.deconv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "output_padding": [
+     0,
+     0,
+     0
+    ],
+    "groups": 1,
+    "dilation": [
+     1,
+     1,
+     1
+    ]
+   },
+   "output": "conv_transpose3d"
+  },
+  {
+   "op": "aten.pad.default",
+   "inputs": [
+    "conv_transpose3d"
+   ],
+   "attrs": {
+    "pad": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "mode": "replicate",
+    "value": null
+   },
+   "output": "pad"
+  },
+  {
+   "op": "aten.cat.default",
+   "inputs": [
+    "leaky_relu__7",
+    "pad"
+   ],
+   "attrs": {
+    "dim": 1
+   },
+   "output": "cat"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "cat",
+    "net.upcat_4.convs.conv_0.conv.weight",
+    "net.upcat_4.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_10"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_10",
+    "net.upcat_4.convs.conv_0.adn.N.weight",
+    "net.upcat_4.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_10"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_10"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_10"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_10"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__10"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__10",
+    "net.upcat_4.convs.conv_1.conv.weight",
+    "net.upcat_4.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_11"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_11",
+    "net.upcat_4.convs.conv_1.adn.N.weight",
+    "net.upcat_4.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_11"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_11"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_11"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_11"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__11"
+  },
+  {
+   "op": "aten.conv_transpose3d.input",
+   "inputs": [
+    "leaky_relu__11",
+    "net.upcat_3.upsample.deconv.weight",
+    "net.upcat_3.upsample.deconv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "output_padding": [
+     0,
+     0,
+     0
+    ],
+    "groups": 1,
+    "dilation": [
+     1,
+     1,
+     1
+    ]
+   },
+   "output": "conv_transpose3d_1"
+  },
+  {
+   "op": "aten.pad.default",
+   "inputs": [
+    "conv_transpose3d_1"
+   ],
+   "attrs": {
+    "pad": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "mode": "replicate",
+    "value": null
+   },
+   "output": "pad_1"
+  },
+  {
+   "op": "aten.cat.default",
+   "inputs": [
+    "leaky_relu__5",
+    "pad_1"
+   ],
+   "attrs": {
+    "dim": 1
+   },
+   "output": "cat_1"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "cat_1",
+    "net.upcat_3.convs.conv_0.conv.weight",
+    "net.upcat_3.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_12"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_12",
+    "net.upcat_3.convs.conv_0.adn.N.weight",
+    "net.upcat_3.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_12"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_12"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_12"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_12"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__12"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__12",
+    "net.upcat_3.convs.conv_1.conv.weight",
+    "net.upcat_3.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_13"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_13",
+    "net.upcat_3.convs.conv_1.adn.N.weight",
+    "net.upcat_3.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_13"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_13"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_13"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_13"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__13"
+  },
+  {
+   "op": "aten.conv_transpose3d.input",
+   "inputs": [
+    "leaky_relu__13",
+    "net.upcat_2.upsample.deconv.weight",
+    "net.upcat_2.upsample.deconv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "output_padding": [
+     0,
+     0,
+     0
+    ],
+    "groups": 1,
+    "dilation": [
+     1,
+     1,
+     1
+    ]
+   },
+   "output": "conv_transpose3d_2"
+  },
+  {
+   "op": "aten.pad.default",
+   "inputs": [
+    "conv_transpose3d_2"
+   ],
+   "attrs": {
+    "pad": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "mode": "replicate",
+    "value": null
+   },
+   "output": "pad_2"
+  },
+  {
+   "op": "aten.cat.default",
+   "inputs": [
+    "leaky_relu__3",
+    "pad_2"
+   ],
+   "attrs": {
+    "dim": 1
+   },
+   "output": "cat_2"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "cat_2",
+    "net.upcat_2.convs.conv_0.conv.weight",
+    "net.upcat_2.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_14"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_14",
+    "net.upcat_2.convs.conv_0.adn.N.weight",
+    "net.upcat_2.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_14"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_14"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_14"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_14"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__14"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__14",
+    "net.upcat_2.convs.conv_1.conv.weight",
+    "net.upcat_2.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_15"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_15",
+    "net.upcat_2.convs.conv_1.adn.N.weight",
+    "net.upcat_2.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_15"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_15"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_15"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_15"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__15"
+  },
+  {
+   "op": "aten.conv_transpose3d.input",
+   "inputs": [
+    "leaky_relu__15",
+    "net.upcat_1.upsample.deconv.weight",
+    "net.upcat_1.upsample.deconv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     2,
+     2,
+     2
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "output_padding": [
+     0,
+     0,
+     0
+    ],
+    "groups": 1,
+    "dilation": [
+     1,
+     1,
+     1
+    ]
+   },
+   "output": "conv_transpose3d_3"
+  },
+  {
+   "op": "aten.pad.default",
+   "inputs": [
+    "conv_transpose3d_3"
+   ],
+   "attrs": {
+    "pad": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "mode": "replicate",
+    "value": null
+   },
+   "output": "pad_3"
+  },
+  {
+   "op": "aten.cat.default",
+   "inputs": [
+    "leaky_relu__1",
+    "pad_3"
+   ],
+   "attrs": {
+    "dim": 1
+   },
+   "output": "cat_3"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "cat_3",
+    "net.upcat_1.convs.conv_0.conv.weight",
+    "net.upcat_1.convs.conv_0.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_16"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_16",
+    "net.upcat_1.convs.conv_0.adn.N.weight",
+    "net.upcat_1.convs.conv_0.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_16"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_16"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_16"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_16"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__16"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__16",
+    "net.upcat_1.convs.conv_1.conv.weight",
+    "net.upcat_1.convs.conv_1.conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv3d_17"
+  },
+  {
+   "op": "aten.instance_norm.default",
+   "inputs": [
+    "conv3d_17",
+    "net.upcat_1.convs.conv_1.adn.N.weight",
+    "net.upcat_1.convs.conv_1.adn.N.bias"
+   ],
+   "attrs": {
+    "use_input_stats": true,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "instance_norm_17"
+  },
+  {
+   "op": "aten.dropout.default",
+   "inputs": [
+    "instance_norm_17"
+   ],
+   "attrs": {
+    "p": 0.0,
+    "train": false
+   },
+   "output": "dropout_17"
+  },
+  {
+   "op": "aten.leaky_relu_.default",
+   "inputs": [
+    "dropout_17"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu__17"
+  },
+  {
+   "op": "aten.conv3d.default",
+   "inputs": [
+    "leaky_relu__17",
+    "net.final_conv.weight",
+    "net.final_conv.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1,
+     1
+    ],
+    "padding": [
+     0,
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "logits"
+  },
+  {
+   "op": "aten.softmax.int",
+   "inputs": [
+    "logits"
+   ],
+   "attrs": {
+    "dim": 1,
+    "dtype": null
+   },
+   "output": "probs"
+  },
+  {
+   "op": "aten.argmax.default",
+   "inputs": [
+    "probs"
+   ],
+   "attrs": {
+    "dim": 1,
+    "keepdim": true
+   },
+   "output": "labels"
+  }
+ ],
+ "outputs": [
+  "logits",
+  "probs",
+  "labels"
+ ],
+ "weights": "unet3d_tiny.safetensors"
+}
