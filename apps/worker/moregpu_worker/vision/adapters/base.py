@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,43 @@ from ..fetch import sha256_file
 
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 Fetch = Callable[..., Path]
+
+# CVE-2025-32434: torch.load(weights_only=True) could still execute code on torch <= 2.5.1. The pickle ban (state_dict
+# .pt/.pth, the weights_only checks inside .pt2 archives) and the TorchScript deserializer are only trusted on >= 2.6.0.
+MIN_SAFE_TORCH = (2, 6, 0)
+_VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?(.*)$")
+
+
+def parse_torch_version(v: str) -> tuple[int, int, int, bool] | None:
+    """``"2.5.1+cu121"`` → ``(2, 5, 1, False)``; the bool marks a pre-release (``a``/``b``/``rc``/``dev``, e.g. a
+    ``2.6.0a0+git…`` source build or a ``2.6.0.dev2024…`` nightly), which may predate the fix. None if unparseable."""
+    m = _VERSION_RE.match(str(v or "").split("+", 1)[0])
+    if not m:
+        return None
+    rest = m.group(4).lower()
+    if rest and not re.fullmatch(r"\.?(a|alpha|b|beta|rc|c|pre|preview|dev)[.\-_]?\d*(\.?dev\d*)?(\.post\d+)?|\.post\d+", rest):
+        return None
+    pre = bool(rest) and not rest.startswith(".post")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), pre
+
+
+def torch_load_is_safe(v: str | None = None) -> bool:
+    """True iff torch ``v`` (default: the running ``torch.__version__``) is a >= 2.6.0 release, or a pre-release of a
+    LATER version. Unparseable versions fail closed."""
+    p = parse_torch_version(torch.__version__ if v is None else v)
+    if p is None:
+        return False
+    rel, pre = p[:3], p[3]
+    return rel > MIN_SAFE_TORCH or (rel == MIN_SAFE_TORCH and not pre)
+
+
+def require_safe_torch(what: str) -> None:
+    """Refuse (RefusedFormat) to deserialise ``what`` on a torch affected by CVE-2025-32434."""
+    if not torch_load_is_safe():
+        from ..errors import RefusedFormat
+        raise RefusedFormat(f"refusing to load {what}: torch {torch.__version__} is older than 2.6.0, where "
+                            f"torch.load(weights_only=True) is bypassable (CVE-2025-32434); upgrade with "
+                            f"pip install 'torch>=2.6' (safetensors and ONNX still load)")
 
 
 @dataclass

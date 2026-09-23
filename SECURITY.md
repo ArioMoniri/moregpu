@@ -92,6 +92,14 @@ pool secure:
 * Rotate tokens if you suspect they have been exposed.
 * Only allow workers from machines you and your participants are authorized to
   enroll.
+* Run native torch workers on `torch>=2.6` (CVE-2025-32434). The model
+  adapters refuse pickle-based formats on older torch.
+* Set `MOREGPU_OUTPUT_DIR` (the only place exports are written) and
+  `MOREGPU_MODEL_HOSTS` / `MOREGPU_MODEL_ROOTS` on torch workers
+  (docs/MODELS.md#worker-environment).
+* Start torch workers with `moregpu torch-join` from a tree that has a signed
+  `apps/worker/MANIFEST.sha256`. Set `MOREGPU_VERIFY_MANIFEST=1` to refuse
+  unsigned trees.
 
 ---
 

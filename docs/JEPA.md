@@ -67,8 +67,8 @@ An exported encoder can:
 ```bash
 # on each machine that should help:  moregpu torch-join --server wss://HOST:8787/ws --token … --pin …
 moregpu train jepa --task jepa_2p5d --data refs.jsonl --size 224,224 --channels 3 \
-   --inner-steps 50 --batch 32 --lr 1e-3 --cosine --target-samples 200000 --export /data/enc
-moregpu train segment --encoder /data/enc --data seg_refs.jsonl --num-classes 3 --target-samples 20000
+   --inner-steps 50 --batch 32 --lr 1e-3 --cosine --target-samples 200000 --export enc   # relative to each worker's MOREGPU_OUTPUT_DIR
+moregpu train segment --encoder enc --data seg_refs.jsonl --num-classes 3 --target-samples 20000
 ```
 
 Other entry points:

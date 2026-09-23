@@ -5,8 +5,9 @@
   2) export the encoder on a worker
   3) fine-tune a light decoder on top (segment task, Dice+CE, DiLoCo) and export the whole model
 
-  python3 examples/segment_finetune.py --url http://localhost:8787 --token $MOREGPU_ADMIN_TOKEN --out /tmp/mgpu-seg
-(`--out` is a directory ON THE WORKERS; on a single machine all workers share it.)"""
+  python3 examples/segment_finetune.py --url http://localhost:8787 --token $MOREGPU_ADMIN_TOKEN --out mgpu-seg
+(`--out` is a directory ON THE WORKERS inside their MOREGPU_OUTPUT_DIR — a relative path resolves inside it, anything
+outside it is refused; on a single machine all workers share it.)"""
 import argparse, os, sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clients", "python"))

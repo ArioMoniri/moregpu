@@ -37,10 +37,13 @@ Usage:
     python3 scripts/release_sign.py sign --key /secure/moregpu_release_key.b64 \\
         apps/worker/worker.ts apps/worker/vision_wgsl.ts apps/worker/worker_torch.py
 
-    # each release (ADR-0103): a signed MANIFEST.sha256 of the torch worker tree (moregpu_worker/** + vision_ops.json)
+    # each release (ADR-0103): a signed MANIFEST.sha256 of EVERY file under apps/worker (worker_torch.py, pyproject.toml,
+    # moregpu_worker/**, ...; not *.sig), headed by the pyproject.toml version (rollback guard)
     python3 scripts/release_sign.py manifest --key /secure/moregpu_release_key.b64 --root apps/worker
     # ...and its verify step (also: deno run --allow-read scripts/verify_release.ts --manifest-root apps/worker ...)
-    python3 scripts/release_sign.py verify-manifest --root apps/worker --pubkey <RELEASE_PUBKEY_B64>
+    python3 scripts/release_sign.py verify-manifest --root apps/worker --pubkey <RELEASE_PUBKEY_B64> \\
+        [--purge-pycache] [--expect-version V] [--state ~/.local/state/moregpu/torch-worker.version]
+    # (`moregpu torch-join` runs exactly this before it execs worker_torch.py)
 """
 from __future__ import annotations
 
@@ -104,52 +107,113 @@ def sign_artifact(sk: Ed25519PrivateKey, path: str, name: str | None = None) -> 
 
 
 # ---------------------------------------------------------------- ADR-0103: signed MANIFEST.sha256 (torch worker tree)
+# The manifest covers EVERY file under the worker root (apps/worker: worker_torch.py, pyproject.toml, moregpu_worker/**,
+# vision_ops.json, worker.ts, ...) except the manifest + its signature and detached `*.sig` files. Its first line binds
+# the release to apps/worker/pyproject.toml's version (rollback protection, see verify_manifest):
+#     # moregpu-worker-version: <version>
+#     <sha256>  <path>            (sha256sum format, sorted by path, relative to the root)
 MANIFEST_NAME = "MANIFEST.sha256"
-MANIFEST_DIRS = ("moregpu_worker",)       # covered recursively
-MANIFEST_FILES = ("vision_ops.json",)     # covered top-level files (the WGSL executor contract the lowering reads)
+VERSION_PREFIX = "# moregpu-worker-version: "
+EXIT_VERSION = 6
 
 
-def _ignored(rel: str) -> bool:
-    return "__pycache__" in rel.split("/") or rel.endswith(".pyc")
+def _excluded(rel: str) -> bool:
+    """Not covered by the manifest: the manifest itself, detached signatures."""
+    return rel in (MANIFEST_NAME, MANIFEST_NAME + ".sig") or rel.endswith(".sig")
+
+
+def _bytecode(rel: str) -> bool:
+    return "__pycache__" in rel.split("/") or rel.endswith((".pyc", ".pyo"))
+
+
+def pyproject_version(root: str) -> str | None:
+    import re
+    try:
+        with open(os.path.join(root, "pyproject.toml")) as f:
+            m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', f.read())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def version_key(v: str) -> tuple:
+    """PEP 440-ish ordering key: `0.7.0.dev0` < `0.7.0a1` < `0.7.0rc1` < `0.7.0` < `0.7.0.post1` < `0.7.1`."""
+    import re
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)(?:[.\-_]?(dev|a|alpha|b|beta|rc|c|post)[.\-_]?(\d*))?(?:\+.*)?", v.strip().lower())
+    if not m:
+        raise ValueError(f"unparseable version {v!r}")
+    rel = tuple(int(x) for x in m.group(1).split("."))
+    rel = rel + (0,) * (6 - len(rel))
+    phase = {"dev": 0, "a": 1, "alpha": 1, "b": 2, "beta": 2, "rc": 3, "c": 3, None: 4, "post": 5}[m.group(2)]
+    return rel, phase, int(m.group(3) or 0)
 
 
 def manifest_files(root: str) -> list[str]:
     out = []
-    for d in MANIFEST_DIRS:
-        for dp, dns, fns in os.walk(os.path.join(root, d)):
-            dns[:] = sorted(x for x in dns if x != "__pycache__")
-            for fn in fns:
-                rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
-                if not _ignored(rel):
-                    out.append(rel)
-    out += [f for f in MANIFEST_FILES if os.path.isfile(os.path.join(root, f))]
+    for dp, dns, fns in os.walk(root):
+        dns[:] = sorted(x for x in dns if x != "__pycache__")
+        for fn in fns:
+            rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
+            if not _excluded(rel) and not _bytecode(rel):
+                out.append(rel)
     return sorted(out)
 
 
 def build_manifest(root: str) -> str:
-    """`<sha256>  <path>` lines (sha256sum format), sorted by path, relative to root."""
-    lines = []
+    """Version header + `<sha256>  <path>` lines (sha256sum format), sorted by path, relative to root."""
+    version = pyproject_version(root)
+    if not version:
+        raise SystemExit(f"[manifest] {root}/pyproject.toml has no `version = \"...\"` — cannot bind the manifest")
+    lines = [VERSION_PREFIX + version]
     for rel in manifest_files(root):
         with open(os.path.join(root, rel), "rb") as f:
             lines.append(f"{sha256_hex(f.read())}  {rel}")
     return "\n".join(lines) + "\n"
 
 
-def verify_manifest(root: str, manifest: bytes, sig_b64: str, pubkey: str) -> tuple[int, list[str]]:
-    """(0, []) when the manifest's signature verifies AND every covered file matches; (4, why) bad signature;
-    (5, problems) tampered / missing / unlisted files."""
+def purge_bytecode(root: str) -> list[str]:
+    """Delete every __pycache__ dir and stray .pyc/.pyo under root (a planted timestamp-pyc can shadow a verified
+    .py). Returns what was removed."""
+    import shutil
+    gone = []
+    for dp, dns, fns in os.walk(root, topdown=True):
+        for d in [d for d in dns if d == "__pycache__"]:
+            p = os.path.join(dp, d)
+            if os.path.islink(p):
+                os.unlink(p)
+            else:
+                shutil.rmtree(p)
+            gone.append(p)
+            dns.remove(d)
+        for fn in fns:
+            if fn.endswith((".pyc", ".pyo")):
+                os.unlink(os.path.join(dp, fn))
+                gone.append(os.path.join(dp, fn))
+    return gone
+
+
+def verify_manifest(root: str, manifest: bytes, sig_b64: str, pubkey: str, expect_version: str | None = None,
+                    state_file: str | None = None) -> tuple[int, list[str]]:
+    """(0, []) when the signature verifies, every covered file matches, nothing else exists under root and the version
+    checks pass; (4, why) bad signature; (5, problems) tampered / missing / unlisted files, __pycache__ dirs, symlinked
+    dirs; (6, why) missing version header, header != <root>/pyproject.toml version, != expect_version, or lower than
+    the version last recorded in state_file (rollback). On success state_file is updated to this version."""
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     try:
         Ed25519PublicKey.from_public_bytes(b64d(pubkey)).verify(b64d(sig_b64), release_message(MANIFEST_NAME, sha256_hex(manifest)))
     except (InvalidSignature, ValueError) as e:
         return 4, [f"signature does not verify against the release key ({type(e).__name__})"]
-    listed, bad = {}, []
-    for line in manifest.decode().splitlines():
+    listed, bad, version = {}, [], None
+    lines = manifest.decode().splitlines()
+    if lines and lines[0].startswith(VERSION_PREFIX):
+        version = lines[0][len(VERSION_PREFIX):].strip()
+        lines = lines[1:]
+    for line in lines:
         if not line:
             continue
         h, sep, rel = line.partition("  ")
-        if not sep or len(h) != 64 or rel.startswith("/") or ".." in rel.split("/"):
+        if not sep or len(h) != 64 or rel.startswith("/") or ".." in rel.split("/") or _excluded(rel):
             bad.append(f"malformed line: {line[:80]}")
             continue
         listed[rel] = h
@@ -161,13 +225,44 @@ def verify_manifest(root: str, manifest: bytes, sig_b64: str, pubkey: str) -> tu
         with open(p, "rb") as f:
             if sha256_hex(f.read()) != want:
                 bad.append(f"tampered {rel}")
-    for top in sorted({r.split("/", 1)[0] for r in listed if "/" in r}):
-        for dp, _dns, fns in os.walk(os.path.join(root, top)):
-            for fn in fns:
-                rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
-                if not _ignored(rel) and rel not in listed:
-                    bad.append(f"unlisted {rel}")
-    return (5, bad) if bad else (0, [])
+    for dp, dns, fns in os.walk(root):
+        for d in list(dns):
+            rel = os.path.relpath(os.path.join(dp, d), root).replace(os.sep, "/")
+            if d == "__pycache__":
+                bad.append(f"bytecode cache {rel}/ (purge it: verify-manifest --purge-pycache)")
+                dns.remove(d)
+            elif os.path.islink(os.path.join(dp, d)):
+                bad.append(f"symlinked directory {rel}")
+        for fn in fns:
+            rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
+            if not _excluded(rel) and rel not in listed:
+                bad.append(f"unlisted {rel}")
+    if bad:
+        return 5, bad
+    if not version:
+        return EXIT_VERSION, ["manifest has no version header (re-sign it with this release_sign.py)"]
+    have = pyproject_version(root)
+    if version != have:
+        return EXIT_VERSION, [f"manifest version {version} != pyproject.toml version {have}"]
+    if expect_version and version != expect_version:
+        return EXIT_VERSION, [f"manifest version {version} != expected {expect_version}"]
+    if state_file:
+        try:
+            with open(state_file) as f:
+                last = f.read().strip()
+        except FileNotFoundError:
+            last = ""
+        try:
+            if last and version_key(version) < version_key(last):
+                return EXIT_VERSION, [f"rollback: manifest version {version} is older than the last verified {last} "
+                                      f"({state_file})"]
+            if not last or version_key(version) > version_key(last):
+                os.makedirs(os.path.dirname(os.path.abspath(state_file)), exist_ok=True)
+                with open(state_file, "w") as f:
+                    f.write(version + "\n")
+        except ValueError as e:
+            return EXIT_VERSION, [str(e)]
+    return 0, []
 
 
 def load_private_key(path: str) -> Ed25519PrivateKey:
@@ -222,7 +317,7 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
     with open(out + ".sig", "w") as f:
         f.write(sig + "\n")
     print(f'RELEASE_PUBKEY_B64="{pubkey_b64(sk)}"')
-    n = len(text.splitlines())
+    n = len(text.splitlines()) - 1   # minus the version header
     print(f"# {MANIFEST_NAME}: {n} files, sha256={sha256_hex(text)}  sig-> {out}.sig")
     return 0
 
@@ -238,11 +333,15 @@ def _cmd_verify_manifest(args: argparse.Namespace) -> int:
     except OSError as e:
         print(f"[verify] REJECT {MANIFEST_NAME}: {e}", file=sys.stderr)
         return 4
-    code, problems = verify_manifest(args.root, data, sig_b64, args.pubkey)
+    if args.purge_pycache:
+        for p in purge_bytecode(args.root):
+            print(f"[verify] purged bytecode {p}", file=sys.stderr)
+    code, problems = verify_manifest(args.root, data, sig_b64, args.pubkey, args.expect_version, args.state)
     if code:
         print(f"[verify] REJECT {MANIFEST_NAME}: " + "; ".join(problems[:20]), file=sys.stderr)
         return code
-    print(f"[verify] OK {MANIFEST_NAME}: signed by the release key · every covered file matches")
+    print(f"[verify] OK {MANIFEST_NAME}: signed by the release key · every file under {args.root} matches · "
+          f"version {pyproject_version(args.root)}")
     return 0
 
 
@@ -260,17 +359,23 @@ def main(argv: list[str] | None = None) -> int:
     sg.add_argument("artifacts", nargs="+", help="artifact files to sign (e.g. apps/worker/worker.ts)")
     sg.set_defaults(fn=_cmd_sign)
 
-    mf = sub.add_parser("manifest", help="write + sign MANIFEST.sha256 of the torch worker tree (ADR-0103)")
+    mf = sub.add_parser("manifest", help="write + sign MANIFEST.sha256 of the whole torch worker tree (ADR-0103)")
     mf.add_argument("--key", required=True, help="path to the release PRIVATE key from `keygen`")
-    mf.add_argument("--root", default="apps/worker", help="worker root holding moregpu_worker/ (default apps/worker)")
+    mf.add_argument("--root", default="apps/worker", help="worker root (default apps/worker; needs pyproject.toml)")
     mf.add_argument("--out", help="manifest path (default <root>/MANIFEST.sha256; the .sig goes next to it)")
     mf.set_defaults(fn=_cmd_manifest)
 
-    vm = sub.add_parser("verify-manifest", help="verify MANIFEST.sha256's signature + every covered file (exit 0/4/5)")
+    vm = sub.add_parser("verify-manifest", help="verify MANIFEST.sha256's signature + every file under the root + its "
+                                                 "version (exit 0/4/5/6)")
     vm.add_argument("--root", default="apps/worker")
     vm.add_argument("--pubkey", required=True, help="release PUBLIC key (raw, base64)")
     vm.add_argument("--manifest")
     vm.add_argument("--sig")
+    vm.add_argument("--purge-pycache", action="store_true",
+                    help="delete __pycache__ dirs / .pyc files under the root first (otherwise they are refused)")
+    vm.add_argument("--expect-version", help="refuse (exit 6) unless the signed manifest is for exactly this version")
+    vm.add_argument("--state", help="rollback guard: refuse (exit 6) a version older than the one recorded in this "
+                                    "file; record the verified version on success")
     vm.set_defaults(fn=_cmd_verify_manifest)
 
     args = ap.parse_args(argv)

@@ -1,6 +1,10 @@
 """Hardware/software fingerprint for telemetry records (ADR-0111). No PII: the hostname is only kept as a salted,
 truncated SHA-256 (enough to tell machines apart within one run's JSONL, not to recover the name); no user names,
-paths, IPs, serial numbers or UUIDs are collected."""
+paths, IPs, serial numbers or UUIDs are collected.
+
+The salt is a fixed domain tag plus 16 random bytes drawn once per run (per worker process): ``host_hash`` is stable
+within a run, but differs across runs and machines, so it cannot be dictionary-attacked back to a hostname with a
+precomputed table, nor used to link the same machine across separate runs / exported JSONL files."""
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +12,7 @@ import os
 import platform
 import socket
 
-_SALT = b"moregpu.telemetry/1:host:"
+_SALT = b"moregpu.telemetry/1:host:" + os.urandom(16)   # per-run random salt (see module doc)
 
 
 def host_hash(hostname: str | None = None) -> str:

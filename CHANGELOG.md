@@ -73,6 +73,39 @@ The work is planned in ADRs 0101–0114 (`docs/dev/adr/`) and verified against t
 - Data and model roots are realpath-confined, and https hosts come from an allowlist with sha256 required.
 - Bucket tools run with credentials stripped.
 - Outputs are confined to `MOREGPU_OUTPUT_DIR`.
+- **The torch worker requires `torch>=2.6`** (CVE-2025-32434: `torch.load(weights_only=True)` is bypassable on
+  ≤ 2.5.1). The adapters check `torch.__version__` at load time and refuse `state_dict` `.pt/.pth`, `torch_export`
+  `.pt2` and TorchScript loads on an older torch, on a 2.6.0 pre-release, or on a version they cannot parse.
+- **Export confinement** (`moregpu_worker.paths.confine`). Every `TrainTask.export` (JEPA, segment/classify,
+  `finetune_model`) and `task_export` write only inside `MOREGPU_OUTPUT_DIR` (default `./moregpu-out`). A relative path
+  resolves inside it; an absolute path must realpath inside it, so `../x`, outside paths and symlink escapes are
+  refused. Export reads (`vision_infer_load {export}`, `encoder: {init: "export"}`) are confined to
+  `MOREGPU_OUTPUT_DIR` ∪ `MOREGPU_MODEL_ROOTS`.
+- **Model downloads use the data plane's policy.** `https://` model sources need a host in `MOREGPU_MODEL_HOSTS`
+  (falls back to `MOREGPU_DATA_HOSTS`). Every redirect hop is re-checked, the size is capped by
+  `MOREGPU_MODEL_MAX_BYTES` (default 20 GiB), and sha256 stays mandatory. `hf://` sources need a `sha256` or a
+  40-hex commit revision; branches and tags are refused.
+- **`pushed://` model sources resolve through the data plane's BlobStore**: only a blob that was fully pushed and
+  verified at `blob_end` resolves. `MOREGPU_PUSHED_DIR` is now only an alias for the staging dir
+  (`MOREGPU_STAGE_DIR`), not a directory of loadable files.
+- **Signed torch-worker tree.** `MANIFEST.sha256` covers every file under `apps/worker` except `*.sig` and the
+  manifest itself (including `worker_torch.py` and `pyproject.toml`). It carries a version header that must equal
+  `pyproject.toml`'s version. The verifiers (`release_sign.py verify-manifest`, `verify_release.ts --manifest-root`)
+  refuse `__pycache__` directories, stray `.pyc` files, symlinked directories and any unlisted file anywhere in the
+  tree, such as a planted `numpy.py` next to `worker_torch.py`. A version problem exits with code 6: a missing or
+  mismatched header, `--expect-version`, or a rollback below the version recorded by `--state`.
+  `moregpu torch-join` purges bytecode caches and runs `verify-manifest --state` before it execs the worker, then runs
+  it with `python3 -B`. It verifies whenever `MANIFEST.sha256` and its `.sig` exist. Without them it warns "unsigned dev
+  tree". `MOREGPU_VERIFY_MANIFEST=1` makes the manifest mandatory, and `=0` skips the check with a warning.
+- Blob staging caps: `MOREGPU_BLOB_TOTAL_MAX_BYTES` (default 40 GiB) across all staged blobs. `blob_begin` is refused
+  when the staging filesystem has less free space than the blob, and `/dev/shm` is only used when the blob fits there.
+- Bucket refs with wildcard or glob characters are refused. Bucket objects are streamed (`cat`), and the download is
+  cut off at `MOREGPU_DATA_MAX_DOWNLOAD_BYTES`.
+- `.pt2` archives get zip-bomb caps: `MOREGPU_PT2_MEMBER_MAX_BYTES` (8 GiB) and `MOREGPU_PT2_TOTAL_MAX_BYTES` (32 GiB)
+  uncompressed. Members are read as streams.
+- `vision_unload` also drops the `vision_infer_*` models that wrap the handle. A coordinator `welcome` clears adapter
+  handles, lowered artefacts, `vision_infer_*` models and staged data-plane blobs.
+- The telemetry host hash uses a random salt drawn once per worker process, so it cannot link a machine across runs.
 
 
 ### Added

@@ -16,6 +16,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from ... import paths
 from ...models.vit import Predictor, VisionTransformer, vit_config
 from .. import monitors as MON
 from ..masking import MultiBlockMasker, gather_tokens
@@ -283,7 +284,7 @@ class _JepaBase(TrainTask):
         """which='target' (default; the EMA encoder, as I-JEPA evaluates downstream) or 'context'."""
         if which not in ("target", "context"):
             raise ValueError("which must be 'target' or 'context'")
-        os.makedirs(path, exist_ok=True)
+        path = paths.export_dir(path)                     # confined to MOREGPU_OUTPUT_DIR
         enc = (self.target if which == "target" else self.encoder).eval()
         example = self._to_input(self.data.batch([0, 1]))
         if fmt == "safetensors":

@@ -6,15 +6,18 @@
     vision_load     {id, spec}                      → load (validate → fetch → sha256 → adapter); replaces same id
     vision_describe {id}
     vision_lower    {id, target, example_shape?, include_bytes?} → lowered-artefact report (+ base64 payload)
-    vision_unload   {id}
+    vision_unload   {id}                            → drops the adapter handle, its lowered artefacts AND any
+                                                      InferenceStore model with that id or wrapping that handle
 
-HANDLES / LOWERED are module-level so inference ops added later can share the loaded models.
+HANDLES / LOWERED are module-level so inference ops added later can share the loaded models. `reset()` (run on a
+coordinator `welcome`) unloads everything, including every registered InferenceStore's models.
 Errors raise (KeyError for unknown op/id, SpecError/Refused* for bad specs/artefacts); the caller maps them to RPC errors.
 """
 from __future__ import annotations
 
 import base64
 import importlib.util
+import weakref
 
 import torch
 
@@ -36,6 +39,20 @@ RESOLVERS: list = []
 def register_resolver(fn) -> None:
     if fn not in RESOLVERS:
         RESOLVERS.append(fn)
+
+
+# Stores that hold models derived from HANDLES (InferenceStore wraps a handle for vision_infer_*): each registers an
+# object with `drop_linked(mid | None)`; vision_unload / reset call it so no copy of an unloaded model stays resident.
+_LINKED: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def register_linked_store(store) -> None:
+    _LINKED.add(store)
+
+
+def _drop_linked(mid: str | None) -> None:
+    for store in list(_LINKED):
+        store.drop_linked(mid)
 
 
 def _get(mid: str) -> A.Handle:
@@ -107,7 +124,22 @@ def unload(p: dict) -> dict:
         del LOWERED[k]
     if h is not None:
         A.unload(h)
+    _drop_linked(mid)
     return {"id": mid, "unloaded": h is not None}
+
+
+def reset() -> None:
+    """Unload every handle, lowered artefact and linked-store model (a fresh coordinator session starts clean)."""
+    for mid in list(HANDLES):
+        h = HANDLES.pop(mid, None)
+        if h is not None:
+            try:
+                A.unload(h)
+            except Exception:  # pragma: no cover - best effort on reset
+                pass
+    HANDLES.clear()
+    LOWERED.clear()
+    _drop_linked(None)
 
 
 OPS = {"vision_models_describe": models_describe, "vision_load": load, "vision_describe": describe,

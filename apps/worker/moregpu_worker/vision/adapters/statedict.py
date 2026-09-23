@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from ..errors import KeyMismatch, RefusedFormat, UnknownArch, brief
-from .base import DTYPES, Adapter, Fetch, Handle, fetch_verified, module_sha256, resolve_device
+from .base import DTYPES, Adapter, Fetch, Handle, fetch_verified, module_sha256, require_safe_torch, resolve_device
 
 CONTAINER_KEYS = ("state_dict", "model_state_dict", "model", "module", "net", "network")
 PREFIXES = ("module.", "_orig_mod.")
@@ -55,6 +55,7 @@ def read_state_dict(path: Path, fmt: str) -> tuple[dict[str, torch.Tensor], list
             raise
         except Exception as e:
             raise RefusedFormat(f"{path.name} is not a valid safetensors file ({e})") from None
+    require_safe_torch(f"{path.name} with torch.load(weights_only=True)")
     try:
         obj = torch.load(path, map_location="cpu", weights_only=True)
     except Exception as e:

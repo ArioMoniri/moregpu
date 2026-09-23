@@ -56,9 +56,9 @@ MoreGPU is an honest, **verified fp32** linear-algebra service — not a CUDA re
 
 ```bash
 moregpu torch-join --server wss://HOST:8787/ws --token … --pin …          # each machine that should help train
-moregpu train jepa --data refs.jsonl --size 224,224 --inner-steps 25 --batch 64 --cosine --target-samples 200000 --export /data/enc
-moregpu train segment --encoder /data/enc --data seg_refs.jsonl --num-classes 3 --target-samples 20000 --export /data/seg
-moregpu vision load seg --export /data/seg && moregpu vision batch seg --volumes ct_*.npy --split tiles
+moregpu train jepa --data refs.jsonl --size 224,224 --inner-steps 25 --batch 64 --cosine --target-samples 200000 --export enc   # export dirs live in each worker's MOREGPU_OUTPUT_DIR
+moregpu train segment --encoder enc --data seg_refs.jsonl --num-classes 3 --target-samples 20000 --export seg
+moregpu vision load seg --export seg && moregpu vision batch seg --volumes ct_*.npy --split tiles
 moregpu net --pings 50 --sustained-mb 64                                 # link quality: RTT p50/p99, sustained bandwidth
 ```
 
@@ -375,7 +375,7 @@ across two architectures — GPT-2 (fused-QKV `c_attn`) and Llama-family (`q_pro
 `torch`+`transformers` on the machine you run it from. Everything below is the same thing, spelled out by hand:
 
 ```sh
-pip install torch transformers cryptography websockets     # the torch worker's deps
+pip install 'torch>=2.6' transformers cryptography websockets     # the torch worker's deps (torch >= 2.6: CVE-2025-32434)
 
 # join the pool as a native worker (uses the same join token as any worker)
 MOREGPU_SERVER=ws://localhost:8787/ws MOREGPU_TOKEN=<join-token> \

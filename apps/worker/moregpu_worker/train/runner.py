@@ -9,6 +9,7 @@ import time
 
 import torch
 
+from .. import paths
 from . import registry, tensorwire as tw
 from .sessions import SessionStore
 from .task import TaskContext
@@ -139,7 +140,8 @@ class TaskRunner:
     def _task_export(self, p):
         t = self.sessions.get(p["session"])
         kw = {"which": p["which"]} if p.get("which") else {}
-        return {"ok": True, **t.export(p.get("fmt", "safetensors"), p["path"], **kw)}
+        path = paths.confine(p["path"], [paths.output_root()])   # MOREGPU_OUTPUT_DIR; the task re-confines + creates it
+        return {"ok": True, **t.export(p.get("fmt", "safetensors"), path, **kw)}
 
     def _task_describe(self, p):
         return {"ok": True, "describe": self.sessions.get(p["session"]).describe()}

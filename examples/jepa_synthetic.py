@@ -69,7 +69,7 @@ def main(argv=None):
     p.add_argument("--inner", type=int, default=4)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-3)
-    p.add_argument("--export-dir", default=None)
+    p.add_argument("--export-dir", default=None, help="export dir ON THE WORKER, inside its MOREGPU_OUTPUT_DIR (relative → inside it)")
     a = p.parse_args(argv)
     return run_local(a) if a.local else run_pool(a)
 

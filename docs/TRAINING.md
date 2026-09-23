@@ -72,6 +72,11 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
 | CLI | `moregpu train jepa|segment|classify|status|round|stop|checkpoint|resume|rm|export|telemetry` |
 | Dashboard | "Training sessions" panel |
 
+An export `path` is a directory **on the worker**, and it must be inside the worker's `MOREGPU_OUTPUT_DIR` (default
+`./moregpu-out`). A relative path resolves inside that directory. An absolute path outside it, `../…`, or a symlink
+that points outside it is refused. A segment/classify `encoder: {init: "export", path}` may read from
+`MOREGPU_OUTPUT_DIR` or `MOREGPU_MODEL_ROOTS`. See [MODELS.md](MODELS.md#worker-environment).
+
 ## What each worker type can do
 
 Training runs on native torch workers only. WebGPU and browser workers have no autograd; they take part in inference

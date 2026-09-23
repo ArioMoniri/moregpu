@@ -188,10 +188,11 @@ class FinetuneModelTask(TrainTask):
         return {k: v.detach().contiguous().cpu() for k, v in sd.items()}
 
     def export(self, fmt: str, path: str) -> dict:
-        os.makedirs(path, exist_ok=True)
         if fmt != "safetensors":
             raise ValueError("finetune_model exports safetensors (+ a model spec); lower it with /vision/lower for ONNX/WGSL")
         from safetensors.torch import save_file
+        from ... import paths
+        path = paths.export_dir(path)                     # confined to MOREGPU_OUTPUT_DIR
         w = os.path.join(path, "model.safetensors")
         save_file(self._merged_state(), w)
         sha = hashlib.sha256(open(w, "rb").read()).hexdigest()

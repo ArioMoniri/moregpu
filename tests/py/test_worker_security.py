@@ -426,7 +426,7 @@ def _fake_stream_tool(bindir, name, nbytes):
     p = bindir / name
     p.write_text(f"#!/bin/sh\necho \"$@\" > \"{bindir}/{name}.args\"\n"
                  f"for a; do last=\"$a\"; done\n"
-                 f"if [ \"$last\" = \"-\" ]; then head -c {nbytes} /dev/zero; else head -c {nbytes} /dev/zero > \"$last\"; fi\n")
+                 f"case \" $* \" in *\" cat \"*) head -c {nbytes} /dev/zero ;; *) head -c {nbytes} /dev/zero > \"$last\" ;; esac\n")
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
 
 
