@@ -406,11 +406,13 @@ from moregpu_worker.data import ops as DATA_OPS  # noqa: E402
 DATA = DataPlane()   # policy from MOREGPU_DATA_ROOTS / MOREGPU_DATA_HOSTS / MOREGPU_DATA_BUCKETS; cache created lazily
 RUNNER = TaskRunner(SESSIONS, DEV, data_plane=DATA)
 from moregpu_worker.vision.infer import InferenceStore, OPS as VISION_OPS  # noqa: E402
+from moregpu_worker.vision import ops as MODEL_OPS  # noqa: E402  (published-model adapters, ADR-0113)
 VISION = InferenceStore(DEV, plane=DATA)   # exported segment/classify/encoder models; outputs under MOREGPU_OUTPUT_DIR
 
 def train_dispatch(op: str, payload: dict) -> dict:
     if op in DATA_OPS.OPS: return DATA_OPS.handle(DATA, op, payload)                # vision data plane (ADR-0110)
     if op in VISION_OPS: return VISION.handle(op, payload)                          # vision inference (ADR-0112)
+    if op in MODEL_OPS.OPS: return MODEL_OPS.handle(op, payload)                    # published models (ADR-0113)
     if op.startswith("task_"): return RUNNER.handle(op, payload)   # generic TrainTask sessions (ADR-0105)
     if op == "load": return train_load(payload)
     if op == "step": return train_step(payload)
@@ -447,7 +449,7 @@ def model_load(cfg: dict) -> dict:
         MODELS.pop(mid, None); _empty_cache()
     elif len(MODELS) >= MAX_RESIDENT_MODELS:
         MODELS.pop(next(iter(MODELS)), None); _empty_cache()
-    model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float16 if fp16_effective else torch.float32).to(DEV).eval()
+    model = AutoModelForCausalLM.from_pretrained(cfg["model"], use_safetensors=True, dtype=torch.float16 if fp16_effective else torch.float32).to(DEV).eval()
     MODELS.pop(mid, None); MODELS[mid] = model  # (re)insert as most-recent
     MODEL_NAMES[mid] = cfg["model"]; _TOKS.pop(mid, None)  # remember the HF name for the tokenizer (model_chat)
     c = AutoConfig.from_pretrained(cfg["model"])
@@ -548,7 +550,7 @@ def model_push_end(payload: dict) -> dict:
         if mid not in MODELS and len(MODELS) >= MAX_RESIDENT_MODELS:
             MODELS.pop(next(iter(MODELS)), None); _empty_cache()  # evict LRU BEFORE allocating (peak ≤ cap)
         model = AutoModelForCausalLM.from_pretrained(
-            d, dtype=torch.float16 if fp16_effective else torch.float32, local_files_only=True).to(DEV).eval()
+            d, use_safetensors=True, dtype=torch.float16 if fp16_effective else torch.float32, local_files_only=True).to(DEV).eval()
         MODELS.pop(mid, None); MODELS[mid] = model  # (re)insert as most-recent
         MODEL_NAMES[mid] = payload.get("model", mid)
         _TOKS.pop(mid, None)
@@ -719,7 +721,7 @@ def shard_load(cfg: dict) -> dict:
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
         try:
-            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], use_safetensors=True, dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
         except Exception:
             _push_cleanup(sid); raise  # a failed push load (OOM / truncated safetensors on a small box) must not leak the staging dir
     else:
@@ -731,17 +733,17 @@ def shard_load(cfg: dict) -> dict:
             # fp16 size. This is the only way a model too big to fp16-load (e.g. 7B on an 8 GB free slice) fits.
             # No BitsAndBytesConfig, no .to(DEV). (bnb-4bit needs bitsandbytes — installed; AWQ/GPTQ need their
             # own backend pkg, autoawq / auto-gptq, or the load raises a clear message.)
-            model = AutoModelForCausalLM.from_pretrained(cfg["model"], device_map={"": 0}, low_cpu_mem_usage=True).eval()
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], use_safetensors=True, device_map={"": 0}, low_cpu_mem_usage=True).eval()
         elif _qm:
             # int8 / nf4 via bitsandbytes (CUDA only). device_map={"":0} places the quantized weights on cuda:0;
             # do NOT call .to(DEV) — it raises on a bnb-quantized model. The manual slice + del below still frees
             # the unkept quantized modules (single device, no offload hooks); embeddings + lm_head stay fp16 so the
             # final float() cast on the logits is unaffected. NB: from_pretrained here loads fp16 THEN quantizes,
             # so peak VRAM is the fp16 size — use quant:"auto" with a pre-quantized checkpoint to avoid that peak.
-            model = AutoModelForCausalLM.from_pretrained(cfg["model"], quantization_config=_bnb_config(_qm),
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], use_safetensors=True, quantization_config=_bnb_config(_qm),
                                                          device_map={"": 0}, low_cpu_mem_usage=True).eval()
         else:
-            model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], use_safetensors=True, dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     arch = _shard_arch(model)
     mc = model.config
     # REJECT sliding-window / mixed-attention models: a middle stage recomputes ONE full-causal mask for all its
@@ -1025,11 +1027,11 @@ def moe_backbone_load(cfg: dict) -> dict:
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
         try:
-            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], use_safetensors=True, dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
         except Exception:
             _push_cleanup(sid); raise  # a failed push load (OOM / truncated safetensors on a small box) must not leak the staging dir
     else:
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], use_safetensors=True, dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE (model.layers + rotary_emb), got {type(model).__name__}")
     _require_indexable_experts(model)
@@ -1077,11 +1079,11 @@ def expert_load(cfg: dict) -> dict:
         # holder's experts + the non-resident rest random-init → dropped when we slice). transformers 5.x RAISES
         # on the missing/mismatched tensors where 4.x only warned — this keeps the download-free load working on both.
         try:
-            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
+            model = AutoModelForCausalLM.from_pretrained(st["dir"], use_safetensors=True, dtype=_load_dtype(cfg), local_files_only=True, ignore_mismatched_sizes=True).to(DEV).eval()
         except Exception:
             _push_cleanup(sid); raise  # a failed push load (OOM / truncated safetensors on a small box) must not leak the staging dir
     else:
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
+        model = AutoModelForCausalLM.from_pretrained(cfg["model"], use_safetensors=True, dtype=_load_dtype(cfg), low_cpu_mem_usage=True).to(DEV).eval()
     if not _moe_arch_ok(model):
         raise ValueError(f"MoE EP needs a Llama-style routed-MoE, got {type(model).__name__}")
     _require_indexable_experts(model)

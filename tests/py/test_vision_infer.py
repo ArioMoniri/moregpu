@@ -89,3 +89,26 @@ def test_encoder_export_features(tmp_path):
     x = j.data.batch([0]).numpy().astype("<f4")
     r = st.handle("vision_infer", {"id": "e", "shape": list(x.shape), "data": base64.b64encode(x.tobytes()).decode(), "pool": "mean"})
     assert r["shape"] == [1, 32]
+
+
+def test_published_model_via_adapter_predicts_volume(tmp_path, monkeypatch):
+    """A third-party published model (MONAI UNet state_dict, loaded by the M4 adapters) runs the same whole-volume
+    prediction path as MoreGPU's own exports."""
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from _vision_models import save_state_dict, spec_for, tiny_monai_unet
+    from moregpu_worker.vision import ops as MO
+    monkeypatch.setenv("MOREGPU_MODEL_ROOTS", str(tmp_path))
+    m = tiny_monai_unet(); p = tmp_path / "unet.pt"; save_state_dict(m, p)
+    arch = {"registry": "monai", "name": "UNet", "kwargs": {"spatial_dims": 3, "in_channels": 1, "out_channels": 2,
+            "channels": [4, 8, 16], "strides": [2, 2], "num_res_units": 1}}
+    MO.handle("vision_load", {"id": "pub", "spec": spec_for(p, "state_dict", arch)})
+    root = tmp_path / "d"; root.mkdir()
+    vol = np.random.default_rng(0).standard_normal((16, 16, 16)).astype("float32"); np.save(root / "v.npy", vol)
+    st = InferenceStore(device="cpu", plane=_plane(root), out_root=str(tmp_path / "o"))
+    st.handle("vision_infer_load", {"id": "pub", "handle": "pub", "task": "segment", "num_classes": 2, "kind": "3d"})
+    r = st.handle("vision_predict", {"id": "pub", "ref": {"uri": "file://v.npy"}, "out": "pub_v"})
+    with torch.no_grad():
+        ref = m.eval()(torch.from_numpy(vol)[None, None]).argmax(1)[0].numpy()
+    assert (np.load(r["path"]) == ref).mean() > 0.999
+    MO.handle("vision_unload", {"id": "pub"})

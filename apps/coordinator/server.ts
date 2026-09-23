@@ -1778,14 +1778,31 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
   try {
     if (action === 'models' && req.method === 'GET') return json({ ok: true, models: Object.fromEntries([...visionModels].map(([k, v]) => [k, { workers: v.workers, ...v.meta }])) });
     if (action === 'load' && req.method === 'POST') {
-      const body = await req.json().catch(() => ({})) as { id?: string; export?: string; workers?: string[] };
-      if (!body.id || !body.export) return json({ error: 'id and export (a MoreGPU export dir on the workers) are required' }, 400);
+      const body = await req.json().catch(() => ({})) as { id?: string; export?: string; spec?: Record<string, unknown>; workers?: string[]; task?: string; num_classes?: number; kind?: string };
+      if (!body.id || (!body.export && !body.spec)) return json({ error: 'id and one of export (a MoreGPU export dir on the workers) or spec (a published-model spec, docs/MODELS.md) are required' }, 400);
       const targets = body.workers?.length ? body.workers : torchWorkers().map((w) => w.id);
-      const res = await Promise.all(targets.map((id) => tsRpc(id, 'vision_infer_load', { id: body.id, export: body.export })));
+      const res = await Promise.all(targets.map(async (id) => {
+        if (!body.spec) return tsRpc(id, 'vision_infer_load', { id: body.id, export: body.export });
+        // published model: adapters load + verify it (sha256, allowlisted plugins, no pickles), then the inference store wraps it
+        const l = await tsRpc(id, 'vision_load', { id: body.id, spec: body.spec });
+        if (!l.ok) return l;
+        return tsRpc(id, 'vision_infer_load', { id: body.id, handle: body.id, task: body.task ?? 'segment', num_classes: body.num_classes, kind: body.kind ?? '3d' });
+      }));
       const ok = targets.filter((_, i) => res[i]!.ok);
       if (!ok.length) return json({ error: `load failed everywhere: ${res[0]?.error}` }, 502);
       visionModels.set(body.id, { workers: ok, meta: res[targets.indexOf(ok[0]!)]!.data ?? {}, rr: 0 });
       return json({ ok: true, id: body.id, workers: ok, failed: targets.filter((_, i) => !res[i]!.ok), meta: visionModels.get(body.id)!.meta });
+    }
+    if (action === 'lower' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; target?: string; example_shape?: number[]; worker?: string };
+      const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model' }, 404);
+      const r = await tsRpc(body.worker ?? m.workers[0]!, 'vision_lower', { id: body.id, target: body.target ?? 'wgsl', example_shape: body.example_shape });
+      return r.ok ? json({ ok: true, ...r.data }) : json({ error: r.error }, 502);
+    }
+    if (action === 'capabilities' && req.method === 'GET') {
+      const ws = torchWorkers();
+      const r = await Promise.all(ws.map((w) => tsRpc(w.id, 'vision_models_describe', {})));
+      return json({ ok: true, workers: Object.fromEntries(ws.map((w, i) => [w.id, r[i]!.ok ? r[i]!.data : { error: r[i]!.error }])) });
     }
     if (action === 'unload' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string };

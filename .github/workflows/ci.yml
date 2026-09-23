@@ -98,6 +98,9 @@ jobs:
       - name: Vision pipeline — JEPA → segment fine-tune → /vision/batch across 3 workers with a worker killed mid-batch
         run: python3 tests/e2e/vision_pipeline.py
 
+      - name: Published model — MONAI state_dict served natively via /vision, malicious pickle + sha mismatch refused
+        run: python3 tests/e2e/published_model.py
+
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh
 

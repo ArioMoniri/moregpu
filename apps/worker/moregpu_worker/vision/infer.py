@@ -21,6 +21,15 @@ OPS = frozenset({"vision_infer_load", "vision_infer", "vision_predict", "vision_
                  "vision_infer_list"})
 
 
+class _AdapterModule(torch.nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x)
+
+
 class InferenceStore:
     def __init__(self, device: str, plane=None, out_root: str | None = None):
         self.device, self.plane = device, plane
@@ -38,6 +47,14 @@ class InferenceStore:
         return {"ok": True, "id": mid, **meta}
 
     def _infer_load(self, p):
+        if p.get("handle"):   # a published model already loaded through the adapters (vision_load {id, spec})
+            from . import ops as model_ops, adapters as A
+            h = model_ops.HANDLES[p["handle"]]
+            io = h.spec.get("io", {}) if hasattr(h, "spec") else {}
+            meta = {"task": p.get("task", "segment"), "num_classes": p.get("num_classes"), "kind": p.get("kind", "3d"),
+                    "encoder": {"img_size": p.get("img_size") or [], "in_chans": p.get("in_chans", 1)}, "adapter": p["handle"], "io": io}
+            wrapper = _AdapterModule(lambda x: torch.as_tensor(A.infer(h, x)))
+            return self.put(p["id"], wrapper, meta)
         path = p["export"]
         if os.path.exists(os.path.join(path, "model_config.json")):
             meta = json.load(open(os.path.join(path, "model_config.json")))
