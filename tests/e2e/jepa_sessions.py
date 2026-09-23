@@ -49,6 +49,24 @@ def main():
             m = VisionTransformer(**json.load(open(exp["config"])))
             m.load_state_dict(load_file(exp["weights"]), strict=True); ok = True
         ck(ok, "exported encoder loads strictly into a fresh ViT")
+        # resume mid-run: 3 rounds → checkpoint → delete → resume → 3 rounds must equal 6 uninterrupted rounds
+        import sys as _s
+        _s.path.insert(0, os.path.join(HERE, "..", "..", "clients", "python"))
+        from moregpu import MoreGPU
+        sdk = MoreGPU(f"http://127.0.0.1:{pool.port}", pool.admin)
+        body = dict(synthetic=ex.SYN, jepa={**ex.JEPA, "total_steps": 18}, manifest_len=ex.SYN["n"], batch=8, inner_steps=3, lr=2e-3,
+                    amp="fp32", seed=0, target_samples=6 * 3 * 8 * 2, lr_schedule={"kind": "cosine", "warmup_frac": 0.1, "min_lr": 2e-3 * 0.05})
+        sdk.train_jepa("jepa_2p5d", id="res", **body)
+        for _ in range(3):
+            sdk.train_session_round("res", 1)
+        sdk.train_session_checkpoint("res"); sdk.train_session_delete("res"); sdk.train_session_resume("res")
+        for _ in range(3):
+            sdk.train_session_round("res", 1)
+        st2 = pool.api("/train/sessions/res/state"); blob2 = base64.b64decode(st2["blob_b64"]); err2 = 0.0
+        for e in st2["header"]["tensors"]:
+            got = np.frombuffer(blob2[e["offset"]:e["offset"] + e["nbytes"]], dtype="<f4").reshape(e["shape"])
+            err2 = max(err2, float(np.abs(got - ref["state"][e["name"]].numpy()).max()))
+        ck(err2 < 1e-4, f"JEPA resume (EMA target + counters restored) == uninterrupted run (max|Δ|={err2:.2e})")
         knn = out["knn"]
         ck(0.0 <= knn.get("knn_acc", -1) <= 1.0, f"k-NN probe reported ({knn})")
     ck.finish()

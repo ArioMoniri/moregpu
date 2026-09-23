@@ -233,8 +233,8 @@ class _JepaBase(TrainTask):
         return out
 
     def extra_state(self):
-        st = {"target." + k: v.detach().clone() for k, v in self.target.state_dict().items()}
-        st["_meta.step"] = torch.tensor([float(self.step)])
+        st = super().extra_state()
+        st.update({"target." + k: v.detach().clone() for k, v in self.target.state_dict().items()})
         st["_meta.ema_step"] = torch.tensor([float(self._ema_step)])
         st["_meta.global_steps"] = torch.tensor([float(getattr(self, "_global_steps", 0.0))])
         return st
@@ -244,8 +244,8 @@ class _JepaBase(TrainTask):
             for k, v in self.target.state_dict().items():
                 if "target." + k in tensors:
                     v.copy_(tensors["target." + k].reshape(v.shape).to(v.device, v.dtype))
-        if "_meta.step" in tensors:
-            self.step = int(tensors["_meta.step"].item())
+        super().load_extra_state(tensors)
+        if "_meta.ema_step" in tensors:
             self._ema_step = int(tensors["_meta.ema_step"].item())
             self._global_steps = float(tensors["_meta.global_steps"].item())
 

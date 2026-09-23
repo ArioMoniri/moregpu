@@ -123,3 +123,16 @@ def test_p1_8_finetune_model_syncs_batchnorm_buffers(tmp_path, monkeypatch):
 def test_p2_label_map_is_a_lut_not_sequential():
     from moregpu_worker.train.tasks.finetune_model import apply_label_map
     y = torch.tensor([0, 1, 2]); assert apply_label_map(y, {1: 2, 2: 1}).tolist() == [0, 2, 1]
+
+
+def test_inner_optimizer_state_round_trips_through_extra_state():
+    cfg = {"n": 64, "dim": 5, "batch": 4, "optimizer": "adamw"}
+    a = R.create("toy_linear"); a.init(cfg, TaskContext(amp="fp32"))
+    a.inner_steps(list(range(8)), 2, 0.05)
+    ex = a.extra_state()
+    assert any(k.startswith("opt.") for k in ex)
+    b = R.create("toy_linear"); b.init(cfg, TaskContext(amp="fp32"))
+    b.load_sync_state(a.state_for_sync()); b.load_extra_state(ex)
+    a.inner_steps(list(range(8, 16)), 2, 0.05); b.inner_steps(list(range(8, 16)), 2, 0.05)
+    for k, v in a.state_for_sync().items():
+        assert torch.equal(v, b.state_for_sync()[k])

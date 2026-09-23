@@ -61,11 +61,37 @@ class TrainTask(ABC):
         return {}
 
     def extra_state(self) -> dict[str, torch.Tensor]:
-        """Non-synced state that a checkpoint must carry (e.g. the JEPA EMA target and step counters)."""
-        return {}
+        """Non-synced, per-worker state a checkpoint must carry: the inner optimizer's moments (DiLoCo keeps them
+        across rounds), the step counter, and task-specific state added by subclasses (e.g. the JEPA EMA target)."""
+        out: dict[str, torch.Tensor] = {"_meta.step": torch.tensor([float(self.step)])}
+        if self.opt is not None:
+            params = [p for g in self.opt.param_groups for p in g["params"]]
+            for i, p in enumerate(params):
+                for k, v in self.opt.state.get(p, {}).items():
+                    if torch.is_tensor(v):
+                        out[f"opt.{i}.{k}"] = v.detach().clone().float().reshape(-1) if v.dim() == 0 else v.detach().clone()
+        if self.amp is not None and self.amp.scaler is not None:
+            out["_meta.scaler_scale"] = torch.tensor([float(self.amp.scaler.get_scale())])
+        return out
 
     def load_extra_state(self, tensors: dict[str, torch.Tensor]) -> None:
-        return None
+        if "_meta.step" in tensors:
+            self.step = int(tensors["_meta.step"].item())
+        opt = {k: v for k, v in tensors.items() if k.startswith("opt.")}
+        self._pending_opt = opt or None
+        if self.opt is not None and opt:
+            self._apply_opt_state(opt)
+        if "_meta.scaler_scale" in tensors and self.amp is not None and self.amp.scaler is not None:
+            self.amp.scaler.update(float(tensors["_meta.scaler_scale"].item()))
+
+    def _apply_opt_state(self, opt: dict[str, torch.Tensor]) -> None:
+        params = [p for g in self.opt.param_groups for p in g["params"]]
+        for key, v in opt.items():
+            _, i, k = key.split(".", 2)
+            p = params[int(i)]
+            st = self.opt.state.setdefault(p, {})
+            st[k] = v.reshape(()).to(p.device) if k == "step" else v.reshape(p.shape).to(p.device, p.dtype)
+        self._pending_opt = None
 
     def export(self, fmt: str, path: str) -> dict:
         raise NotImplementedError(f"{self.name} does not export {fmt}")
@@ -103,6 +129,8 @@ class TrainTask(ABC):
         """DiLoCo semantics: fresh inner optimizer each round unless keep_inner_state."""
         if self.opt is None or not self.keep_inner_state:
             self.opt = self.make_optimizer(params, lr, kind, weight_decay)
+            if getattr(self, "_pending_opt", None):
+                self._apply_opt_state(self._pending_opt)
         for g in self.opt.param_groups:
             g["lr"] = lr
         return self.opt

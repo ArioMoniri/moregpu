@@ -316,26 +316,28 @@ export class TrainSession {
     const m = await encodeTensors(this.st.momentum, this.shapes, 'f32');
     await store.write(`${name}.global.bin`, g.blob);
     await store.write(`${name}.momentum.bin`, m.blob);
-    // non-synced task state (e.g. the JEPA EMA target + step counters) — identical on all workers, taken from worker 0
-    let extraHeader: WireHeader | null = null;
-    try {
-      const first = await this.call(this.workers[0]!, 'task_state_get', { which: 'extra', chunk_bytes: this.chunk });
-      const hdr = first.header as WireHeader;
-      if (hdr.tensors.length) {
+    // non-synced, PER-WORKER task state (inner optimizer moments, step counters, JEPA EMA target) — one file per worker
+    const extra: Record<string, WireHeader> = {};
+    for (const w of this.workers) {
+      try {
+        const first = await this.call(w, 'task_state_get', { which: 'extra', chunk_bytes: this.chunk });
+        const hdr = first.header as WireHeader;
+        if (!hdr.tensors.length) continue;
         const parts = [b64ToBytes(String(first.chunk0 ?? ''))];
-        for (let k = 1; k < Number(first.nchunks); k++) parts.push(b64ToBytes(String((await this.call(this.workers[0]!, 'task_state_chunk', { k })).data)));
-        await store.write(`${name}.extra.bin`, concatBytes(parts)); extraHeader = hdr;
-      }
-    } catch (e) { this.log('warn', `checkpoint: no extra task state (${(e as Error).message})`); }
+        for (let k = 1; k < Number(first.nchunks); k++) parts.push(b64ToBytes(String((await this.call(w, 'task_state_chunk', { k })).data)));
+        await store.write(`${name}.extra.${encodeURIComponent(w)}.bin`, concatBytes(parts)); extra[w] = hdr;
+      } catch (e) { this.log('warn', `checkpoint: no extra task state from ${w} (${(e as Error).message})`); }
+    }
     const meta = { v: 1, id: this.id, cfg: this.cfg, workers: this.workers, round: this.round, samples_seen: this.samplesSeen,
       per_worker_seen: Object.fromEntries(this.perWorkerSeen), speeds: Object.fromEntries(this.speeds), stream: this.stream.state(),
-      global: g.header, momentum: m.header, extra: extraHeader, config_hash: this.hash };
+      global: g.header, momentum: m.header, extra, config_hash: this.hash };
     await store.write(`${name}.json`, JSON.stringify(meta));   // written last: a checkpoint exists iff its .json exists
     const keep = this.cfg.keep_checkpoints ?? 3;
     const all = (await store.list(`${this.id}/`)).filter((n) => n.endsWith('.json')).sort();
     for (const old of all.slice(0, Math.max(0, all.length - keep))) {
       const base = old.slice(0, -5);
-      for (const suf of ['.json', '.global.bin', '.momentum.bin', '.extra.bin']) await store.remove(base + suf);
+      for (const suf of ['.json', '.global.bin', '.momentum.bin']) await store.remove(base + suf);
+      for (const f of await store.list(`${this.id}/`)) if (f.startsWith(`${base}.extra.`)) await store.remove(f);
     }
     return name;
   }
@@ -359,13 +361,25 @@ export class TrainSession {
     if (!s.workers.length) throw new Error('resume: task_init failed on every worker');
     const b = await s.broadcast(s.workers);
     s.workers = b.ok;
-    // restore non-synced task state (JEPA EMA target, step counters) exactly as checkpointed
-    if (meta.extra) {
-      const blob = (await store.read(`${base}.extra.bin`))!;
-      const parts = chunkBytes(blob, s.chunk);
+    // restore non-synced per-worker task state. A worker that was in the checkpoint gets its own state back (exact
+    // resume); a replacement worker gets the shared part (e.g. the EMA target) from the first saved worker, without
+    // another worker's optimizer moments (its inner optimizer starts fresh — logged).
+    const saved = (meta.extra ?? {}) as Record<string, WireHeader>;
+    const savedIds = Object.keys(saved);
+    if (savedIds.length) {
       const ok = await Promise.all(s.workers.map(async (w) => {
+        const own = saved[w] !== undefined, src = own ? w : savedIds[0]!;
+        let header = saved[src]!, blob = (await store.read(`${base}.extra.${encodeURIComponent(src)}.bin`))!;
+        if (!own) {
+          const t = await decodeTensors(header, blob);
+          for (const k of [...t.keys()]) if (k.startsWith('opt.')) t.delete(k);
+          const shapes: Record<string, number[]> = {}; for (const e of header.tensors) shapes[e.name] = e.shape;
+          ({ header, blob } = await encodeTensors(t, shapes, 'f32'));
+          deps.log?.('warn', `resume ${id}: ${w} was not in the checkpoint — shared task state restored, inner optimizer starts fresh`);
+        }
         try {
-          for (let k = 0; k < parts.length; k++) await s.call(w, 'task_state_put', { which: 'extra', header: k === 0 ? meta.extra : null, k, n: parts.length, data: bytesToB64(parts[k]!) });
+          const parts = chunkBytes(blob, s.chunk);
+          for (let k = 0; k < parts.length; k++) await s.call(w, 'task_state_put', { which: 'extra', header: k === 0 ? header : null, k, n: parts.length, data: bytesToB64(parts[k]!) });
           return true;
         } catch { return false; }
       }));
