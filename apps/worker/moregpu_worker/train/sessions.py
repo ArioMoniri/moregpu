@@ -19,17 +19,21 @@ def default_limit(device: str) -> int:
 
 
 class SessionStore:
-    def __init__(self, max_sessions: int = 1):
+    def __init__(self, max_sessions: int = 1, reserved: tuple[str, ...] = ()):
         self.max = max_sessions
+        self.reserved = set(reserved)       # ids that never count toward the limit (the legacy /train slot)
         self._s: dict[str, TrainTask] = {}
+
+    def _count(self) -> int:
+        return sum(1 for k in self._s if k not in self.reserved)
 
     def create(self, sid: str, task: str, cfg: dict, ctx: TaskContext, replace: bool = False) -> TrainTask:
         if sid in self._s:
             if not replace:
                 raise ValueError(f"training session {sid!r} already exists")
             self.close(sid)
-        if len(self._s) >= self.max:
-            raise SessionLimit(f"worker holds {len(self._s)}/{self.max} training sessions; close one first "
+        if sid not in self.reserved and self._count() >= self.max:
+            raise SessionLimit(f"worker holds {self._count()}/{self.max} training sessions; close one first "
                                f"(MOREGPU_MAX_TRAIN_SESSIONS)")
         t = registry.create(task)
         t.init(cfg, ctx)
@@ -37,8 +41,8 @@ class SessionStore:
         return t
 
     def put(self, sid: str, t: TrainTask) -> None:
-        if sid not in self._s and len(self._s) >= self.max:
-            raise SessionLimit(f"worker holds {len(self._s)}/{self.max} training sessions")
+        if sid not in self._s and sid not in self.reserved and self._count() >= self.max:
+            raise SessionLimit(f"worker holds {self._count()}/{self.max} training sessions")
         self._s[sid] = t
 
     def get(self, sid: str) -> TrainTask:

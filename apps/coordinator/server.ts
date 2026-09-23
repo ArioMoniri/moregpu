@@ -17,6 +17,7 @@
  * (persisted beside MOREGPU_CONFIG) and serves wss:// + https, printing the cert's SHA-256 fingerprint as the
  * worker pin (MOREGPU_PIN). Set MOREGPU_INSECURE=1 to opt back into plaintext ws:// for a simple local/CI run.
  */
+import { TrainSession, type Rpc, type RoundSummary, type SessionConfig, type CheckpointStore } from './lib/train_session.ts';
 if (Deno.args.includes('--help') || Deno.args.includes('-h')) { printHelp(); Deno.exit(0); }
 
 const PORT = Number(Deno.env.get('PORT') ?? 8787);
@@ -1641,6 +1642,132 @@ function virtualGpu() {
 }
 
 // ---------- HTTP + WS ----------
+// ---------- generic training sessions (apps/coordinator/lib/train_session.ts) ----------
+const TRAIN_DIR = Deno.env.get('MOREGPU_TRAIN_DIR') ?? './.moregpu-train';
+const TELEMETRY_DIR = Deno.env.get('MOREGPU_TELEMETRY_DIR') ?? '';
+const GIT_SHA = Deno.env.get('MOREGPU_GIT_SHA') ?? '';
+const tsessions = new Map<string, TrainSession>();
+const tsRunning = new Map<string, { stop: boolean }>();
+const tsTelemetry = new Map<string, Record<string, unknown>[]>();   // recent records per session (dashboard)
+const fsStore: CheckpointStore = {
+  async write(name, data) {
+    const path = `${TRAIN_DIR}/${name}`; await Deno.mkdir(path.slice(0, path.lastIndexOf('/')), { recursive: true });
+    const tmp = `${path}.tmp`;
+    if (typeof data === 'string') await Deno.writeTextFile(tmp, data); else await Deno.writeFile(tmp, data);
+    await Deno.rename(tmp, path);   // atomic: a checkpoint's .json appears only once complete
+  },
+  async read(name) { try { return await Deno.readFile(`${TRAIN_DIR}/${name}`); } catch { return null; } },
+  async list(prefix) {
+    const dir = `${TRAIN_DIR}/${prefix.replace(/\/$/, '')}`; const out: string[] = [];
+    try { for await (const e of Deno.readDir(dir)) if (e.isFile && !e.name.endsWith('.tmp')) out.push(`${prefix.replace(/\/$/, '')}/${e.name}`); } catch { /* none */ }
+    return out;
+  },
+  async remove(name) { try { await Deno.remove(`${TRAIN_DIR}/${name}`); } catch { /* gone */ } },
+};
+function tsTelemetrySink(sid: string) {
+  return (rec: Record<string, unknown>) => {
+    const arr = tsTelemetry.get(sid) ?? []; arr.push(rec); if (arr.length > 2000) arr.splice(0, arr.length - 2000); tsTelemetry.set(sid, arr);
+    if (TELEMETRY_DIR) {
+      Deno.mkdir(TELEMETRY_DIR, { recursive: true }).then(() => Deno.writeTextFile(`${TELEMETRY_DIR}/${sid}.jsonl`, JSON.stringify(rec) + '\n', { append: true }))
+        .catch((e) => log('warn', `telemetry write failed: ${e}`));
+    }
+  };
+}
+const tsRpc: Rpc = (id, op, payload) => {
+  const w = workers.get(id);
+  if (!w) return Promise.resolve({ ok: false, error: `worker ${id} disconnected` });
+  return trainRPC(w, op, payload);
+};
+const tsDeps = (sid: string) => ({ telemetry: tsTelemetrySink(sid), store: fsStore, log: (l: string, m: string) => log(l as 'info' | 'warn', m), gitSha: GIT_SHA || undefined });
+const tsLive = (id: string) => workers.has(id) && !(workers.get(id)!.paused);
+async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
+  const parts = url.pathname.split('/').filter(Boolean);   // ['train','sessions', id?, action?]
+  const id = parts[2], action = parts[3];
+  try {
+    if (!id && req.method === 'GET') return json({ ok: true, sessions: [...tsessions.values()].map((s) => s.describe()) });
+    if (!id && req.method === 'POST') {
+      const body = await req.json().catch(() => null) as (SessionConfig & { workers?: string[]; id?: string }) | null;
+      if (!body || typeof body.task !== 'string') return json({ error: 'body must include task' }, 400);
+      for (const k of ['manifest_len', 'batch', 'inner_steps', 'lr'] as const) if (!Number.isFinite(Number(body[k]))) return json({ error: `${k} must be a number` }, 400);
+      const pool = torchWorkers().filter((w) => w.caps.has('train') || w.label.includes('torch'));
+      const chosen = body.workers?.length ? body.workers : pool.map((w) => w.id);
+      const missing = chosen.filter((w) => !workers.has(w));
+      if (missing.length) return json({ error: `unknown/disconnected workers: ${missing.join(', ')}` }, 400);
+      if (!chosen.length) return json({ error: 'no native (torch) worker connected' }, 503);
+      const sid = body.id && /^[A-Za-z0-9_.-]{1,64}$/.test(body.id) ? body.id : `ts-${crypto.randomUUID().slice(0, 8)}`;
+      if (sid === 'legacy' || tsessions.has(sid)) return json({ error: `session id ${sid} is taken` }, 409);
+      const { workers: _w, id: _i, ...cfg } = body;
+      const s = new TrainSession(sid, cfg, chosen, tsRpc, tsDeps(sid));
+      tsessions.set(sid, s);
+      try { const r = await s.init(); return json(r); }
+      catch (e) { tsessions.delete(sid); return json({ error: (e as Error).message }, 502); }
+    }
+    if (id === 'resume' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; workers?: string[] };
+      if (!body.id) return json({ error: 'id required' }, 400);
+      if (tsessions.has(body.id)) return json({ error: 'session is live; delete it before resuming' }, 409);
+      const s = await TrainSession.resume(body.id, fsStore, tsRpc, tsDeps(body.id), body.workers);
+      tsessions.set(body.id, s);
+      return json({ ok: true, ...s.describe() });
+    }
+    const s = id ? tsessions.get(id) : undefined;
+    if (!s) return json({ error: `no training session ${id}` }, 404);
+    if (!action && req.method === 'GET') return json({ ok: true, ...s.describe(), history: s.history });
+    if (!action && req.method === 'DELETE') {
+      const run = tsRunning.get(s.id); if (run) run.stop = true;
+      await s.close(); tsessions.delete(s.id); return json({ ok: true });
+    }
+    if (action === 'round' && req.method === 'POST') {
+      if (tsRunning.has(s.id)) return json({ error: 'a background run is active — POST /stop first' }, 409);
+      const body = await req.json().catch(() => ({})) as { rounds?: number };
+      const n = Math.max(1, Math.min(Number(body.rounds ?? 1), 100_000));
+      const out: RoundSummary[] = [];
+      for (let i = 0; i < n && !s.isDone(); i++) out.push(await s.runRound(tsLive));
+      return json({ ok: true, rounds: out, ...s.describe() });
+    }
+    if (action === 'run' && req.method === 'POST') {
+      if (tsRunning.has(s.id)) return json({ error: 'already running' }, 409);
+      const body = await req.json().catch(() => ({})) as { max_rounds?: number };
+      const limit = Number(body.max_rounds ?? Infinity); const flag = { stop: false }; tsRunning.set(s.id, flag);
+      (async () => {
+        let i = 0;
+        try { while (!flag.stop && !s.isDone() && i++ < limit) await s.runRound(tsLive); }
+        catch (e) { log('warn', `train ${s.id}: background run stopped — ${(e as Error).message}`); }
+        finally { tsRunning.delete(s.id); }
+      })();
+      return json({ ok: true, running: true, ...s.describe() });
+    }
+    if (action === 'stop' && req.method === 'POST') { const r = tsRunning.get(s.id); if (r) r.stop = true; return json({ ok: true, stopping: !!r }); }
+    if (action === 'eval' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { refs?: unknown[]; kind?: string; worker?: string };
+      return json({ ok: true, metrics: await s.evaluate(body.refs ?? [], body.kind ?? 'loss', body.worker) });
+    }
+    if (action === 'export' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { fmt?: string; path?: string; worker?: string };
+      if (!body.path) return json({ error: 'path required (a path on the worker)' }, 400);
+      return json({ ok: true, ...(await s.export(body.fmt ?? 'safetensors', body.path, body.worker)) });
+    }
+    if (action === 'state' && req.method === 'GET') {
+      const dt = (url.searchParams.get('dtype') ?? 'f32') as 'f32' | 'bf16' | 'fp16';
+      const { header, blob } = await s.globalTensors(dt);
+      return json({ ok: true, round: s.round, header, blob_b64: b64e(blob) });
+    }
+    if (action === 'checkpoint' && req.method === 'POST') return json({ ok: true, checkpoint: await s.checkpoint() });
+    if (action === 'workers' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { add?: string };
+      if (!body.add || !workers.has(body.add)) return json({ error: 'add must name a connected worker' }, 400);
+      return json({ ok: await s.addWorker(body.add), workers: s.workers });
+    }
+    if (action === 'telemetry' && req.method === 'GET') {
+      const n = Math.max(1, Math.min(Number(url.searchParams.get('n') ?? 500), 2000));
+      return json({ ok: true, records: (tsTelemetry.get(s.id) ?? []).slice(-n) });
+    }
+    return json({ error: 'not found' }, 404);
+  } catch (e) {
+    return json({ error: (e as Error).message }, 500);
+  }
+}
+
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o, null, 2), { status, headers: { 'content-type': 'application/json' } });
 const authOk = (req: Request) => constEq((req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '') || (req.headers.get('x-admin-token') ?? ''), cfg.adminToken);
 const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale', 'gelu', 'softmax', 'layernorm'];
@@ -1934,6 +2061,22 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     for (const [n, a] of diloco.global) tensors[n] = { data: f32ToB64(a), shape: diloco.shape.get(n)! };
     return json({ ok: true, round: diloco.round, workers: diloco.workers, tensors });
   }
+  // ---- Generic training-task sessions (ADR-0104/0105/0106): any TrainTask (llm_lora, jepa_*, segment, classify,
+  // toy_linear, pinned plugins) on N torch workers with weighted DiLoCo, deterministic shards, telemetry, resume.
+  //   POST   /train/sessions                  {task, cfg, workers?, manifest_len, batch, inner_steps, lr, ...} → init
+  //   GET    /train/sessions                  → list
+  //   GET    /train/sessions/:id              → describe + round history
+  //   POST   /train/sessions/:id/round        {rounds?} → run rounds synchronously
+  //   POST   /train/sessions/:id/run          {max_rounds?} → run in the background until the stopping rule
+  //   POST   /train/sessions/:id/stop         → stop a background run after the current round
+  //   POST   /train/sessions/:id/eval         {refs, kind, worker?}
+  //   POST   /train/sessions/:id/export       {fmt, path, worker?}   (written on the worker)
+  //   GET    /train/sessions/:id/state?dtype= → global tensors {header, blob_b64}
+  //   POST   /train/sessions/:id/checkpoint   · POST /train/sessions/resume {id, workers?}
+  //   POST   /train/sessions/:id/workers      {add}
+  //   GET    /train/sessions/:id/telemetry    → recent telemetry records
+  //   DELETE /train/sessions/:id
+  if (url.pathname === '/train/sessions' || url.pathname.startsWith('/train/sessions/')) return trainSessionRoute(req, url);
   // Resident-model serving: hold a whole model on a torch worker and run the ENTIRE forward per call —
   // ONE round-trip per token instead of the ~500 the fine-grained kernel path needs. THIS is fast serving.
   //   POST /model/load     { model, id?, fp16?, worker? }

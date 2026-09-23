@@ -102,3 +102,40 @@ def test_plugin_allowlist_refuses_unpinned(tmp_path, monkeypatch):
     found, refused = R.discover_plugins(eps, allowlist_path=allow)
     assert list(found) == ["good"]
     assert set(refused) == {"wrongver", "nohash", "unknown"}
+
+
+def test_reserved_legacy_slot_does_not_count():
+    s = SessionStore(max_sessions=1, reserved=("legacy",))
+    s.create("legacy", "toy_linear", TOY, ctx())
+    s.create("a", "toy_linear", TOY, ctx())
+    with pytest.raises(SessionLimit):
+        s.create("b", "toy_linear", TOY, ctx())
+
+
+def test_default_limit_env_and_store_helpers(monkeypatch):
+    from moregpu_worker.train.sessions import default_limit
+    monkeypatch.setenv("MOREGPU_MAX_TRAIN_SESSIONS", "5")
+    assert default_limit("cuda") == 5
+    monkeypatch.delenv("MOREGPU_MAX_TRAIN_SESSIONS")
+    assert default_limit("cuda") == 1 and default_limit("cpu") == 2
+    s = SessionStore(1)
+    t = R.create("toy_linear"); t.init(TOY, ctx())
+    s.put("x", t)
+    assert s.maybe("x") is t and s.maybe("y") is None and s.ids() == ["x"]
+    with pytest.raises(SessionLimit):
+        s.put("y", t)
+    assert s.close("x") and not s.close("x")
+    s.create("r", "toy_linear", TOY, ctx())
+    s.create("r", "toy_linear", TOY, ctx(), replace=True)
+
+
+def test_task_base_defaults():
+    t = R.create("toy_linear"); t.init({**TOY, "optimizer": "adamw"}, TaskContext(deterministic=True))
+    assert t.after_outer_step(1) == {}
+    with pytest.raises(NotImplementedError):
+        t.export("onnx", "/tmp/x")
+    with pytest.raises(ValueError):
+        t.make_optimizer(t.model.parameters(), 0.1, "lion")
+    with pytest.raises(ValueError):
+        t.inner_steps([], 1, 0.1)
+    torch.use_deterministic_algorithms(False)

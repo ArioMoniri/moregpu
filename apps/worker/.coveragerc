@@ -1,0 +1,9 @@
+[run]
+source = moregpu_worker
+omit =
+    */moregpu_worker/vision/webgpu_*
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError

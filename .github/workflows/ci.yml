@@ -71,9 +71,20 @@ jobs:
           # (experts.<N>.gate_proj…), which transformers 5.x fuses into a single batched `Experts` module.
           # Sharding/serving/training work on 4.x AND 5.x; MoE EP currently needs the 4.x OLMoE ModuleList layout.
           pip install cryptography websockets numpy 'transformers>=4.44,<5' safetensors
+          # vision / training-task framework test deps (ADR-0102); GPU/WebGPU-marked tests skip on CI runners
+          pip install pytest pytest-cov scipy nibabel pillow tifffile onnx onnxruntime onnxscript monai timm
+
+      - name: Research boundary (ADR-0101) — no study/dataset terms, copyleft code or medical images outside docs/case-studies
+        run: python3 -m pytest -q tests/boundary
+
+      - name: Worker library unit tests (pytest, ≥90% coverage of moregpu_worker)
+        run: python3 -m pytest -q tests/py --cov=moregpu_worker --cov-config=apps/worker/.coveragerc --cov-fail-under=90
 
       - name: Compile-check native code
         run: python -m py_compile apps/worker/worker_torch.py examples/*.py clients/python/moregpu/__init__.py
+
+      - name: Generic training sessions — coordinator DiLoCo == in-process reference, resume, isolation, churn
+        run: python3 tests/e2e/train_sessions.py
 
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh

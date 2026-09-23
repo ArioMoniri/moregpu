@@ -182,7 +182,7 @@ TORCH_POOL = ThreadPoolExecutor(max_workers=1)
 # Compute ops that count toward the node's DUTY (the admin slider's ceiling throttles these — a kernel shard,
 # a resident/pipeline forward, a training step). Transfer/control ops (push_*/ping/load/unload/arch) are never
 # throttled (throttling a weight stream would just make loading slower for no benefit).
-_PACED_OPS = {"forward", "generate", "chat", "shard_forward", "inner", "step"}
+_PACED_OPS = {"forward", "generate", "chat", "shard_forward", "inner", "step", "task_inner"}
 def _paced(fn, args, ceil_val, pace_it=True):
     """Run a compute op on the TORCH_POOL thread, then, if the duty ceiling < 100%, sleep so the thread is busy
     at most `ceil_val` of the time — a real duty-cycle throttle. Since the pool is single-threaded, sleeping here
@@ -292,8 +292,8 @@ def attach_lora(model: nn.Module, targets: list[str], r: int, alpha: float, dev:
 
 # Per-session training state (ADR-0104). The legacy /train and /train/diloco routes share the reserved session
 # LEGACY (exactly as they shared the old single TRAIN slot); new task sessions get coordinator-minted ids.
-SESSIONS = SessionStore(max_sessions=default_limit(DEV) + 1)   # +1: the legacy slot never blocks a task session
 LEGACY = "legacy"
+SESSIONS = SessionStore(max_sessions=default_limit(DEV), reserved=(LEGACY,))   # the legacy slot never blocks a task session
 
 def _legacy() -> "LlmLoraTask | None":
     t = SESSIONS.maybe(LEGACY)
@@ -400,7 +400,11 @@ def train_generate(payload: dict) -> dict:
     new = out[0, ids.shape[1]:].tolist()
     return {"ok": True, "tokens": new, "n": len(new), "step": task.step}
 
+from moregpu_worker.train.runner import TaskRunner  # noqa: E402
+RUNNER = TaskRunner(SESSIONS, DEV)
+
 def train_dispatch(op: str, payload: dict) -> dict:
+    if op.startswith("task_"): return RUNNER.handle(op, payload)   # generic TrainTask sessions (ADR-0105)
     if op == "load": return train_load(payload)
     if op == "step": return train_step(payload)
     if op == "adapter": return train_adapter()

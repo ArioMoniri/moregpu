@@ -44,3 +44,35 @@ def test_fp32_step_and_describe():
     p.backward_step(loss, opt)
     d = p.describe()
     assert d["mode"] == "fp32" and d["skipped_steps"] == 0
+
+
+def test_scaler_path_counts_skipped_steps():
+    class FakeScaler:
+        def __init__(self): self.s = 1024.0; self.calls = []
+        def scale(self, loss): self.calls.append("scale"); return loss * self.s
+        def unscale_(self, opt): self.calls.append("unscale")
+        def get_scale(self): return self.s
+        def step(self, opt): self.calls.append("step")
+        def update(self): self.s /= 2   # pretend an inf was found
+    p = A.AmpPolicy("fp16", "cuda", FakeScaler())
+    lin = torch.nn.Linear(2, 1)
+    opt = torch.optim.SGD(lin.parameters(), lr=0.1)
+    p.backward_step(lin(torch.ones(1, 2)).sum(), opt, clip=1.0, params=list(lin.parameters()))
+    assert p.skipped_steps == 1 and p.describe()["scale"] == 512.0
+    assert p.scaler.calls == ["scale", "unscale", "step"]
+
+
+def test_fp32_clip_and_bad_mps_bf16():
+    p = A.resolve("fp32", "cpu")
+    lin = torch.nn.Linear(2, 1); opt = torch.optim.SGD(lin.parameters(), lr=0.1)
+    p.backward_step(lin(torch.ones(1, 2)).sum() * 100, opt, clip=0.5, params=list(lin.parameters()))
+    with pytest.raises(ValueError):
+        A.resolve("bf16", "mps")
+
+
+@pytest.mark.cuda
+def test_cuda_autocast_real():
+    p = A.resolve("auto", "cuda")
+    with p.autocast():
+        y = torch.nn.Linear(4, 4).cuda()(torch.randn(2, 4, device="cuda"))
+    assert y.dtype in (torch.bfloat16, torch.float16)

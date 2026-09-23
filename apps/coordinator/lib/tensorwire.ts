@@ -7,11 +7,15 @@ export interface WireEntry { name: string; shape: number[]; offset: number; nbyt
 export interface WireHeader { v: 1; dtype: WireDtype; sha256: string; tensors: WireEntry[]; error?: { max_abs: number; rel_l2: number } }
 
 export function b64ToBytes(s: string): Uint8Array {
+  const F = (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array }).fromBase64;
+  if (typeof F === 'function') return F(s);   // native (Deno 2.x / modern V8): ~10x faster for MB payloads
   const bin = atob(s); const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
 export function bytesToB64(b: Uint8Array): string {
+  const f = (b as unknown as { toBase64?: () => string }).toBase64;
+  if (typeof f === 'function') return f.call(b);
   let s = ''; const CH = 0x8000;
   for (let i = 0; i < b.length; i += CH) s += String.fromCharCode(...b.subarray(i, i + CH));
   return btoa(s);

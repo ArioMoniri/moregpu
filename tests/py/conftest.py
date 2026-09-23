@@ -20,3 +20,8 @@ def pytest_collection_modifyitems(config, items):
             it.add_marker(pytest.mark.skip(reason="needs a CUDA device"))
         if "webgpu" in it.keywords and not os.environ.get("MOREGPU_WEBGPU"):
             it.add_marker(pytest.mark.skip(reason="needs WebGPU"))
+
+
+def pytest_configure(config):
+    for m in ("gpu: needs any accelerator", "cuda: needs CUDA", "webgpu: needs WebGPU", "slow: long-running"):
+        config.addinivalue_line("markers", m)
