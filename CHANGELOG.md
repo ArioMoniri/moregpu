@@ -65,6 +65,28 @@ The work is planned in ADRs 0101–0114 (`docs/dev/adr/`) and verified against t
   - `moregpu bench` emulates VRAM, CPU, memory and network limits.
 - **Research boundary guard** (`tests/boundary`), plus unit tests (pytest, ≥90 % coverage of `moregpu_worker`) and
   vitest suites for the coordinator libs.
+- **`MOREGPU_VRAM_FRACTION`** on native torch workers. The torch worker used to ignore it. It now calls
+  `torch.cuda.set_per_process_memory_fraction(f)` on every visible CUDA device at start-up. NaN, infinities,
+  non-numbers and values outside `(0, 1]` stop the worker with an error. The applied value is reported as
+  `hw.vram_fraction` in the hardware fingerprint, and so in every telemetry record (docs/ADMIN.md, docs/TRAINING.md).
+- **Encoder and model weights from pushed blobs.** A segment/classify `encoder: {init: "export", path}` and a
+  `finetune_model` spec `source` accept `pushed://<id>` (a `/data/push` BlobStore blob, `sha256` required) as well
+  as a path. Both kinds of source are size-capped at `MOREGPU_MODEL_MAX_BYTES`, re-hashed against `sha256`, and must
+  be safetensors: a pickle is refused before anything parses it. Paths stay confined to `MOREGPU_OUTPUT_DIR` ∪
+  `MOREGPU_MODEL_ROOTS`, and an export directory's `sha256` is now checked when given. JEPA exports store their
+  encoder config in the safetensors metadata, so the file alone is enough. New SDK helpers `push_safetensors` (Python)
+  and `pushSafetensors` (TS), and CLI flag `--encoder-sha256` (docs/TRAINING.md#initial-weights-a-path-or-a-pushed-blob).
+- **`pred_sha256` on predictions.** `vision_predict` and `vision_merge_write` results, `/vision/batch` job records,
+  `/vision/infer` and each `/vision/infer_batch` output carry a deterministic sha256 of the predicted label volume
+  (`moregpu.pred/1`: dtype and shape in the preimage, then uint8/uint16 labels in C order). The coordinator computes it
+  from the argmax of torch and WebGPU replies alike. A cross-language golden (`tests/goldens/pred_sha256.json`) checks
+  the Python and TypeScript implementations (docs/VISION.md#prediction-hashes-pred_sha256).
+
+### Fixed (0.7.0-dev)
+
+- Label maps with a class above 255 are written as `uint16`. They used to wrap to `uint8`.
+- A pushed blob `suffix` may have parts of up to 16 characters (for example `.safetensors`). The limit used to be 8.
+- `pushed://` model sources are capped at `MOREGPU_MODEL_MAX_BYTES`, like `https://` downloads.
 
 ### Security
 
