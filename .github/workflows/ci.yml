@@ -154,6 +154,9 @@ jobs:
       - name: CLI — moregpu train jepa|segment|status, net, models describe, vision load/batch --split tiles
         run: python3 tests/e2e/cli_train.py
 
+      - name: Security regressions — session-id traversal, config validation, body limit, caps coercion, dashboard CSP
+        run: python3 tests/e2e/security_routes.py
+
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh
 

@@ -208,6 +208,15 @@ class _JepaBase(TrainTask):
                     if p.requires_grad and pre + k in tensors:
                         p.copy_(tensors[pre + k].reshape(p.shape).to(p.device, p.dtype))
 
+    def target_checksum(self) -> list[float]:
+        """[sum, sum of squares] of the target weights in float64 — lets the coordinator accept ulp-level differences
+        between devices (CPU/CUDA/MPS) that change the exact hash."""
+        s1 = s2 = 0.0
+        for v in self.target.state_dict().values():
+            d = v.detach().double()
+            s1 += float(d.sum()); s2 += float((d * d).sum())
+        return [s1, s2]
+
     def target_hash(self) -> str:
         h = hashlib.sha256()
         for k, v in sorted(self.target.state_dict().items()):
@@ -225,7 +234,7 @@ class _JepaBase(TrainTask):
             m = self.ema.momentum_between(self._ema_step, self.step)
         self._ema_step = self.step
         ema_update(dict(self.target.named_parameters()), dict(self.encoder.named_parameters()), m)
-        out = {"target_sha256": self.target_hash(), "ema_momentum": m}
+        out = {"target_sha256": self.target_hash(), "target_checksum": self.target_checksum(), "ema_momentum": m}
         if self.monitor_every > 0 and round % self.monitor_every == 0:
             mon = MON.embedding_monitors(self._features(self.probe_idx))
             out["monitors"] = mon

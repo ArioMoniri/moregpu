@@ -22,7 +22,7 @@ import {
   fleetWants, exampleShape, inferCall, makeFleetRpc, pushVisionArtifact, bytesFromB64, parityReport,
   type Fleet, type TensorB64, type VisionIO, type WorkerKind,
 } from './lib/vision_fleet.ts';
-import { TrainSession, type Rpc, type RoundSummary, type SessionConfig, type CheckpointStore } from './lib/train_session.ts';
+import { TrainSession, SESSION_ID_RE, type Rpc, type RoundSummary, type SessionConfig, type CheckpointStore } from './lib/train_session.ts';
 if (Deno.args.includes('--help') || Deno.args.includes('-h')) { printHelp(); Deno.exit(0); }
 
 const PORT = Number(Deno.env.get('PORT') ?? 8787);
@@ -1649,30 +1649,39 @@ function virtualGpu() {
 // ---------- HTTP + WS ----------
 // ---------- generic training sessions (apps/coordinator/lib/train_session.ts) ----------
 const TRAIN_DIR = Deno.env.get('MOREGPU_TRAIN_DIR') ?? './.moregpu-train';
+const MAX_BODY_BYTES = Number(Deno.env.get('MOREGPU_MAX_BODY_BYTES') ?? 512 * 2 ** 20);
 const TELEMETRY_DIR = Deno.env.get('MOREGPU_TELEMETRY_DIR') ?? '';
 const GIT_SHA = Deno.env.get('MOREGPU_GIT_SHA') ?? '';
 const tsessions = new Map<string, TrainSession>();
 const tsRunning = new Map<string, { stop: boolean }>();
 const tsTelemetry = new Map<string, Record<string, unknown>[]>();   // recent records per session (dashboard)
+// every checkpoint path is `<session id>/<file>` and must stay inside TRAIN_DIR (session ids are validated too)
+const safeName = (name: string) => {
+  const parts = name.split('/');
+  if (parts.length !== 2 || !SESSION_ID_RE.test(parts[0]!) || !/^[A-Za-z0-9._%-]{1,200}$/.test(parts[1]!) || parts[1]!.startsWith('.')) throw new Error('invalid checkpoint path');
+  return `${TRAIN_DIR}/${parts[0]}/${parts[1]}`;
+};
 const fsStore: CheckpointStore = {
   async write(name, data) {
-    const path = `${TRAIN_DIR}/${name}`; await Deno.mkdir(path.slice(0, path.lastIndexOf('/')), { recursive: true });
+    const path = safeName(name); await Deno.mkdir(path.slice(0, path.lastIndexOf('/')), { recursive: true });
     const tmp = `${path}.tmp`;
     if (typeof data === 'string') await Deno.writeTextFile(tmp, data); else await Deno.writeFile(tmp, data);
     await Deno.rename(tmp, path);   // atomic: a checkpoint's .json appears only once complete
   },
-  async read(name) { try { return await Deno.readFile(`${TRAIN_DIR}/${name}`); } catch { return null; } },
+  async read(name) { try { return await Deno.readFile(safeName(name)); } catch { return null; } },
   async list(prefix) {
-    const dir = `${TRAIN_DIR}/${prefix.replace(/\/$/, '')}`; const out: string[] = [];
+    const sid = prefix.replace(/\/$/, '');
+    if (!SESSION_ID_RE.test(sid)) return [];
+    const dir = `${TRAIN_DIR}/${sid}`; const out: string[] = [];
     try { for await (const e of Deno.readDir(dir)) if (e.isFile && !e.name.endsWith('.tmp')) out.push(`${prefix.replace(/\/$/, '')}/${e.name}`); } catch { /* none */ }
     return out;
   },
-  async remove(name) { try { await Deno.remove(`${TRAIN_DIR}/${name}`); } catch { /* gone */ } },
+  async remove(name) { try { await Deno.remove(safeName(name)); } catch { /* gone */ } },
 };
 function tsTelemetrySink(sid: string) {
   return (rec: Record<string, unknown>) => {
     const arr = tsTelemetry.get(sid) ?? []; arr.push(rec); if (arr.length > 2000) arr.splice(0, arr.length - 2000); tsTelemetry.set(sid, arr);
-    if (TELEMETRY_DIR) {
+    if (TELEMETRY_DIR && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(sid)) {
       Deno.mkdir(TELEMETRY_DIR, { recursive: true }).then(() => Deno.writeTextFile(`${TELEMETRY_DIR}/${sid}.jsonl`, JSON.stringify(rec) + '\n', { append: true }))
         .catch((e) => log('warn', `telemetry write failed: ${e}`));
     }
@@ -1684,7 +1693,8 @@ const tsRpc: Rpc = (id, op, payload) => {
   return trainRPC(w, op, payload);
 };
 const tsDeps = (sid: string) => ({ telemetry: tsTelemetrySink(sid), store: fsStore, log: (l: string, m: string) => log(l as 'info' | 'warn', m), gitSha: GIT_SHA || undefined });
-const tsLive = (id: string) => workers.has(id) && !(workers.get(id)!.paused);
+const tsConnected = (id: string) => workers.has(id);
+const tsLive = (id: string) => workers.has(id) && !(workers.get(id)!.paused);   // paused: sits the round out, not evicted
 async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
   const parts = url.pathname.split('/').filter(Boolean);   // ['train','sessions', id?, action?]
   const id = parts[2], action = parts[3];
@@ -1695,23 +1705,27 @@ async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
       if (!body || typeof body.task !== 'string') return json({ error: 'body must include task' }, 400);
       for (const k of ['manifest_len', 'batch', 'inner_steps', 'lr'] as const) if (!Number.isFinite(Number(body[k]))) return json({ error: `${k} must be a number` }, 400);
       const pool = torchWorkers().filter((w) => w.caps.has('train') || w.label.includes('torch'));
-      const chosen = body.workers?.length ? body.workers : pool.map((w) => w.id);
-      const missing = chosen.filter((w) => !workers.has(w));
-      if (missing.length) return json({ error: `unknown/disconnected workers: ${missing.join(', ')}` }, 400);
+      const chosen = [...new Set(body.workers?.length ? body.workers : pool.map((w) => w.id))];
+      const missing = chosen.filter((w) => !pool.some((p) => p.id === w));
+      if (missing.length) return json({ error: `not connected native torch workers: ${missing.join(', ')}` }, 400);
       if (!chosen.length) return json({ error: 'no native (torch) worker connected' }, 503);
-      const sid = body.id && /^[A-Za-z0-9_.-]{1,64}$/.test(body.id) ? body.id : `ts-${crypto.randomUUID().slice(0, 8)}`;
+      if (body.id !== undefined && !SESSION_ID_RE.test(String(body.id))) return json({ error: 'id must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}' }, 400);
+      const sid = body.id ?? `ts-${crypto.randomUUID().slice(0, 8)}`;
       if (sid === 'legacy' || tsessions.has(sid)) return json({ error: `session id ${sid} is taken` }, 409);
       const { workers: _w, id: _i, ...cfg } = body;
-      const s = new TrainSession(sid, cfg, chosen, tsRpc, tsDeps(sid));
+      let s: TrainSession;
+      try { s = new TrainSession(sid, cfg, chosen, tsRpc, tsDeps(sid)); } catch (e) { return json({ error: (e as Error).message }, 400); }
       tsessions.set(sid, s);
       try { const r = await s.init(); return json(r); }
-      catch (e) { tsessions.delete(sid); return json({ error: (e as Error).message }, 502); }
+      catch (e) { tsessions.delete(sid); await s.close().catch(() => undefined); return json({ error: (e as Error).message }, 502); }
     }
     if (id === 'resume' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string; workers?: string[] };
-      if (!body.id) return json({ error: 'id required' }, 400);
+      if (!body.id || !SESSION_ID_RE.test(String(body.id))) return json({ error: 'id must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}' }, 400);
       if (tsessions.has(body.id)) return json({ error: 'session is live; delete it before resuming' }, 409);
-      const s = await TrainSession.resume(body.id, fsStore, tsRpc, tsDeps(body.id), body.workers);
+      let s: TrainSession;
+      try { s = await TrainSession.resume(body.id, fsStore, tsRpc, tsDeps(body.id), body.workers); }
+      catch (e) { log('warn', `resume ${body.id}: ${(e as Error).message}`); return json({ error: 'resume failed (no valid checkpoint for this id, or its workers are unavailable) — see the coordinator log' }, 400); }
       tsessions.set(body.id, s);
       return json({ ok: true, ...s.describe() });
     }
@@ -1720,14 +1734,14 @@ async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
     if (!action && req.method === 'GET') return json({ ok: true, ...s.describe(), history: s.history });
     if (!action && req.method === 'DELETE') {
       const run = tsRunning.get(s.id); if (run) run.stop = true;
-      await s.close(); tsessions.delete(s.id); return json({ ok: true });
+      await s.close(); tsessions.delete(s.id); tsTelemetry.delete(s.id); return json({ ok: true });
     }
     if (action === 'round' && req.method === 'POST') {
       if (tsRunning.has(s.id)) return json({ error: 'a background run is active — POST /stop first' }, 409);
       const body = await req.json().catch(() => ({})) as { rounds?: number };
       const n = Math.max(1, Math.min(Number(body.rounds ?? 1), 100_000));
       const out: RoundSummary[] = [];
-      for (let i = 0; i < n && !s.isDone(); i++) out.push(await s.runRound(tsLive));
+      for (let i = 0; i < n && !s.isDone(); i++) out.push(await s.runRound(tsLive, tsConnected));
       return json({ ok: true, rounds: out, ...s.describe() });
     }
     if (action === 'run' && req.method === 'POST') {
@@ -1736,7 +1750,7 @@ async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
       const limit = Number(body.max_rounds ?? Infinity); const flag = { stop: false }; tsRunning.set(s.id, flag);
       (async () => {
         let i = 0;
-        try { while (!flag.stop && !s.isDone() && i++ < limit) await s.runRound(tsLive); }
+        try { while (!flag.stop && !s.isDone() && i++ < limit) await s.runRound(tsLive, tsConnected); }
         catch (e) { log('warn', `train ${s.id}: background run stopped — ${(e as Error).message}`); }
         finally { tsRunning.delete(s.id); }
       })();
@@ -1865,7 +1879,11 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
       const body = await req.json().catch(() => ({})) as { id?: string };
       const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model' }, 404);
       const all = [...new Set([...m.workers, ...(m.lowerer ? [m.lowerer] : [])])];
-      await Promise.all(all.map((w) => holderKind(m)(w) === 'webgpu' ? modelRpcById(w, 'vision_unload', { id: body.id }) : tsRpc(w, 'vision_infer_unload', { id: body.id })));
+      await Promise.all(all.map(async (w) => {
+        if (holderKind(m)(w) === 'webgpu') return modelRpcById(w, 'vision_unload', { id: body.id });
+        await tsRpc(w, 'vision_infer_unload', { id: body.id });
+        return tsRpc(w, 'vision_unload', { id: body.id });        // also free a published-model adapter handle
+      }));
       visionModels.delete(body.id!); return json({ ok: true });
     }
     if (action === 'infer' && req.method === 'POST') {
@@ -1937,6 +1955,8 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
       const job = new VisionBatch(id, body.id!, body.items, ws, tsRpc, { tta: body.tta, overlap: body.overlap, sw_batch: body.sw_batch, blend: body.blend,
         normalize: body.normalize, split: body.split, stealAfterMs: body.steal_after_ms, maxAttempts: body.max_attempts, telemetry: tsTelemetrySink(id) });
       visionJobs.set(id, job);
+      // bounded memory: keep at most 200 jobs (drop the oldest finished ones and their telemetry)
+      if (visionJobs.size > 200) for (const [k, j] of visionJobs) { if (visionJobs.size <= 200) break; if (j.status !== 'running' && j.status !== 'pending') { visionJobs.delete(k); tsTelemetry.delete(k); } }
       job.run().catch((e) => log('warn', `vision job ${id}: ${(e as Error).message}`));
       return json({ ok: true, job: id, workers: ws, items: body.items.length });
     }
@@ -1958,6 +1978,9 @@ const KERNELS = ['matmul', 'vector_add', 'vector_mul', 'saxpy', 'relu', 'scale',
 async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Response> {
   const reflexiveIp = (info && 'remoteAddr' in info && info.remoteAddr && 'hostname' in info.remoteAddr) ? (info.remoteAddr as Deno.NetAddr).hostname : undefined;
   const url = new URL(req.url);
+  // request-body size limit for the JSON API (streamed transfers use their own chunked paths)
+  const clen = Number(req.headers.get('content-length') ?? 0);
+  if (req.method !== 'GET' && Number.isFinite(clen) && clen > MAX_BODY_BYTES) return new Response(JSON.stringify({ error: `request body larger than ${MAX_BODY_BYTES} bytes (MOREGPU_MAX_BODY_BYTES)` }), { status: 413, headers: { 'content-type': 'application/json' } });
   if (url.pathname === '/ws') { const { socket, response } = Deno.upgradeWebSocket(req); wireWorker(socket, reflexiveIp); return response; }
   // STUN-like reflexive-address hint: report the caller's observed public IP so an operator can decide whether to
   // port-forward the peer port and advertise it via MOREGPU_PEER_PUBLIC. Public + read-only (no secrets).
@@ -1984,7 +2007,7 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   if (url.pathname === '/net') {
     const cands = torchWorkers();
     const NET_PINGS = Math.max(1, Math.min(Number(url.searchParams.get('pings') ?? 20), 1000));
-    const NET_SUSTAINED_MB = Math.max(0, Math.min(Number(url.searchParams.get('sustained_mb') ?? 0), 4096));
+    const NET_SUSTAINED_MB = Math.max(0, Math.min(Number(url.searchParams.get('sustained_mb') ?? 0), 256)) || 0;
     const BW_BYTES = 512 << 10; // 512 KiB probe — enough to gauge throughput, small enough not to stall a slow link
     const bwBuf = new Uint8Array(BW_BYTES); // getRandomValues caps at 64 KiB/call → fill in chunks (entropy avoids any deflate skew)
     for (let o = 0; o < BW_BYTES; o += 65536) crypto.getRandomValues(bwBuf.subarray(o, Math.min(o + 65536, BW_BYTES)));
@@ -2292,12 +2315,18 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
     if (!w) return json({ error: 'no such worker' }, 404);
     if (!w.label.includes('torch')) return json({ ok: true, id: w.id, label: w.label, caps: [...w.caps], data: null, note: 'data plane runs on native torch workers' });
     const [d, t] = await Promise.all([trainRPC(w, 'data_caps', {}), trainRPC(w, 'task_list', {})]);
-    return json({ ok: true, id: w.id, label: w.label, caps: [...w.caps], data: d.ok ? d.data : { error: d.error }, train: t.ok ? t.data : { error: t.error } });
+    // worker-supplied fields are untrusted: coerce to the documented shape (the dashboard also escapes everything)
+    const dd = (d.ok ? d.data ?? {} : {}) as Record<string, unknown>;
+    const rd = (dd.readers ?? {}) as Record<string, unknown>;
+    const data = d.ok ? { readers: Object.fromEntries(Object.entries(rd).slice(0, 32).map(([k, v]) => [String(k).slice(0, 32), v === true])),
+      n_roots: Number(dd.n_roots) || 0, n_hosts: Number(dd.n_hosts) || 0, buckets: dd.buckets === true } : { error: String(d.error ?? '').slice(0, 200) };
+    const tasks = t.ok && Array.isArray((t.data as Record<string, unknown>)?.tasks) ? ((t.data as { tasks: unknown[] }).tasks).slice(0, 64).map((x) => String(x).slice(0, 64)) : [];
+    return json({ ok: true, id: w.id, label: w.label, caps: [...w.caps], data, train: { tasks } });
   }
   if (req.method === 'POST' && (url.pathname === '/data/push' || url.pathname === '/data/drop')) {
     const body = await req.json().catch(() => ({})) as { id?: string; sha256?: string; data_b64?: string; suffix?: string; workers?: string[] };
     if (!body.id || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(body.id)) return json({ error: 'id must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}' }, 400);
-    const targets = (body.workers?.length ? body.workers.map((id) => workers.get(id)).filter((w): w is Worker => !!w) : torchWorkers());
+    const targets = (body.workers?.length ? torchWorkers().filter((w) => body.workers!.includes(w.id)) : torchWorkers());
     if (!targets.length) return json({ error: 'no target torch workers' }, 503);
     if (url.pathname === '/data/drop') { const r = await Promise.all(targets.map((w) => trainRPC(w, 'blob_drop', { id: body.id }))); return json({ ok: r.every((x) => x.ok), workers: targets.map((w) => w.id) }); }
     if (!body.sha256 || !/^[0-9a-f]{64}$/.test(body.sha256) || typeof body.data_b64 !== 'string') return json({ error: 'sha256 (hex) and data_b64 are required' }, 400);
@@ -2819,7 +2848,11 @@ async function handler(req: Request, info?: Deno.ServeHandlerInfo): Promise<Resp
   if (url.pathname === '/jobs') return json([...jobs.values()].slice(-50).reverse().map(({ output: _o, ...r }) => ({ ...r, hasOutput: !!_o })));
   if (url.pathname.startsWith('/jobs/')) { const r = jobs.get(url.pathname.slice(6)); return r ? json(r) : json({ error: 'not found' }, 404); }
   if (url.pathname === '/chat') return new Response(CHAT_HTML, { headers: { 'content-type': 'text/html' } });
-  return new Response(dashboard(), { headers: { 'content-type': 'text/html' } });
+  // CSP: inline script is needed by this single-file page, but connect/img/frames are same-origin only, so even an
+  // injected script could not exfiltrate the admin token to another host.
+  return new Response(dashboard(), { headers: { 'content-type': 'text/html',
+    'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' } });
 }
 
 function prometheus(): string {
@@ -3532,7 +3565,7 @@ $("capsBtn").addEventListener("click",function(){
       var train=(tr.tasks||[]).join(", ");
       var vision=(c.caps||[]).indexOf("vision")>=0||(c.label||"").indexOf("torch")>=0;
       return '<tr><td>'+esc(c.id||"")+'</td><td class="mono">'+esc(c.label||"")+'</td><td class="mono">'+(train?esc(train):'– (inference only)')+'</td>'
-        +'<td class="mono">'+(readers?esc(readers):'–')+'</td><td class="mono">'+(d.n_roots!=null?d.n_roots:'–')+'</td><td class="mono">'+(vision?'✓':'–')+'</td></tr>';
+        +'<td class="mono">'+(readers?esc(readers):'–')+'</td><td class="mono">'+(d.n_roots!=null?esc(String(+d.n_roots)):'–')+'</td><td class="mono">'+(vision?'✓':'–')+'</td></tr>';
     }).join("");
     $("capsOut").innerHTML='<table class="nettbl"><thead><tr><th>worker</th><th>type</th><th>training tasks</th><th>data readers</th><th>data roots</th><th>vision</th></tr></thead><tbody>'+(rows||'<tr><td colspan="6" class="empty">no workers</td></tr>')+'</tbody></table>';
   }).catch(function(e){$("capsNote").textContent="✗ "+(e&&e.message||e);});

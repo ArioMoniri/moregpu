@@ -66,6 +66,7 @@ export async function decodeTensors(hdr: WireHeader, blob: Uint8Array, ref?: Map
   const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
   const out = new Map<string, Float32Array>();
   for (const e of hdr.tensors) {
+    if (!Number.isInteger(e.offset) || !Number.isInteger(e.nbytes) || e.offset < 0 || e.nbytes < 0 || e.offset + e.nbytes > blob.byteLength) throw new Error(`${e.name}: offset/size outside the payload`);
     const n = numel(e.shape), x = new Float32Array(n);
     if (hdr.dtype === 'f32') { if (e.nbytes !== 4 * n) throw new Error(`${e.name}: size mismatch`); for (let i = 0; i < n; i++) x[i] = dv.getFloat32(e.offset + 4 * i, true); }
     else if (hdr.dtype === 'bf16') { if (e.nbytes !== 2 * n) throw new Error(`${e.name}: size mismatch`); for (let i = 0; i < n; i++) x[i] = bf16ToFloat(dv.getUint16(e.offset + 2 * i, true)); }
