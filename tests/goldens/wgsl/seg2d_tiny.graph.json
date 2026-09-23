@@ -1,0 +1,232 @@
+{
+ "version": 1,
+ "inputs": [
+  {
+   "name": "x",
+   "shape": [
+    1,
+    3,
+    16,
+    20
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "op": "aten.conv2d.default",
+   "inputs": [
+    "x",
+    "c1.weight",
+    "c1.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv2d"
+  },
+  {
+   "op": "aten.batch_norm.default",
+   "inputs": [
+    "conv2d",
+    "b1.weight",
+    "b1.bias",
+    "b1.running_mean",
+    "b1.running_var"
+   ],
+   "attrs": {
+    "training": false,
+    "momentum": 0.1,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "batch_norm"
+  },
+  {
+   "op": "aten.relu.default",
+   "inputs": [
+    "batch_norm"
+   ],
+   "attrs": {},
+   "output": "relu"
+  },
+  {
+   "op": "aten.max_pool2d.default",
+   "inputs": [
+    "relu"
+   ],
+   "attrs": {
+    "kernel_size": [
+     2,
+     2
+    ],
+    "stride": [],
+    "padding": [
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1
+    ],
+    "ceil_mode": false
+   },
+   "output": "max_pool2d"
+  },
+  {
+   "op": "aten.conv2d.default",
+   "inputs": [
+    "max_pool2d",
+    "c2.weight",
+    "c2.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv2d_1"
+  },
+  {
+   "op": "aten.group_norm.default",
+   "inputs": [
+    "conv2d_1",
+    "g2.weight",
+    "g2.bias"
+   ],
+   "attrs": {
+    "num_groups": 4,
+    "eps": 1e-05,
+    "cudnn_enabled": false
+   },
+   "output": "group_norm"
+  },
+  {
+   "op": "aten.gelu.default",
+   "inputs": [
+    "group_norm"
+   ],
+   "attrs": {
+    "approximate": "none"
+   },
+   "output": "gelu"
+  },
+  {
+   "op": "aten.upsample_bilinear2d.vec",
+   "inputs": [
+    "gelu"
+   ],
+   "attrs": {
+    "output_size": null,
+    "align_corners": false,
+    "scale_factors": [
+     2.0,
+     2.0
+    ]
+   },
+   "output": "upsample_bilinear2d"
+  },
+  {
+   "op": "aten.cat.default",
+   "inputs": [
+    "relu",
+    "upsample_bilinear2d"
+   ],
+   "attrs": {
+    "dim": 1
+   },
+   "output": "cat"
+  },
+  {
+   "op": "aten.conv2d.default",
+   "inputs": [
+    "cat",
+    "c3.weight",
+    "c3.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1
+    ],
+    "padding": [
+     1,
+     1
+    ],
+    "dilation": [
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv2d_2"
+  },
+  {
+   "op": "aten.leaky_relu.default",
+   "inputs": [
+    "conv2d_2"
+   ],
+   "attrs": {
+    "negative_slope": 0.1
+   },
+   "output": "leaky_relu"
+  },
+  {
+   "op": "aten.conv2d.default",
+   "inputs": [
+    "leaky_relu",
+    "head.weight",
+    "head.bias"
+   ],
+   "attrs": {
+    "stride": [
+     1,
+     1
+    ],
+    "padding": [
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv2d_3"
+  },
+  {
+   "op": "aten.sigmoid.default",
+   "inputs": [
+    "conv2d_3"
+   ],
+   "attrs": {},
+   "output": "mask"
+  }
+ ],
+ "outputs": [
+  "mask"
+ ],
+ "weights": "seg2d_tiny.safetensors"
+}

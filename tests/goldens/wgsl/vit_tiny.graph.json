@@ -1,0 +1,586 @@
+{
+ "version": 1,
+ "inputs": [
+  {
+   "name": "x",
+   "shape": [
+    1,
+    3,
+    32,
+    32
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "op": "aten.conv2d.default",
+   "inputs": [
+    "x",
+    "pe.weight",
+    "pe.bias"
+   ],
+   "attrs": {
+    "stride": [
+     16,
+     16
+    ],
+    "padding": [
+     0,
+     0
+    ],
+    "dilation": [
+     1,
+     1
+    ],
+    "groups": 1
+   },
+   "output": "conv2d"
+  },
+  {
+   "op": "aten.flatten.using_ints",
+   "inputs": [
+    "conv2d"
+   ],
+   "attrs": {
+    "start_dim": 2,
+    "end_dim": -1
+   },
+   "output": "flatten"
+  },
+  {
+   "op": "aten.transpose.int",
+   "inputs": [
+    "flatten"
+   ],
+   "attrs": {
+    "dim0": 1,
+    "dim1": 2
+   },
+   "output": "transpose"
+  },
+  {
+   "op": "aten.expand.default",
+   "inputs": [
+    "cls"
+   ],
+   "attrs": {
+    "size": [
+     1,
+     -1,
+     -1
+    ],
+    "implicit": false
+   },
+   "output": "expand"
+  },
+  {
+   "op": "aten.cat.default",
+   "inputs": [
+    "expand",
+    "transpose"
+   ],
+   "attrs": {
+    "dim": 1
+   },
+   "output": "cat"
+  },
+  {
+   "op": "aten.add.Tensor",
+   "inputs": [
+    "cat",
+    "pos"
+   ],
+   "attrs": {
+    "alpha": 1
+   },
+   "output": "add"
+  },
+  {
+   "op": "aten.layer_norm.default",
+   "inputs": [
+    "add",
+    "blocks.0.n1.weight",
+    "blocks.0.n1.bias"
+   ],
+   "attrs": {
+    "normalized_shape": [
+     192
+    ],
+    "eps": 1e-06,
+    "cudnn_enable": false
+   },
+   "output": "layer_norm"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "layer_norm",
+    "blocks.0.qkv.weight",
+    "blocks.0.qkv.bias"
+   ],
+   "attrs": {},
+   "output": "linear"
+  },
+  {
+   "op": "aten.reshape.default",
+   "inputs": [
+    "linear"
+   ],
+   "attrs": {
+    "shape": [
+     1,
+     5,
+     3,
+     3,
+     64
+    ]
+   },
+   "output": "reshape"
+  },
+  {
+   "op": "aten.permute.default",
+   "inputs": [
+    "reshape"
+   ],
+   "attrs": {
+    "dims": [
+     2,
+     0,
+     3,
+     1,
+     4
+    ]
+   },
+   "output": "permute"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "permute"
+   ],
+   "attrs": {
+    "dim": 0,
+    "index": 0
+   },
+   "output": "select"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "permute"
+   ],
+   "attrs": {
+    "dim": 0,
+    "index": 1
+   },
+   "output": "select_1"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "permute"
+   ],
+   "attrs": {
+    "dim": 0,
+    "index": 2
+   },
+   "output": "select_2"
+  },
+  {
+   "op": "aten.scaled_dot_product_attention.default",
+   "inputs": [
+    "select",
+    "select_1",
+    "select_2"
+   ],
+   "attrs": {
+    "dropout_p": 0.0,
+    "is_causal": false,
+    "scale": null,
+    "enable_gqa": false
+   },
+   "output": "scaled_dot_product_attention"
+  },
+  {
+   "op": "aten.transpose.int",
+   "inputs": [
+    "scaled_dot_product_attention"
+   ],
+   "attrs": {
+    "dim0": 1,
+    "dim1": 2
+   },
+   "output": "transpose_1"
+  },
+  {
+   "op": "aten.reshape.default",
+   "inputs": [
+    "transpose_1"
+   ],
+   "attrs": {
+    "shape": [
+     1,
+     5,
+     192
+    ]
+   },
+   "output": "reshape_1"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "reshape_1",
+    "blocks.0.proj.weight",
+    "blocks.0.proj.bias"
+   ],
+   "attrs": {},
+   "output": "linear_1"
+  },
+  {
+   "op": "aten.add.Tensor",
+   "inputs": [
+    "add",
+    "linear_1"
+   ],
+   "attrs": {
+    "alpha": 1
+   },
+   "output": "add_1"
+  },
+  {
+   "op": "aten.layer_norm.default",
+   "inputs": [
+    "add_1",
+    "blocks.0.n2.weight",
+    "blocks.0.n2.bias"
+   ],
+   "attrs": {
+    "normalized_shape": [
+     192
+    ],
+    "eps": 1e-06,
+    "cudnn_enable": false
+   },
+   "output": "layer_norm_1"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "layer_norm_1",
+    "blocks.0.fc1.weight",
+    "blocks.0.fc1.bias"
+   ],
+   "attrs": {},
+   "output": "linear_2"
+  },
+  {
+   "op": "aten.gelu.default",
+   "inputs": [
+    "linear_2"
+   ],
+   "attrs": {
+    "approximate": "none"
+   },
+   "output": "gelu"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "gelu",
+    "blocks.0.fc2.weight",
+    "blocks.0.fc2.bias"
+   ],
+   "attrs": {},
+   "output": "linear_3"
+  },
+  {
+   "op": "aten.add.Tensor",
+   "inputs": [
+    "add_1",
+    "linear_3"
+   ],
+   "attrs": {
+    "alpha": 1
+   },
+   "output": "add_2"
+  },
+  {
+   "op": "aten.layer_norm.default",
+   "inputs": [
+    "add_2",
+    "blocks.1.n1.weight",
+    "blocks.1.n1.bias"
+   ],
+   "attrs": {
+    "normalized_shape": [
+     192
+    ],
+    "eps": 1e-06,
+    "cudnn_enable": false
+   },
+   "output": "layer_norm_2"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "layer_norm_2",
+    "blocks.1.qkv.weight",
+    "blocks.1.qkv.bias"
+   ],
+   "attrs": {},
+   "output": "linear_4"
+  },
+  {
+   "op": "aten.reshape.default",
+   "inputs": [
+    "linear_4"
+   ],
+   "attrs": {
+    "shape": [
+     1,
+     5,
+     3,
+     3,
+     64
+    ]
+   },
+   "output": "reshape_2"
+  },
+  {
+   "op": "aten.permute.default",
+   "inputs": [
+    "reshape_2"
+   ],
+   "attrs": {
+    "dims": [
+     2,
+     0,
+     3,
+     1,
+     4
+    ]
+   },
+   "output": "permute_1"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "permute_1"
+   ],
+   "attrs": {
+    "dim": 0,
+    "index": 0
+   },
+   "output": "select_3"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "permute_1"
+   ],
+   "attrs": {
+    "dim": 0,
+    "index": 1
+   },
+   "output": "select_4"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "permute_1"
+   ],
+   "attrs": {
+    "dim": 0,
+    "index": 2
+   },
+   "output": "select_5"
+  },
+  {
+   "op": "aten.scaled_dot_product_attention.default",
+   "inputs": [
+    "select_3",
+    "select_4",
+    "select_5"
+   ],
+   "attrs": {
+    "dropout_p": 0.0,
+    "is_causal": false,
+    "scale": null,
+    "enable_gqa": false
+   },
+   "output": "scaled_dot_product_attention_1"
+  },
+  {
+   "op": "aten.transpose.int",
+   "inputs": [
+    "scaled_dot_product_attention_1"
+   ],
+   "attrs": {
+    "dim0": 1,
+    "dim1": 2
+   },
+   "output": "transpose_2"
+  },
+  {
+   "op": "aten.reshape.default",
+   "inputs": [
+    "transpose_2"
+   ],
+   "attrs": {
+    "shape": [
+     1,
+     5,
+     192
+    ]
+   },
+   "output": "reshape_3"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "reshape_3",
+    "blocks.1.proj.weight",
+    "blocks.1.proj.bias"
+   ],
+   "attrs": {},
+   "output": "linear_5"
+  },
+  {
+   "op": "aten.add.Tensor",
+   "inputs": [
+    "add_2",
+    "linear_5"
+   ],
+   "attrs": {
+    "alpha": 1
+   },
+   "output": "add_3"
+  },
+  {
+   "op": "aten.layer_norm.default",
+   "inputs": [
+    "add_3",
+    "blocks.1.n2.weight",
+    "blocks.1.n2.bias"
+   ],
+   "attrs": {
+    "normalized_shape": [
+     192
+    ],
+    "eps": 1e-06,
+    "cudnn_enable": false
+   },
+   "output": "layer_norm_3"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "layer_norm_3",
+    "blocks.1.fc1.weight",
+    "blocks.1.fc1.bias"
+   ],
+   "attrs": {},
+   "output": "linear_6"
+  },
+  {
+   "op": "aten.gelu.default",
+   "inputs": [
+    "linear_6"
+   ],
+   "attrs": {
+    "approximate": "none"
+   },
+   "output": "gelu_1"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "gelu_1",
+    "blocks.1.fc2.weight",
+    "blocks.1.fc2.bias"
+   ],
+   "attrs": {},
+   "output": "linear_7"
+  },
+  {
+   "op": "aten.add.Tensor",
+   "inputs": [
+    "add_3",
+    "linear_7"
+   ],
+   "attrs": {
+    "alpha": 1
+   },
+   "output": "add_4"
+  },
+  {
+   "op": "aten.layer_norm.default",
+   "inputs": [
+    "add_4",
+    "norm.weight",
+    "norm.bias"
+   ],
+   "attrs": {
+    "normalized_shape": [
+     192
+    ],
+    "eps": 1e-06,
+    "cudnn_enable": false
+   },
+   "output": "layer_norm_4"
+  },
+  {
+   "op": "aten.select.int",
+   "inputs": [
+    "layer_norm_4"
+   ],
+   "attrs": {
+    "dim": 1,
+    "index": 0
+   },
+   "output": "select_6"
+  },
+  {
+   "op": "aten.linear.default",
+   "inputs": [
+    "select_6",
+    "head.weight",
+    "head.bias"
+   ],
+   "attrs": {},
+   "output": "logits"
+  },
+  {
+   "op": "aten.slice.Tensor",
+   "inputs": [
+    "layer_norm_4"
+   ],
+   "attrs": {
+    "dim": 1,
+    "start": 1,
+    "end": 9223372036854775807,
+    "step": 1
+   },
+   "output": "slice_1"
+  },
+  {
+   "op": "aten.mean.dim",
+   "inputs": [
+    "slice_1"
+   ],
+   "attrs": {
+    "dim": [
+     1
+    ],
+    "keepdim": false,
+    "dtype": null
+   },
+   "output": "features"
+  }
+ ],
+ "outputs": [
+  "logits",
+  "features"
+ ],
+ "weights": "vit_tiny.safetensors"
+}
