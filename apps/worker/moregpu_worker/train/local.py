@@ -20,8 +20,9 @@ def run_plain(task: str, cfg: dict, steps: int, batch: int, lr: float, seed: int
     t = _make(task, cfg, seed, device, amp, keep=True)
     stream = SampleStream(manifest_len, seed)
     losses = []
-    for _ in range(steps):
+    for s in range(steps):
         losses += t.inner_steps(stream.take(batch), 1, lr).losses
+        t.after_outer_step(s + 1)          # per-step hook (e.g. I-JEPA EMA every step) — DiLoCo N=1,H=1 equivalence
     return {"state": t.state_for_sync(), "losses": losses, "samples_seen": steps * batch, "task": t}
 
 
