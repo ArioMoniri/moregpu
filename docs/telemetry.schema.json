@@ -1,0 +1,943 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:moregpu:telemetry:1",
+  "title": "moregpu.telemetry/1",
+  "description": "MoreGPU telemetry records (JSONL, one object per line). See docs/TELEMETRY.md and ADR-0111.",
+  "type": "object",
+  "required": [
+    "schema",
+    "kind"
+  ],
+  "properties": {
+    "schema": {
+      "const": "moregpu.telemetry/1"
+    },
+    "kind": {
+      "enum": [
+        "worker_round",
+        "round",
+        "job",
+        "bench",
+        "external_round"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/worker_round"
+    },
+    {
+      "$ref": "#/$defs/round"
+    },
+    {
+      "$ref": "#/$defs/job"
+    },
+    {
+      "$ref": "#/$defs/bench"
+    },
+    {
+      "$ref": "#/$defs/external_round"
+    }
+  ],
+  "$defs": {
+    "worker_round": {
+      "type": "object",
+      "required": [
+        "amp",
+        "bytes_down",
+        "bytes_up",
+        "compute_s",
+        "config_hash",
+        "data_s",
+        "energy_j",
+        "git_sha",
+        "gpu_power_w",
+        "gpu_util",
+        "hw",
+        "kind",
+        "loss_last",
+        "mem_peak_bytes",
+        "network_s",
+        "round",
+        "samples",
+        "samples_per_s",
+        "samples_seen",
+        "schema",
+        "serialize_s",
+        "session",
+        "task",
+        "ts",
+        "wait_s",
+        "wall_s",
+        "wire_error",
+        "worker"
+      ],
+      "properties": {
+        "schema": {
+          "const": "moregpu.telemetry/1"
+        },
+        "kind": {
+          "const": "worker_round"
+        },
+        "ts": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+          "description": "ISO-8601 UTC time of emission"
+        },
+        "session": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task": {
+          "type": "string",
+          "minLength": 1
+        },
+        "round": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "worker": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "round/job wall time; = compute+data+serialize+network+wait"
+        },
+        "compute_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "data_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "serialize_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "network_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "time in flight on the wire (coordinator-measured for MoreGPU)"
+        },
+        "wait_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "wall \u2212 all other phases (straggler / barrier wait)"
+        },
+        "bytes_up": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_down": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "samples_seen": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "cumulative samples this worker has trained on in the session"
+        },
+        "samples_per_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "loss_last": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "amp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "resolved AMP mode (bf16|fp16|fp32) or null"
+        },
+        "gpu_util": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "mean NVML GPU util, %"
+        },
+        "gpu_power_w": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "mean NVML board power, W"
+        },
+        "energy_j": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "NVML total-energy counter delta, else trapezoid of sampled power, J"
+        },
+        "mem_peak_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "torch.cuda.max_memory_allocated (or NVML used peak)"
+        },
+        "hw": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "hw.fingerprint() \u2014 no PII (host is a salted hash)"
+        },
+        "wire_error": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "max_abs",
+            "rel_l2"
+          ],
+          "properties": {
+            "max_abs": {
+              "type": "number",
+              "minimum": 0
+            },
+            "rel_l2": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "description": "lossy sync dtype reconstruction error (tensorwire header.error)"
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_hash": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "round": {
+      "type": "object",
+      "required": [
+        "alarms",
+        "avg_last_loss",
+        "bytes_down",
+        "bytes_up",
+        "config_hash",
+        "dropped",
+        "eval",
+        "git_sha",
+        "kind",
+        "monitors",
+        "reduce_s",
+        "round",
+        "samples",
+        "samples_seen",
+        "schema",
+        "session",
+        "task",
+        "ts",
+        "wall_s",
+        "workers"
+      ],
+      "properties": {
+        "schema": {
+          "const": "moregpu.telemetry/1"
+        },
+        "kind": {
+          "const": "round"
+        },
+        "ts": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+          "description": "ISO-8601 UTC time of emission"
+        },
+        "session": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task": {
+          "type": "string",
+          "minLength": 1
+        },
+        "round": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reduce_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "workers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dropped": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "samples_seen": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "avg_last_loss": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "bytes_up": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_down": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "alarms": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "eval": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "monitors": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_hash": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "job": {
+      "type": "object",
+      "required": [
+        "items",
+        "job",
+        "kind",
+        "schema",
+        "ts",
+        "wall_s"
+      ],
+      "properties": {
+        "schema": {
+          "const": "moregpu.telemetry/1"
+        },
+        "kind": {
+          "const": "job"
+        },
+        "ts": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+          "description": "ISO-8601 UTC time of emission"
+        },
+        "job": {
+          "type": "string",
+          "minLength": 1
+        },
+        "op": {
+          "type": "string"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "items": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "items_done": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "items_failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "compute_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "data_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "serialize_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "network_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "time in flight on the wire (coordinator-measured for MoreGPU)"
+        },
+        "wait_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "wall \u2212 all other phases (straggler / barrier wait)"
+        },
+        "items_per_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "bytes_up": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_down": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "amp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "resolved AMP mode (bf16|fp16|fp32) or null"
+        },
+        "gpu_util": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "mean NVML GPU util, %"
+        },
+        "gpu_power_w": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "mean NVML board power, W"
+        },
+        "energy_j": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "NVML total-energy counter delta, else trapezoid of sampled power, J"
+        },
+        "mem_peak_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "torch.cuda.max_memory_allocated (or NVML used peak)"
+        },
+        "hw": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "hw.fingerprint() \u2014 no PII (host is a salted hash)"
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "sha256 of canonical config"
+        },
+        "metrics": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "bench": {
+      "type": "object",
+      "required": [
+        "cmd",
+        "config_hash",
+        "emulation",
+        "failures",
+        "git_sha",
+        "hw",
+        "kind",
+        "name",
+        "repeats",
+        "runs",
+        "schema",
+        "seeds",
+        "stats",
+        "ts"
+      ],
+      "properties": {
+        "schema": {
+          "const": "moregpu.telemetry/1"
+        },
+        "kind": {
+          "const": "bench"
+        },
+        "ts": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+          "description": "ISO-8601 UTC time of emission"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cmd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repeats": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "seeds": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "invalid_records",
+              "rc",
+              "records",
+              "seed",
+              "wall_s"
+            ],
+            "properties": {
+              "seed": {
+                "type": "integer"
+              },
+              "wall_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "rc": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "records": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "invalid_records": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stats": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "max",
+              "mean",
+              "min",
+              "n",
+              "sd"
+            ],
+            "properties": {
+              "n": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "mean": {
+                "type": "number"
+              },
+              "sd": {
+                "type": "number",
+                "minimum": 0
+              },
+              "min": {
+                "type": "number"
+              },
+              "max": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          },
+          "description": "per-metric summary over successful runs (wall_s, samples_per_s, \u2026)"
+        },
+        "emulation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "label",
+            "limits"
+          ],
+          "properties": {
+            "label": {
+              "const": "emulation"
+            },
+            "note": {
+              "type": "string"
+            },
+            "limits": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "applied",
+                  "label",
+                  "type",
+                  "value"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "value": {
+                    "type": [
+                      "number",
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "mechanism": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "const": "emulation"
+                  },
+                  "applied": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false,
+          "description": "every resource/network limit is an emulation, never a real device"
+        },
+        "hw": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "sha256 of canonical config"
+        },
+        "metrics": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "external_round": {
+      "type": "object",
+      "required": [
+        "compute_s",
+        "data_s",
+        "kind",
+        "network_s",
+        "rank",
+        "round",
+        "runner",
+        "schema",
+        "serialize_s",
+        "ts",
+        "wait_s",
+        "wall_s",
+        "world_size"
+      ],
+      "properties": {
+        "schema": {
+          "const": "moregpu.telemetry/1"
+        },
+        "kind": {
+          "const": "external_round"
+        },
+        "ts": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+          "description": "ISO-8601 UTC time of emission"
+        },
+        "runner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ddp | single | fsdp | \u2026 (free-form, non-empty)"
+        },
+        "world_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "round": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "round/job wall time; = compute+data+serialize+network+wait"
+        },
+        "compute_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "data_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "serialize_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "network_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "time in flight on the wire (coordinator-measured for MoreGPU)"
+        },
+        "wait_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "wall \u2212 all other phases (straggler / barrier wait)"
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "samples_seen": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "samples_per_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "loss_last": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "bytes_up": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_down": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "amp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "resolved AMP mode (bf16|fp16|fp32) or null"
+        },
+        "gpu_util": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "mean NVML GPU util, %"
+        },
+        "gpu_power_w": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "mean NVML board power, W"
+        },
+        "energy_j": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "NVML total-energy counter delta, else trapezoid of sampled power, J"
+        },
+        "mem_peak_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "torch.cuda.max_memory_allocated (or NVML used peak)"
+        },
+        "hw": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "hw.fingerprint() \u2014 no PII (host is a salted hash)"
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "sha256 of canonical config"
+        },
+        "metrics": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
