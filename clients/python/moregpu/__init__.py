@@ -21,7 +21,7 @@ try:  # keep __version__ in sync with the installed distribution, not a hand-edi
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("moregpu-client")
 except Exception:
-    __version__ = "0.3.0"
+    __version__ = "0.7.0.dev0"
 KERNELS = ("matmul", "vector_add", "vector_mul", "saxpy", "relu", "scale", "gelu", "softmax", "layernorm")
 
 

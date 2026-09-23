@@ -59,7 +59,16 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
     `MOREGPU_TRAIN_DIR`.
   - `POST /train/sessions/resume` continues bit-identically. This is tested.
   - Non-synced task state (e.g. the JEPA EMA target and step counters) is checkpointed via `extra_state` and restored on resume (tested).
-- **Churn.** A lost worker is excluded from that round, and its samples are not counted. `POST
+- **Churn and delivery semantics.** A lost or failed worker is excluded from that round. Its samples are not counted,
+  and its shard for that epoch is **not** re-queued, so delivery is at-most-once under failure: `samples_seen` counts
+  only samples that entered the average. A paused worker (user activity, schedule) sits the round out and stays in the
+  session. A relay timeout abandons the coordinator's wait, but the worker may still finish the step. The next
+  broadcast resynchronises it.
+- **Adversarial or broken workers.** Payload headers are validated and reported sample counts are clamped, so a single
+  worker cannot finish, wedge or crash a session. The EMA-target check uses a checksum tolerance, a majority keeps its
+  state and the minority is dropped. Poisoned but well-formed weights cannot be detected; see SECURITY.md.
+- **Serialisation.** Rounds, checkpoints, evaluation, export, adding a worker and closing are serialised per session.
+- **Exactness.** "Stops exactly at `target_samples`" and "resume is bit-identical" hold for honest workers. `POST
   /train/sessions/:id/workers {add}` brings a new worker in on the current global state.
 
 ## API

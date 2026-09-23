@@ -34,12 +34,22 @@ def main():
         r = segment_finetune.main(["--url", f"http://127.0.0.1:{pool.port}", "--token", pool.admin, "--out", os.path.join(root, "models")])
         ck(r["dice_after"]["dice_mean"] > r["dice_before"]["dice_mean"] and r["dice_after"]["dice_mean"] > 0.4,
            f"segment fine-tune on JEPA encoder improves Dice ({r['dice_before']['dice_mean']:.3f} → {r['dice_after']['dice_mean']:.3f})")
-        killer = threading.Timer(1.0, lambda: pool.kill_worker("v3"))
-        killer.start()
-        res = vision_batch.main(["--url", f"http://127.0.0.1:{pool.port}", "--token", pool.admin, "--model-dir", r["model_dir"],
-                                 "--volumes", *[f"v{v}.npy" for v in vols], "--masks", *[f"g{v}.npy" for v in vols]])
-        killer.cancel()
+        # churn, deterministically: start the batch, wait until the first volume is done, THEN kill v3 while items
+        # remain — v3 must be retired and its work retried elsewhere
+        from moregpu import MoreGPU
+        sdk0 = MoreGPU(f"http://127.0.0.1:{pool.port}", pool.admin)
+        sdk0.vision_load("seg", r["model_dir"])
+        items = [{"ref": {"uri": f"file://v{v}.npy"}, "out": f"pred_v{v}", "mask": {"uri": f"file://g{v}.npy"}} for v in vols]
+        job = sdk0.vision_batch("seg", items, tta="flip", steal_after_ms=2000)
+        for _ in range(600):
+            j = sdk0.vision_job(job["job"])
+            if j["done"] >= 1:
+                break
+            time.sleep(0.05)
+        pool.kill_worker("v3")
+        res = sdk0.vision_wait(job["job"], poll_s=0.3)
         ck(res["status"] == "done" and res["done"] == 9 and res["failed"] == 0, f"batch completes all 9 volumes ({res['done']}/{res['items']}, retries {res['retries']})")
+        ck("v3" in res["dead_workers"], f"killed worker retired mid-batch (dead={res['dead_workers']}, per_worker={res['per_worker']})")
         full = pool.api(f"/vision/jobs/{res['id']}?results=1")
         paths = [x["data"]["path"] for x in full["results"] if x["ok"]]
         ck(len(set(paths)) == 9 and all(os.path.exists(p) and np.load(p).shape == (5, 32, 32) for p in paths), "9 label maps written, correct shape")

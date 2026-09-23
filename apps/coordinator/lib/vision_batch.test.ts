@@ -114,3 +114,23 @@ describe('VisionBatch split=tiles (one volume across all workers)', () => {
     expect(r.retries).toBeGreaterThan(0);
   });
 });
+
+describe('VisionBatch robustness (review P2)', () => {
+  it('a fast-failing worker is retired after repeated failures and cannot burn every retry', async () => {
+    const f = fleet({ bad: { ms: 0, fail: () => true }, good: { ms: 3 } });
+    const b = new VisionBatch('j', 'm', items(10), ['bad', 'good'], f.rpc, { maxAttempts: 3 });
+    const r = await b.run();
+    expect(r.done).toBe(10); expect(r.failed).toBe(0); expect(b.deadWorkers).toContain('bad');
+  });
+  it('tiled mode refuses parts whose geometry disagrees before merging', async () => {
+    const calls: string[] = [];
+    const rpc: Rpc = async (w, op, p) => {
+      calls.push(op);
+      if (op === 'vision_predict_part') return { ok: true, data: { k: p.part[0], n: p.part[1], n_units: 1, kind: '3d', vol_shape: w === 'evil' ? [9999, 9999, 9999] : [8, 8, 8] } };
+      return { ok: true, data: { path: '/o.npy' } };
+    };
+    const b = new VisionBatch('j', 'm', items(1), ['a', 'evil'], rpc, { split: 'tiles', maxAttempts: 1 });
+    const r = await b.run();
+    expect(r.failed).toBe(1); expect(calls).not.toContain('vision_merge_write');
+  });
+});

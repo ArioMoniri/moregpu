@@ -67,7 +67,9 @@ moregpu net --pings 50 --sustained-mb 64                                 # link 
 | | Native torch (CUDA/MPS/CPU) | Deno WebGPU | Browser tab |
 |---|---|---|---|
 | Run published vision models | ✅ all formats | ✅ lowered op-graph | ✅ lowered op-graph |
-| Whole-volume / tiled / batch inference | ✅ | ✅ | ✅ |
+| Whole-volume inference (sliding window + TTA) | ✅ | ✅ (host-side blending) | ✅ (host-side blending) |
+| Distributed batch inference | ✅ `/vision/batch` (cases or tiles) | ✅ `/vision/infer_batch` (mixed fleet) | ✅ `/vision/infer_batch` |
+| Tile sharding of one volume | ✅ | ❌ | ❌ |
 | JEPA pretraining, fine-tuning (DiLoCo) | ✅ | ❌ (no autograd) | ❌ |
 | JEPA feature extraction | ✅ | ✅ | ✅ |
 

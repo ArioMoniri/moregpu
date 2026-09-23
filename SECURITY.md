@@ -128,6 +128,48 @@ MoreGPU is a **single trust domain**. Every mechanism below protects work units 
 
 **Bottom line:** MoreGPU today defends against a network eavesdropper and against a worker forging or tampering with *another* worker's result. It does **not** defend against a malicious worker reading the job data it was handed, nor prove that a worker computed honestly. There is **no TEE**: decrypted job data lives in ordinary worker memory, readable by the worker process, its OS, and its operator.
 
+## Training, vision and data plane (0.7) — trust model
+
+These surfaces were added in 0.7. The rules below describe what the code does today.
+
+- **Workers are trusted for the correctness of their training updates.** DiLoCo averages the states that workers
+  report. The coordinator does check each worker's contribution:
+  - the payload structure (tensor names, shapes and sizes, and the chunk count) is validated before any fetch or
+    allocation;
+  - the reported sample counts are clamped to what the worker was assigned;
+  - non-finite states are dropped;
+  - the outer step is atomic;
+  - EMA target consensus uses a majority rule.
+
+  None of these checks can detect a worker that sends *plausible but poisoned* weights. A pool that trains together
+  must trust its members, which matches the single-trust-domain model above. Secure aggregation and robust averaging
+  are on the roadmap.
+- **Data and model access policy is set by the worker, never by the coordinator:**
+  - `file://` is limited to `MOREGPU_DATA_ROOTS` and `MOREGPU_MODEL_ROOTS`. Paths are realpath-checked, so symlinks
+    cannot escape.
+  - `https://` hosts must be allowlisted in `MOREGPU_DATA_HOSTS` or `MOREGPU_MODEL_HOSTS`. Every redirect is checked
+    again, sizes are capped and sha256 is required.
+  - Public buckets are accessed anonymously, and credential environment variables are stripped.
+  - `pushed://` blobs are verified by sha256 and size-capped.
+- **Outputs.** Worker-side outputs (predictions, exports) are confined to `MOREGPU_OUTPUT_DIR`. Coordinator checkpoints
+  go under `MOREGPU_TRAIN_DIR`, and session ids may not contain dots or slashes.
+- **No pickles.** Model loading refuses pickled full models. `torch.load` is only used with `weights_only=True`, which
+  requires **torch ≥ 2.6** because of CVE-2025-32434; the adapters refuse to load on older torch. `.pt2` archives are
+  inspected before torch opens them, LLM weights load with `use_safetensors=True`, and a repo-wide CI ban test enforces
+  all of this.
+- **Plugins.** Training-task and model plugins load only when their distribution name, version and wheel sha256 are in
+  the worker's allowlist. The allowlist attests to install metadata; it does not re-hash the installed files. Code never
+  travels over the wire.
+- **Dashboard.** Values reported by workers are escaped and coerced server-side. The page is served with a restrictive
+  Content-Security-Policy (`connect-src`/`img-src 'self'`), so even injected script could not exfiltrate the admin
+  token.
+- **Request limits.** JSON request bodies are limited (`MOREGPU_MAX_BODY_BYTES`, default 512 MiB), and every session
+  configuration is schema-validated.
+- **Release integrity.** `worker.ts` and `vision_wgsl.ts` are signed artefacts. The installer fails closed for
+  `worker.ts` and fails soft for vision: an unsigned or tampered module simply disables vision on that worker. A signed
+  `MANIFEST.sha256` covers the torch worker package. **Status:** the signatures and pins must be regenerated with the
+  release key before tagging; until then, installer-provisioned workers run without vision.
+
 ## Hardening roadmap (not yet implemented)
 
 Everything below is **NOT YET BUILT** — it is the realistic next tier, listed roughly by security impact.

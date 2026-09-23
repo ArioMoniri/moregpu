@@ -80,7 +80,9 @@ export class VisionBatch {
         if (this.attempts[idx]! < maxAttempts) { this.retries++; this.inflight.delete(idx); this.queue.push(idx); }
         else { this.finished.add(idx); this.inflight.delete(idx); this.results.push({ index: idx, worker: w, ok: false, error: r.error, attempts: this.attempts[idx]! }); }
       }
-      if (consecutive >= deadAfter && /disconnect|closed|timeout/i.test(r.error ?? '')) { this.deadWorkers.push(w); return; }
+      // retire a worker after `deadAfter` consecutive disconnects/timeouts, or after 2·deadAfter consecutive failures of
+      // any kind (a fast-failing worker would otherwise grab every retry and exhaust maxAttempts for all items)
+      if ((consecutive >= deadAfter && /disconnect|closed|timeout/i.test(r.error ?? '')) || consecutive >= 2 * deadAfter) { this.deadWorkers.push(w); return; }
     }
   }
 
@@ -104,6 +106,12 @@ export class VisionBatch {
         }
       }));
       if (parts.some((x) => !x) || !live.length) { this.results.push({ index: idx, ok: false, error: err || 'no live worker left', attempts: maxAttempts }); continue; }
+      // every part must describe the same volume geometry and its own (k, n) slot — one worker must not be able to
+      // make the merge worker allocate an arbitrary volume
+      const shape0 = JSON.stringify(parts[0]!.vol_shape);
+      if (!parts.every((q, k) => JSON.stringify(q!.vol_shape) === shape0 && Number(q!.k) === k && Number(q!.n) === n)) {
+        this.results.push({ index: idx, ok: false, error: 'tile parts disagree on geometry — refused', attempts: 1 }); continue;
+      }
       const mw = live[0]!;
       const r = await this.rpc(mw, 'vision_merge_write', { id: this.model, parts, out: it.out, mask: it.mask });
       const lat = (this.now() - t) / 1000;
