@@ -70,7 +70,7 @@ def main():
     ck = Checks()
     root = tempfile.mkdtemp(prefix="mgpu-mixed-")
     export, model = make_export(root)
-    with Pool(["t1"]) as pool:
+    with Pool(["t1"], worker_env={"MOREGPU_MODEL_ROOTS": root}) as pool:   # the export dir is read-only input
         glog = os.path.join(pool.root, "g1.log")
         g = subprocess.Popen(["deno", "run", "--unstable-webgpu", "--allow-net", "--allow-env", "--allow-sys", "--allow-read",
                               "apps/worker/worker.ts", "--server", f"ws://127.0.0.1:{pool.port}/ws", "--token", pool.join, "--name", "g1"],

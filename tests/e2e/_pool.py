@@ -44,7 +44,10 @@ class Pool:
         return self
 
     def start_worker(self, n):
-        wenv = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", **self.worker_env)
+        # exports are confined to MOREGPU_OUTPUT_DIR on the worker: default it to the pool's temp root (tests pick
+        # export dirs under pool.root); a test's worker_env overrides it
+        wenv = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "MOREGPU_OUTPUT_DIR": self.root,
+                **self.worker_env}
         p = subprocess.Popen(["python3", "apps/worker/worker_torch.py", "--server", f"ws://127.0.0.1:{self.port}/ws",
                               "--token", self.join, "--name", n, "--cpu"], cwd=REPO, env=wenv,
                              stdout=open(os.path.join(self.root, f"{n}.log"), "w"), stderr=subprocess.STDOUT)

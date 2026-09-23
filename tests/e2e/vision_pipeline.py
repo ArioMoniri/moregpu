@@ -31,7 +31,7 @@ def main():
         vols.append(v)
     env = {"MOREGPU_DATA_ROOTS": data, "MOREGPU_OUTPUT_DIR": out, "MOREGPU_CACHE_DIR": os.path.join(root, "cache")}
     with Pool(["v1", "v2", "v3"], worker_env=env) as pool:
-        r = segment_finetune.main(["--url", f"http://127.0.0.1:{pool.port}", "--token", pool.admin, "--out", os.path.join(root, "models")])
+        r = segment_finetune.main(["--url", f"http://127.0.0.1:{pool.port}", "--token", pool.admin, "--out", os.path.join(out, "models")])
         ck(r["dice_after"]["dice_mean"] > r["dice_before"]["dice_mean"] and r["dice_after"]["dice_mean"] > 0.4,
            f"segment fine-tune on JEPA encoder improves Dice ({r['dice_before']['dice_mean']:.3f} → {r['dice_after']['dice_mean']:.3f})")
         killer = threading.Timer(1.0, lambda: pool.kill_worker("v3"))

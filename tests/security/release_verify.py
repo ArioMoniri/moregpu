@@ -36,9 +36,13 @@ any artifact that is not both (1) the exact pinned bytes and (2) signed by the p
       worker boots with it; a tampered / missing / unsigned / wrong-key vision_wgsl.ts is REMOVED (vision disabled)
       while the install succeeds and the worker still starts; a tampered worker.ts still aborts the install
     - (f) install.sh pins VISION_WGSL_TS_SHA256; the coordinator's built-in worker --reload refreshes vision_wgsl.ts
-    - (g) ADR-0103 MANIFEST.sha256 over moregpu_worker/** + vision_ops.json: release_sign.py manifest/verify-manifest
-      and verify_release.ts --manifest-root reject a tampered (5) / added (5) / missing (5) file, a rewritten
-      manifest (4) and a wrong key (4)
+    - (g) ADR-0103 MANIFEST.sha256 over EVERY file under apps/worker (worker_torch.py, pyproject.toml, moregpu_worker/**,
+      ...; not *.sig / the manifest itself): release_sign.py manifest/verify-manifest and verify_release.ts
+      --manifest-root reject a tampered (5) / added (5) / missing (5) file, a __pycache__ dir or sourceless .pyc (5),
+      a planted root-level numpy.py (5), a rewritten manifest (4), a wrong key (4), and a missing / mismatched
+      version header or a rollback below --expect-version / --state (6)
+    - (h) `moregpu torch-join` purges bytecode caches and runs verify-manifest before exec'ing worker_torch.py (refuses
+      on any failure; warns "unsigned dev tree" when no MANIFEST exists; MOREGPU_VERIFY_MANIFEST=1 makes it mandatory)
 
 Runs on CPU, no network, no live coordinator, no model download: unit-level against the imported real
 signing functions plus the real Deno verifier. Ed25519 is RFC 8032, so the Python-signed / Deno-verified
@@ -374,8 +378,8 @@ def test_vision_shipped_and_reload() -> None:
 # ============================================================================================
 # (g) ADR-0103 — signed MANIFEST.sha256 of the torch worker tree (apps/worker/moregpu_worker/** + vision_ops.json)
 # ============================================================================================
-def run_manifest_verify_py(root: str, pub: str) -> int:
-    p = subprocess.run([sys.executable, SIGN_PY, "verify-manifest", "--root", root, "--pubkey", pub],
+def run_manifest_verify_py(root: str, pub: str, *extra: str) -> int:
+    p = subprocess.run([sys.executable, SIGN_PY, "verify-manifest", "--root", root, "--pubkey", pub, *extra],
                        capture_output=True, text=True, timeout=120)
     line = (p.stdout or p.stderr).strip().splitlines()
     if line:
@@ -393,6 +397,27 @@ def run_manifest_verify_ts(root: str, pub: str) -> int:
     return p.returncode
 
 
+def _both(root: str, pub: str) -> tuple[int, int]:
+    return run_manifest_verify_py(root, pub), run_manifest_verify_ts(root, pub)
+
+
+WORKER_DIR = os.path.join(REPO, "apps", "worker")
+_TREE_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "MANIFEST.sha256", "MANIFEST.sha256.sig")
+
+
+def _pyproject_version(root: str) -> str:
+    return re.search(r'(?m)^version\s*=\s*"([^"]+)"', open(os.path.join(root, "pyproject.toml")).read()).group(1)
+
+
+def _sign_manifest(root: str, sk, text: bytes | None = None) -> None:
+    """(Re)write MANIFEST.sha256 (+ .sig) under root with a THROWAWAY key — the real tool, or explicit bytes."""
+    if text is None:
+        text = S.build_manifest(root).encode()
+    _write(os.path.join(root, "MANIFEST.sha256"), text)
+    _write(os.path.join(root, "MANIFEST.sha256.sig"),
+           (base64.b64encode(sk.sign(S.release_message("MANIFEST.sha256", S.sha256_hex(text)))).decode() + "\n").encode())
+
+
 def test_torch_worker_manifest() -> None:
     print("\n(g) torch worker MANIFEST.sha256  [release_sign.py manifest → verify-manifest (py) + verify_release.ts --manifest-root]")
     sk = Ed25519PrivateKey.generate()   # throwaway key
@@ -400,45 +425,157 @@ def test_torch_worker_manifest() -> None:
     d = tempfile.mkdtemp(prefix="mg-manifest-")
     try:
         root = os.path.join(d, "worker")
-        shutil.copytree(os.path.join(REPO, "apps", "worker", "moregpu_worker"), os.path.join(root, "moregpu_worker"),
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        shutil.copy(os.path.join(REPO, "apps", "worker", "vision_ops.json"), root)
+        shutil.copytree(WORKER_DIR, root, ignore=_TREE_IGNORE)
         key = os.path.join(d, "k.b64")
         _write(key, (base64.b64encode(sk.private_bytes_raw()).decode() + "\n").encode())
         p = subprocess.run([sys.executable, SIGN_PY, "manifest", "--key", key, "--root", root], capture_output=True, text=True, timeout=120)
         man = os.path.join(root, "MANIFEST.sha256")
         check(p.returncode == 0 and os.path.exists(man) and os.path.exists(man + ".sig"), "manifest + detached sig written")
-        lines = open(man).read().splitlines()
+        text = open(man).read()
+        head, lines = text.splitlines()[0], text.splitlines()[1:]
         paths = [l.split("  ", 1)[1] for l in lines]
-        check(paths == sorted(paths) and any(l.endswith("  moregpu_worker/vision/lowering.py") for l in lines)
-              and any(l.endswith("  vision_ops.json") for l in lines) and not any("__pycache__" in l for l in lines),
-              f"manifest is sorted `sha256  path` lines over moregpu_worker/** + vision_ops.json ({len(lines)} files)")
-        check(run_manifest_verify_py(root, pub) == 0 and run_manifest_verify_ts(root, pub) == 0, "control: genuine tree VERIFIES (py + ts, exit 0)")
-        # __pycache__ appearing after an import must not break verification
-        os.makedirs(os.path.join(root, "moregpu_worker", "__pycache__"), exist_ok=True)
-        _write(os.path.join(root, "moregpu_worker", "__pycache__", "x.cpython-311.pyc"), b"\0")
-        check(run_manifest_verify_py(root, pub) == 0 and run_manifest_verify_ts(root, pub) == 0, "  bytecode caches are ignored")
+        version = _pyproject_version(root)
+        check(head == f"# moregpu-worker-version: {version}",
+              f"manifest carries a version header bound to apps/worker/pyproject.toml ({head!r})")
+        check(paths == sorted(paths) and all(x in paths for x in ("moregpu_worker/vision/lowering.py", "vision_ops.json",
+                                                                  "worker_torch.py", "pyproject.toml", "worker.ts"))
+              and not any("__pycache__" in x or x.endswith(".sig") or x.startswith("MANIFEST") for x in paths),
+              f"manifest covers EVERY file under apps/worker (worker_torch.py, pyproject.toml, ...) except .sig/MANIFEST ({len(lines)} files)")
+        check(_both(root, pub) == (0, 0), "control: genuine tree VERIFIES (py + ts, exit 0)")
+        # a planted bytecode cache can shadow a verified .py (timestamp pycs are trusted by the importer): REFUSE it
+        cache = os.path.join(root, "moregpu_worker", "__pycache__")
+        os.makedirs(cache, exist_ok=True)
+        _write(os.path.join(cache, "bench.cpython-311.pyc"), b"\0")
+        check(_both(root, pub) == (5, 5), "__pycache__ present → REJECTED (py + ts, exit 5)")
+        check(run_manifest_verify_py(root, pub, "--purge-pycache") == 0 and not os.path.exists(cache),
+              "  verify-manifest --purge-pycache deletes bytecode caches, then VERIFIES")
+        sourceless = os.path.join(root, "moregpu_worker", "vision", "evil.pyc")
+        _write(sourceless, b"\0")
+        check(_both(root, pub) == (5, 5), "sourceless .pyc in the package → REJECTED (exit 5)")
+        os.remove(sourceless)
+        # a module planted next to worker_torch.py shadows a dependency (sys.path[0] is the script dir)
+        planted = os.path.join(root, "numpy.py")
+        _write(planted, b"import os; os.system('id')\n")
+        check(_both(root, pub) == (5, 5), "planted root-level numpy.py next to worker_torch.py → REJECTED (exit 5)")
+        os.remove(planted)
+        victim_root = os.path.join(root, "worker_torch.py")
+        orig_root = open(victim_root, "rb").read()
+        _write(victim_root, orig_root + b"\n# evil\n")
+        check(_both(root, pub) == (5, 5), "tampered worker_torch.py → REJECTED (exit 5)")
+        _write(victim_root, orig_root)
         victim = os.path.join(root, "moregpu_worker", "vision", "lowering.py")
         orig = open(victim, "rb").read()
         _write(victim, orig + b"\nimport os; os.system('id')\n")
-        check(run_manifest_verify_py(root, pub) == 5 and run_manifest_verify_ts(root, pub) == 5, "tampered package file → REJECTED (exit 5)")
+        check(_both(root, pub) == (5, 5), "tampered package file → REJECTED (exit 5)")
         _write(victim, orig)
         added = os.path.join(root, "moregpu_worker", "vision", "evil.py")
         _write(added, b"print('x')\n")
-        check(run_manifest_verify_py(root, pub) == 5 and run_manifest_verify_ts(root, pub) == 5, "ADDED package file → REJECTED (exit 5)")
+        check(_both(root, pub) == (5, 5), "ADDED package file → REJECTED (exit 5)")
         os.remove(added)
         os.remove(victim)
-        check(run_manifest_verify_py(root, pub) == 5 and run_manifest_verify_ts(root, pub) == 5, "MISSING package file → REJECTED (exit 5)")
+        check(_both(root, pub) == (5, 5), "MISSING package file → REJECTED (exit 5)")
         _write(victim, orig)
+        check(_both(root, pub) == (0, 0), "  restored tree verifies again")
         # attacker rewrites the manifest to match a tampered file → the manifest signature breaks
         _write(victim, orig + b"\n# evil\n")
         import hashlib
         new = hashlib.sha256(open(victim, "rb").read()).hexdigest()
-        _write(man, "\n".join(f"{new}  {l.split('  ', 1)[1]}" if l.endswith("  moregpu_worker/vision/lowering.py") else l for l in lines).encode() + b"\n")
-        check(run_manifest_verify_py(root, pub) == 4 and run_manifest_verify_ts(root, pub) == 4, "rewritten manifest → REJECTED (exit 4, signature)")
+        _write(man, (head + "\n" + "\n".join(f"{new}  {l.split('  ', 1)[1]}" if l.endswith("  moregpu_worker/vision/lowering.py") else l
+                                            for l in lines) + "\n").encode())
+        check(_both(root, pub) == (4, 4), "rewritten manifest → REJECTED (exit 4, signature)")
+        _write(victim, orig)
+        _sign_manifest(root, sk)
         check(run_manifest_verify_py(root, S.pubkey_b64(Ed25519PrivateKey.generate())) == 4, "wrong release key → REJECTED (exit 4)")
+
+        # ---- version binding / rollback (exit 6)
+        print("  version binding / rollback:")
+        good = open(man, "rb").read()
+        body = b"\n".join(good.split(b"\n")[1:])
+        _sign_manifest(root, sk, body)                                   # validly signed, but no version header
+        check(_both(root, pub) == (6, 6), "manifest WITHOUT a version header → REJECTED (exit 6)")
+        _sign_manifest(root, sk, b"# moregpu-worker-version: 99.0.0\n" + body)
+        check(_both(root, pub) == (6, 6), "manifest version != pyproject.toml version → REJECTED (exit 6)")
+        _sign_manifest(root, sk, good)
+        check(run_manifest_verify_py(root, pub, "--expect-version", version) == 0, "  --expect-version <current> → OK")
+        check(run_manifest_verify_py(root, pub, "--expect-version", "99.0.0") == 6, "--expect-version mismatch → REJECTED (exit 6)")
+        state = os.path.join(d, "state", "torch-worker.version")
+        check(run_manifest_verify_py(root, pub, "--state", state) == 0 and open(state).read().strip() == version,
+              "  --state records the verified version")
+        _write(state, b"99.0.0\n")
+        check(run_manifest_verify_py(root, pub, "--state", state) == 6,
+              "ROLLBACK below the last verified version (--state) → REJECTED (exit 6)")
+        check(S.version_key("0.7.0.dev0") < S.version_key("0.7.0rc1") < S.version_key("0.7.0") < S.version_key("0.7.1")
+              < S.version_key("0.10.0"), "  version ordering: dev < rc < final, numeric components")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================================================
+# (h) `moregpu torch-join` runs the manifest gate before exec'ing worker_torch.py
+# ============================================================================================
+MOREGPU_SH = os.path.join(REPO, "scripts", "moregpu")
+
+
+def _torch_join_tree(d: str) -> str:
+    """A throwaway clone layout: scripts/{moregpu,release_sign.py} + a stub apps/worker tree whose worker prints RAN."""
+    os.makedirs(os.path.join(d, "scripts"))
+    for f in ("moregpu", "release_sign.py"):
+        shutil.copy2(os.path.join(REPO, "scripts", f), os.path.join(d, "scripts", f))
+    w = os.path.join(d, "apps", "worker")
+    os.makedirs(os.path.join(w, "moregpu_worker"))
+    _write(os.path.join(w, "worker_torch.py"), b"import sys\nprint('WORKER-RAN', sys.argv[1:], flush=True)\n")
+    _write(os.path.join(w, "pyproject.toml"), b'[project]\nname = "moregpu-worker"\nversion = "0.7.0.dev0"\n')
+    _write(os.path.join(w, "moregpu_worker", "__init__.py"), b"")
+    return w
+
+
+def run_torch_join(d: str, env: dict) -> tuple[int, str]:
+    e = {k: v for k, v in os.environ.items() if not k.startswith("MOREGPU_")}
+    e.update(NO_COLOR="1", MOREGPU_STATE_DIR=os.path.join(d, "state"), **env)
+    p = subprocess.run(["bash", os.path.join(d, "scripts", "moregpu"), "torch-join", "--name", "t"], env=e,
+                       capture_output=True, text=True, timeout=120)
+    return p.returncode, p.stdout + p.stderr
+
+
+def test_torch_join_gate() -> None:
+    print("\n(h) `moregpu torch-join` verifies the signed MANIFEST before exec  [scripts/moregpu]")
+    sk = Ed25519PrivateKey.generate()   # throwaway key
+    pub = S.pubkey_b64(sk)
+    d = tempfile.mkdtemp(prefix="mg-tjoin-")
+    try:
+        w = _torch_join_tree(d)
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub})
+        check(rc == 0 and "WORKER-RAN" in out and "unsigned dev tree" in out,
+              "no MANIFEST → runs with a clear 'unsigned dev tree' warning")
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub, "MOREGPU_VERIFY_MANIFEST": "1"})
+        check(rc != 0 and "WORKER-RAN" not in out, "MOREGPU_VERIFY_MANIFEST=1 without a MANIFEST → REFUSED")
+        _sign_manifest(w, sk)
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub})
+        check(rc == 0 and "WORKER-RAN" in out and "--name" in out, "signed tree → verified, then worker_torch.py exec'd with its args")
+        cache = os.path.join(w, "moregpu_worker", "__pycache__")
+        os.makedirs(cache)
+        _write(os.path.join(cache, "x.cpython-311.pyc"), b"\0")
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub})
+        check(rc == 0 and "WORKER-RAN" in out and not os.path.exists(cache), "stale __pycache__ is purged before verification")
+        _write(os.path.join(w, "numpy.py"), b"raise SystemExit('pwned')\n")
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub})
+        check(rc != 0 and "WORKER-RAN" not in out, "planted numpy.py next to worker_torch.py → REFUSED (never exec'd)")
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub, "MOREGPU_VERIFY_MANIFEST": "0"})
+        check(rc == 0 and "WORKER-RAN" in out and "NOT verified" in out,
+              "  MOREGPU_VERIFY_MANIFEST=0 is an explicit, loudly-warned opt-out")
+        os.remove(os.path.join(w, "numpy.py"))
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": S.pubkey_b64(Ed25519PrivateKey.generate())})
+        check(rc != 0 and "WORKER-RAN" not in out, "manifest signed by another key → REFUSED")
+        os.makedirs(os.path.join(d, "state"), exist_ok=True)
+        _write(os.path.join(d, "state", "torch-worker.version"), b"0.8.0\n")
+        rc, out = run_torch_join(d, {"MOREGPU_RELEASE_PUBKEY": pub})
+        check(rc != 0 and "WORKER-RAN" not in out, "rollback below the last verified worker version → REFUSED")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    src = open(MOREGPU_SH).read()
+    m = re.search(r'RELEASE_PUBKEY_B64="\$\{MOREGPU_RELEASE_PUBKEY:-([^}]+)\}"', src)
+    check(m is not None and m.group(1) == _install_pin("RELEASE_PUBKEY_B64"),
+          "scripts/moregpu pins the same release public key as scripts/install.sh (no drift)")
 
 
 def main() -> int:
@@ -456,6 +593,7 @@ def main() -> int:
     test_vision_second_artifact()
     test_vision_shipped_and_reload()
     test_torch_worker_manifest()
+    test_torch_join_gate()
 
     passed = sum(1 for ok, _ in _RESULTS if ok)
     total = len(_RESULTS)
