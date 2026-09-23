@@ -1,6 +1,6 @@
 # ADR-0110 — Vision data plane
 
-**Status:** Proposed · **Milestone:** M2
+**Status:** Accepted (2026-09-23) · **Milestone:** M2
 
 ## Decision
 - **Refs** (`Ref = {uri, sha256?, slice?, meta?}`): `file://` restricted to `MOREGPU_DATA_ROOTS` (realpath check, no

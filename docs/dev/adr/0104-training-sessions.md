@@ -1,6 +1,6 @@
 # ADR-0104 — Per-session training state
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Context
 One `TRAIN` dict per worker; one `trainingHome` and one `diloco` per coordinator; `/train` and `/train/diloco` collide

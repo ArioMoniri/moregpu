@@ -1,6 +1,6 @@
 # Proposed ADRs — vision, training-task framework, JEPA
 
-**Status of every ADR here: Proposed. Awaiting owner approval before any implementation (Part C step 1).**
+**Status: Accepted by the owner on 2026-09-23.**
 
 These are numbered **0101+** so they cannot collide with the maintainer's local, git-ignored `docs/adr/` series (code
 already references `ADR-0007`). If approved they can move to `docs/adr/` (which would need that path un-ignored) or stay

@@ -1,6 +1,6 @@
 # ADR-0103 — Code layout and signed release
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Context
 `worker_torch.py` (1.9k lines) and `server.ts` (3.2k lines) are single-file monoliths; releases sign those single files

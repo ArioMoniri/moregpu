@@ -1,6 +1,6 @@
 # ADR-0102 — Test layers for strict TDD
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Context
 Worker Python is tested only by standalone e2e scripts; coordinator code only by e2e. Unit-level red→green on DiLoCo

@@ -1,6 +1,6 @@
 # ADR-0113 — Model formats, plugins, and the `weights_only` ban
 
-**Status:** Proposed · **Milestone:** M4
+**Status:** Accepted (2026-09-23) · **Milestone:** M4
 
 ## Decision
 - Adapter chain on native workers: (1) state_dict `.pth/.pt` via `torch.load(weights_only=True)` or safetensors + named

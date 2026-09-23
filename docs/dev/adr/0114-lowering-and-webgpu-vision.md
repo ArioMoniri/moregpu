@@ -1,6 +1,6 @@
 # ADR-0114 — Automatic lowering and WebGPU vision
 
-**Status:** Proposed (design only; implementation after the study) · **Milestones:** M4 (hooks), M6 (kernels)
+**Status:** Accepted (2026-09-23) (design only; implementation after the study) · **Milestones:** M4 (hooks), M6 (kernels)
 
 ## Decision
 Native model → `torch.export` graph → MoreGPU op-graph + safetensors when every op is in the WGSL executor's table; else

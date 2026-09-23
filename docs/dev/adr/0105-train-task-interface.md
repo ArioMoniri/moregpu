@@ -1,6 +1,6 @@
 # ADR-0105 — `TrainTask` interface and registry
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Decision
 ```python

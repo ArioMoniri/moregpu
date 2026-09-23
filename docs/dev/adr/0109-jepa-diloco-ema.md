@@ -1,6 +1,6 @@
 # ADR-0109 — JEPA on DiLoCo: EMA semantics and model
 
-**Status:** Proposed · **Milestone:** M2
+**Status:** Accepted (2026-09-23) · **Milestone:** M2
 
 ## Decision
 - **Synced state:** online (context) encoder + predictor. **Target encoder is never transmitted.**

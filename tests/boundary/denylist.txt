@@ -1,0 +1,20 @@
+# Research-boundary denylist (ADR-0101). One rule per line: `term:<regex>`, `ext:<suffix>`, `id:<regex>`.
+# Regexes are Python, matched case-insensitively. This file and the test are self-exempt.
+term:\bhcc[-_ ]?tace\b
+term:\btace[-_ ]?seg\b
+term:\bhcc_tace_seg\b
+term:\blits\b(?!\w)
+term:\bbtcv\b
+term:\bmsd[-_ ]?task0?3\b
+term:\btask03[-_]liver\b
+term:\bmoregpu-jepa-poc-study\b
+term:\blightningmedseg3d\b
+term:gnu\s+affero
+term:\bagpl(?:-3\.0)?\b
+id:\bhcc_\d{3}\b
+ext:.nii
+ext:.nii.gz
+ext:.dcm
+ext:.nrrd
+ext:.mha
+ext:.mhd

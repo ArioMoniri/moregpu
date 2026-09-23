@@ -1,6 +1,6 @@
 # ADR-0108 — AMP policy
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Decision
 `amp: auto | bf16 | fp16 | fp32` per session. `auto`: CUDA with `torch.cuda.is_bf16_supported()` → bf16 autocast (no

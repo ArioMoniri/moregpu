@@ -1,6 +1,6 @@
 # ADR-0111 — Telemetry schema and `moregpu bench`
 
-**Status:** Proposed · **Milestone:** M2
+**Status:** Accepted (2026-09-23) · **Milestone:** M2
 
 ## Decision
 - **Schema v1** (JSON Schema in `docs/telemetry.schema.json`, documented in `docs/TELEMETRY.md`): one JSONL line per

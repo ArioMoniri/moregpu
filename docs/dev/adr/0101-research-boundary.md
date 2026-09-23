@@ -1,6 +1,6 @@
 # ADR-0101 — Research boundary guard
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Context
 The study (private repo) must never leak into MoreGPU. Only `docs/case-studies/*.md` may mention it.

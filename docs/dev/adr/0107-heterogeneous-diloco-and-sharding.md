@@ -1,6 +1,6 @@
 # ADR-0107 — Heterogeneous DiLoCo and deterministic sharding
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Decision
 - **Speed measurement:** samples/s per worker from the previous round's `compute` time (warm-up round uses a short probe).

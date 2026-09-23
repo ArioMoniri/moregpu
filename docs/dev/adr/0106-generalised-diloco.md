@@ -1,6 +1,6 @@
 # ADR-0106 — Generalised DiLoCo and tensor transport
 
-**Status:** Proposed · **Milestone:** M1
+**Status:** Accepted (2026-09-23) · **Milestone:** M1
 
 ## Decision
 - **Topology:** the coordinator stays the parameter server (keeps today's code path and trust model). Bandwidth at the
