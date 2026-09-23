@@ -143,6 +143,18 @@ The service runs the same supervised restart loop as a foreground worker: if the
 
 ---
 
+### Native torch workers (training / vision)
+
+Start these with `moregpu torch-join --server wss://HOST:8787/ws --token … --pin …`. Set these on each machine:
+
+| Variable | Purpose |
+|---|---|
+| `MOREGPU_OUTPUT_DIR` | The only directory exports and checkpoints are written to. The worker refuses paths outside it. |
+| `MOREGPU_MODEL_HOSTS` / `MOREGPU_MODEL_ROOTS` | The https hosts and local roots that published models may be fetched from ([MODELS.md](MODELS.md#worker-environment)). |
+| `MOREGPU_VERIFY_MANIFEST=1` | Refuse to start from a tree with no signed `apps/worker/MANIFEST.sha256`. |
+
+The worker needs `torch>=2.6` and refuses to start on anything older (CVE-2025-32434). Session ids must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`. See [SECURITY.md](../SECURITY.md) for the trust model.
+
 ## 9. Troubleshooting
 
 | Symptom | Likely cause | Action |
