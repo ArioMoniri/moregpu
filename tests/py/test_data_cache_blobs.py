@@ -88,7 +88,7 @@ def test_cache_reloads_existing_entries_in_mtime_order(tmp_path):
     past = time.time() - 100
     os.utime(old, (past, past))
     (tmp_path / "c" / "junk.txt").write_bytes(b"ignored")
-    c2 = ContentCache(tmp_path / "c", 6)   # smaller cap on reopen -> evicts the oldest
+    c2 = ContentCache(tmp_path / "c", 5)   # smaller cap on reopen -> evicts the oldest
     assert c2.get(h(b"old")) is None and c2.get(h(b"new")) == new
 
 

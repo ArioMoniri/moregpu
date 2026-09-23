@@ -56,6 +56,20 @@ def test_nifti_geometry_round_trip(tmp_path, suffix):
     np.testing.assert_allclose(R.read_array(p), vol_zyx)
 
 
+@pytest.mark.parametrize("gz", [True, False])
+def test_nifti_without_suffix_parsed_from_bytes(tmp_path, gz):
+    nib = pytest.importorskip("nibabel")
+    vol = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    src = tmp_path / ("v.nii.gz" if gz else "v.nii")
+    nib.save(nib.Nifti1Image(vol.transpose(2, 1, 0), np.diag([2.0, 3.0, 4.0, 1.0])), str(src))
+    blob = tmp_path / "0123abcd"                      # content-addressed name, no suffix
+    blob.write_bytes(src.read_bytes())
+    arr, aff = R.read_nifti(blob)
+    np.testing.assert_array_equal(arr, vol)
+    assert aff[2, 2] == 4.0
+    np.testing.assert_array_equal(R.read_array(blob, fmt="nifti"), vol)
+
+
 def test_nifti_4d_keeps_trailing_axis(tmp_path):
     nib = pytest.importorskip("nibabel")
     xyzt = np.zeros((4, 3, 2, 5), dtype=np.int16); xyzt[1, 2, 0, 3] = 7
@@ -136,7 +150,7 @@ def test_png_and_jpeg(tmp_path):
 def test_tiff(tmp_path):
     tifffile = pytest.importorskip("tifffile")
     a = np.arange(60, dtype=np.uint16).reshape(3, 4, 5)
-    tifffile.imwrite(tmp_path / "s.tif", a)
+    tifffile.imwrite(tmp_path / "s.tif", a, photometric="minisblack")
     assert np.array_equal(R.read_array(tmp_path / "s.tif"), a)
     tifffile.imwrite(tmp_path / "s2.tiff", a[0])
     assert np.array_equal(R.read_array(tmp_path / "s2.tiff"), a[0])

@@ -299,7 +299,7 @@ def test_bucket_cli_failure(tmp_path, root, monkeypatch):
     monkeypatch.setenv("PATH", str(bindir))
     plane = DataPlane(DataPolicy(roots=[str(root)], allow_buckets=True), cache=ContentCache(tmp_path / "c", 1 << 20))
     with pytest.raises(FileNotFoundError):
-        plane.resolve(Ref("s3://b/k", sha256="0" * 64))
+        plane.resolve(Ref("s3://pub/k", sha256="0" * 64))
     with pytest.raises(RefDenied):
         plane.resolve(Ref("s3://-bad/k", sha256="0" * 64))
 
@@ -320,3 +320,31 @@ def test_default_construction_uses_env(monkeypatch, tmp_path):
     assert p.policy.roots == [str(tmp_path)]
     assert p.capabilities()["cache"]["entries"] == 0
     assert p.blobs is not None
+
+
+def test_pushed_nifti_keeps_suffix_and_http_format_from_uri(plane, server, tmp_path):
+    nib = pytest.importorskip("nibabel")
+    vol = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    src = tmp_path / "v.nii.gz"
+    nib.save(nib.Nifti1Image(vol.transpose(2, 1, 0), np.eye(4)), str(src))
+    data = src.read_bytes()
+    plane.blobs.begin("vol", h(data), len(data), suffix=".nii.gz")
+    plane.blobs.chunk("vol", 0, data); plane.blobs.end("vol")
+    np.testing.assert_array_equal(plane.read(Ref("pushed://vol")), vol)
+    with pytest.raises(ValueError):
+        plane.blobs.begin("x", h(data), 1, suffix="/../evil")
+    # remote: the cached file is named by sha256 only; the format comes from the URI path
+    srv, base = server
+    _Handler.routes = {"/d/v.nii.gz": (200, data, {})}
+    plane.policy.hosts.append("127.0.0.1")
+    np.testing.assert_array_equal(plane.read(Ref(f"{base}/d/v.nii.gz", sha256=h(data), slice=(1, 2))), vol[1:2])
+
+
+def test_hosts_match_case_insensitively_and_with_port(root, tmp_path):
+    plane = DataPlane(DataPolicy(roots=[str(root)], hosts=["Data.Test"]), cache=ContentCache(tmp_path / "c", 1 << 20))
+    plane.cache.put(b"k")
+    assert plane.resolve(Ref("https://data.test/k", sha256=h(b"k"))).read_bytes() == b"k"   # cache hit, no network
+    plane2 = DataPlane(DataPolicy(roots=[str(root)], hosts=["data.test:8443"]), cache=plane.cache)
+    assert plane2.resolve(Ref("https://data.test:8443/k", sha256=h(b"k"))).exists()
+    with pytest.raises(RefDenied):
+        plane2.resolve(Ref("https://data.test/k", sha256=h(b"k")))
