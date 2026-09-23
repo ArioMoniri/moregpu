@@ -18,6 +18,7 @@ BUILTINS = {
     "jepa_3d": "moregpu_worker.train.tasks.jepa:Jepa3DTask",
     "classify": "moregpu_worker.train.tasks.vision:ClassifyTask",
     "segment": "moregpu_worker.train.tasks.vision:SegmentTask",
+    "finetune_model": "moregpu_worker.train.tasks.finetune_model:FinetuneModelTask",
 }
 GROUP = "moregpu.train_tasks"
 
