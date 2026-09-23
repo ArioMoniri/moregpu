@@ -74,3 +74,6 @@ clients/python/build/
 # Playwright (tests/webgpu/browser.spec.ts)
 test-results/
 playwright-report/
+
+# local experiment outputs (study rehearsals must live in the study repo, never here)
+/results/
