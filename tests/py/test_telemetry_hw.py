@@ -7,7 +7,7 @@ from moregpu_worker.telemetry import hw
 
 
 KEYS = {"host_hash", "os", "os_release", "machine", "python", "torch", "cuda", "device", "capability",
-        "total_mem_bytes", "cpu_count", "ram_bytes"}
+        "total_mem_bytes", "cpu_count", "ram_bytes", "vram_fraction"}
 
 
 def fake_torch(cuda=True):
