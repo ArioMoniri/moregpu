@@ -72,7 +72,7 @@ jobs:
           # Sharding/serving/training work on 4.x AND 5.x; MoE EP currently needs the 4.x OLMoE ModuleList layout.
           pip install cryptography websockets numpy 'transformers>=4.44,<5' safetensors
           # vision / training-task framework test deps (ADR-0102); GPU/WebGPU-marked tests skip on CI runners
-          pip install pytest pytest-cov scipy nibabel pillow tifffile onnx onnxruntime onnxscript monai timm
+          pip install pytest pytest-cov jsonschema scipy nibabel pillow tifffile onnx onnxruntime onnxscript monai timm
 
       - name: Research boundary (ADR-0101) — no study/dataset terms, copyleft code or medical images outside docs/case-studies
         run: python3 -m pytest -q tests/boundary
@@ -88,6 +88,9 @@ jobs:
 
       - name: JEPA pretraining — 2 workers via coordinator == in-process reference, identical EMA targets, export
         run: python3 tests/e2e/jepa_sessions.py
+
+      - name: Data plane — JEPA on file:// + pushed:// data, path escape refused, per-worker caps
+        run: python3 tests/e2e/data_plane_jepa.py
 
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh

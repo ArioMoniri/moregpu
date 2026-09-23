@@ -12,6 +12,10 @@ import torch
 from . import registry, tensorwire as tw
 from .sessions import SessionStore
 from .task import TaskContext
+from ..telemetry.hw import fingerprint
+from ..telemetry.nvml import GpuSampler
+
+_HW: dict | None = None
 
 DEFAULT_CHUNK = 4 << 20
 
@@ -54,14 +58,34 @@ class TaskRunner:
                 "serialize_s": time.perf_counter() - t0}
 
     def _task_inner(self, p):
+        global _HW
         sid = p["session"]
         t = self.sessions.get(sid)
         refs = p.get("refs") if p.get("refs") is not None else p.get("batches", [])
-        rep = t.inner_steps(refs, int(p.get("steps", 1)), float(p.get("lr", 1e-3)))
+        cuda = torch.cuda.is_available() and self.device.startswith("cuda")
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
+        gpu = GpuSampler(device_index=torch.device(self.device).index or 0).start() if cuda else None
+        try:
+            rep = t.inner_steps(refs, int(p.get("steps", 1)), float(p.get("lr", 1e-3)))
+            if cuda:
+                torch.cuda.synchronize()
+        finally:
+            if gpu:
+                gpu.stop()
         out = self._encode_out(sid, p.get("sync_dtype", "f32"), int(p.get("chunk_bytes", DEFAULT_CHUNK)))
         rep.timings["serialize_s"] = out.pop("serialize_s")
-        if torch.cuda.is_available() and self.device.startswith("cuda"):
-            rep.metrics.setdefault("mem_peak_bytes", int(torch.cuda.max_memory_allocated()))
+        if gpu:
+            for k, v in gpu.as_metrics().items():
+                if v is not None:
+                    rep.metrics.setdefault(k, v)
+        if cuda:
+            rep.metrics["mem_peak_bytes"] = int(torch.cuda.max_memory_allocated())
+        if t.amp is not None:
+            rep.metrics["amp"] = t.amp.mode
+        if _HW is None:
+            _HW = fingerprint()
+        rep.metrics.setdefault("hw", _HW)
         return {"ok": True, "report": rep.to_json(), "step": t.step, **out}
 
     def _task_state_get(self, p):

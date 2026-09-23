@@ -82,7 +82,7 @@ _WORKER_ROUND = {
 _ROUND = {
     **_header("round"),
     "session": _ID, "task": _ID, "round": _INT0, "wall_s": _SECS, "reduce_s": _SECS,
-    "workers": _STRS, "dropped": _STRS, "samples": _INT0, "samples_seen": _INT0, "avg_last_loss": _NNUM,
+    "workers": _STRS, "dropped": _STRS, "samples": _INT0, "samples_seen": _INT0, "avg_last_loss": _NNUM, "lr": _NNUM,
     "bytes_up": _INT0, "bytes_down": _INT0, "alarms": _STRS, "eval": _NOBJ, "monitors": _NOBJ,
     "git_sha": _NSTR, "config_hash": {"type": "string"},
 }

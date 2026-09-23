@@ -250,6 +250,7 @@
         "eval",
         "git_sha",
         "kind",
+        "lr",
         "monitors",
         "reduce_s",
         "round",
@@ -315,6 +316,12 @@
           "minimum": 0
         },
         "avg_last_loss": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lr": {
           "type": [
             "number",
             "null"
