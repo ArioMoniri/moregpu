@@ -1,5 +1,5 @@
 """Vision fine-tuning tasks (ADR-0112): `segment` (2D / 2.5D / 3D, Dice+CE) and `classify` (CE) on a ViT encoder that
-is random, or loaded from a JEPA export. Modes: full fine-tune, frozen encoder + head, or LoRA on attention linears.
+is random, or loaded from a JEPA export (a confined export dir, or a `pushed://<id>` safetensors blob — vision/weights.py). Modes: full fine-tune, frozen encoder + head, or LoRA on attention linears.
 DiLoCo-compatible: state_for_sync returns exactly the trainable tensors."""
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from ... import paths
 from ...models.vit import vit_config
 from ...vision import losses as L
+from ...vision import weights as W
 from ...vision.models import build
 from ..synthetic import SyntheticSeg, SyntheticVolumes
 from ..task import StepReport, TaskContext, Timer, TrainTask
@@ -87,13 +88,11 @@ class _VisionBase(TrainTask):
             raise ValueError(f"{self.task} needs cfg.synthetic or cfg.data")
         in_chans = 1 if self.kind == "3d" else chans
         enc = cfg.get("encoder", {"init": "random"})
+        init_sd, self.encoder_info = None, {"source": "random"}
         if enc.get("init") == "export":
-            enc = {**enc, "path": paths.export_source(enc["path"])}   # MOREGPU_OUTPUT_DIR ∪ MOREGPU_MODEL_ROOTS
-            p = os.path.join(enc["path"], "encoder_config.json")
-            if not os.path.exists(p):
-                raise FileNotFoundError(f"no JEPA encoder export at {enc['path']}")
-            vc = json.load(open(p))
-            vc["img_size"] = list(vc["img_size"])
+            # an export dir (confined to MOREGPU_OUTPUT_DIR ∪ MOREGPU_MODEL_ROOTS) or pushed://<id> (BlobStore); either
+            # way size-capped, sha256-checked and safetensors-only before any tensor is read (vision/weights.py)
+            init_sd, vc, self.encoder_info = W.load_encoder(enc, W.blobs_of(ctx.data))
         else:
             vc = vit_config(enc.get("model", "tiny"), img_size=size, patch=enc.get("patch", 16), in_chans=in_chans)
             vc = {**vc, "img_size": list(size), "patch": list(vc["patch"]) if isinstance(vc["patch"], (list, tuple)) else vc["patch"]}
@@ -102,9 +101,8 @@ class _VisionBase(TrainTask):
         torch.manual_seed(ctx.seed)
         self.model = build(self.task, vc, self.num_classes, self.dec_ch).to(ctx.device)
         self.encoder = self.model.encoder
-        if enc.get("init") == "export":
-            from safetensors.torch import load_file
-            self.encoder.load_state_dict(load_file(os.path.join(enc["path"], "encoder.safetensors")), strict=True)
+        if init_sd is not None:
+            self.encoder.load_state_dict(init_sd, strict=True)
         self.mode = cfg.get("mode", "full")
         if self.mode == "frozen":
             for p in self.encoder.parameters():
@@ -124,7 +122,7 @@ class _VisionBase(TrainTask):
         self.wd = float(cfg.get("weight_decay", 1e-4))
         self.clip = cfg.get("clip_grad")
         n = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        return {"ok": True, "trainable_params": n, "mode": self.mode}
+        return {"ok": True, "trainable_params": n, "mode": self.mode, "encoder": self.encoder_info}
 
     def _in(self, b):
         if self.kind == "3d" and b.dim() == 4:

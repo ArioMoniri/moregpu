@@ -299,7 +299,10 @@ class _JepaBase(TrainTask):
         if fmt == "safetensors":
             from safetensors.torch import save_file
             w = os.path.join(path, "encoder.safetensors")
-            save_file({k: v.detach().contiguous().cpu() for k, v in enc.state_dict().items()}, w)
+            # the ViT config also rides in the safetensors metadata, so the file alone (e.g. pushed:// to another
+            # worker) is enough to initialise a segment/classify encoder
+            save_file({k: v.detach().contiguous().cpu() for k, v in enc.state_dict().items()}, w,
+                      metadata={"moregpu.encoder_config": json.dumps(self.vit_cfg)})
             c = os.path.join(path, "encoder_config.json")
             json.dump({k: v for k, v in self.vit_cfg.items()}, open(c, "w"))
             out = {"format": fmt, "weights": w, "config": c, "sha256": _sha(w), "which": which}

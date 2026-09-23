@@ -228,7 +228,7 @@ def _unet():
 
 
 def _ft(spec):
-    return {"spec": spec, "objective": "segment", "num_classes": 2, "synthetic": FT_SYN}
+    return {"spec": spec, "objective": "segment", "num_classes": 2, "synthetic": FT_SYN, "label_map": {"2": 1}}
 
 
 def test_finetune_model_from_pushed_safetensors(store):

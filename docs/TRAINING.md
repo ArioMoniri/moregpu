@@ -86,8 +86,36 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
 
 An export `path` is a directory **on the worker**, and it must be inside the worker's `MOREGPU_OUTPUT_DIR` (default
 `./moregpu-out`). A relative path resolves inside that directory. An absolute path outside it, `../…`, or a symlink
-that points outside it is refused. A segment/classify `encoder: {init: "export", path}` may read from
-`MOREGPU_OUTPUT_DIR` or `MOREGPU_MODEL_ROOTS`. See [MODELS.md](MODELS.md#worker-environment).
+that points outside it is refused. See [MODELS.md](MODELS.md#worker-environment).
+
+### Initial weights: a path or a pushed blob
+
+A worker does not need the weights on its own disk. Both keys that name initial weights take either a path on the
+worker or a `pushed://<id>` blob sent with `/data/push`:
+
+| Task | Key | Path | `pushed://<id>` |
+|---|---|---|---|
+| `segment`, `classify` | `encoder: {init: "export", path, sha256?, config?}` (`source` is an alias of `path`) | A JEPA export directory (`encoder.safetensors` + `encoder_config.json`), confined to `MOREGPU_OUTPUT_DIR` ∪ `MOREGPU_MODEL_ROOTS`. `sha256` is optional and checked when given. | One `encoder.safetensors` file. `sha256` is **required**. The ViT config comes from `config`, or from the file's `moregpu.encoder_config` safetensors metadata, which JEPA exports write. |
+| `finetune_model` | `spec.source` + `spec.sha256` ([MODELS.md](MODELS.md)) | `file:///…` under `MOREGPU_MODEL_ROOTS` | `format` must be `safetensors`. `sha256` is **required**. |
+
+The same checks run for both kinds of source, before any tensor is read:
+- **Size.** The file must be at most `MOREGPU_MODEL_MAX_BYTES` (default 20 GiB). A push is also capped by
+  `MOREGPU_PUSH_MAX_BYTES` when it is staged.
+- **Integrity.** The file is hashed and compared with `sha256`; a mismatch raises `IntegrityError`. A pushed blob is
+  hashed again at load time, so a staged file that changed on disk after `blob_end` is refused.
+- **Format.** Only safetensors is accepted. The header is checked by hand, so a pickle or `torch.save` archive is refused
+  (`RefusedFormat`) before anything parses it.
+- An unknown or incomplete blob id raises `RefusedSource`.
+
+The SDKs push a file and return the ref: `pool.push_safetensors("encoder.safetensors")` (Python) or
+`client.pushSafetensors(bytes)` (TypeScript) returns `{uri, sha256, ref}`. Pass `ref` as the encoder:
+
+```python
+r = pool.push_safetensors("moregpu-out/jepa/encoder.safetensors")   # checks the file is safetensors, then /data/push
+pool.train_session_create("segment", {"encoder": {"init": "export", **r["ref"]}, ...}, ...)
+```
+
+The CLI takes `moregpu train segment --encoder pushed://<id> --encoder-sha256 <hex>`.
 
 ## What each worker type can do
 

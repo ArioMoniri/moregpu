@@ -28,7 +28,7 @@ from pathlib import Path
 from .refs import GiB, IntegrityError, check_sha256
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_SUFFIX_RE = re.compile(r"^(\.[A-Za-z0-9]{1,8}){0,3}$")
+_SUFFIX_RE = re.compile(r"^(\.[A-Za-z0-9]{1,16}){0,3}$")   # e.g. .nii.gz, .safetensors
 
 
 def stage_root(need: int = 0) -> str:

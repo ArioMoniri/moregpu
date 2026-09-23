@@ -30,6 +30,16 @@ function b64ToF32(b64: string): Float32Array {
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
   return new Float32Array(u.buffer);
 }
+/** Throw unless `b` is a safetensors file (u64 LE header length + JSON object header); pickles are refused. */
+function checkSafetensors(b: Uint8Array): void {
+  if ((b[0] === 0x50 && b[1] === 0x4b) || b[0] === 0x80) throw new Error('moregpu: this is a pickle / torch.save archive; only safetensors weights can be pushed for init');
+  if (b.length < 8) throw new Error('moregpu: not a safetensors file (too short)');
+  const n = Number(new DataView(b.buffer, b.byteOffset, 8).getBigUint64(0, true));
+  if (n < 2 || n > b.length - 8) throw new Error('moregpu: not a safetensors file (bad header length)');
+  let hdr: unknown;
+  try { hdr = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(b.subarray(8, 8 + n))); } catch { throw new Error('moregpu: not a safetensors file (the header is not JSON)'); }
+  if (!hdr || typeof hdr !== 'object' || Array.isArray(hdr)) throw new Error('moregpu: not a safetensors file (the header is not a JSON object)');
+}
 
 export interface TrainSessionConfig {
   task: string; cfg?: Record<string, unknown>; workers?: string[]; id?: string;
@@ -181,6 +191,19 @@ export class MoreGPUClient {
     const sha256 = Array.from(digest, (x) => x.toString(16).padStart(2, '0')).join('');
     let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     return this.send('POST', '/data/push', { id, sha256, data_b64: btoa(s), suffix, ...(workers ? { workers } : {}) });
+  }
+  /** Push a safetensors file to the workers' blob store for weight init and get its ref (parity with the Python
+   *  `push_safetensors`). Use `ref` as a segment/classify `encoder: { init: 'export', ...ref }`, or `uri` + `sha256` as a
+   *  model spec's `source` / `sha256`. Pickles / torch.save archives and non-safetensors bytes are refused locally. */
+  async pushSafetensors(bytes: Uint8Array, id?: string, workers?: string[]): Promise<{ ok: boolean; uri: string; sha256: string; size: number;
+    ref: { path: string; sha256: string }; results: unknown[] }> {
+    checkSafetensors(bytes);
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes as unknown as ArrayBuffer));
+    const sha256 = Array.from(digest, (x) => x.toString(16).padStart(2, '0')).join('');
+    const bid = id ?? `st-${sha256.slice(0, 16)}`;
+    const r = await this.dataPush(bid, bytes, '.safetensors', workers) as { ok: boolean; results?: unknown[] };
+    const uri = `pushed://${bid}`;
+    return { ok: !!r.ok, uri, sha256, size: bytes.length, ref: { path: uri, sha256 }, results: r.results ?? [] };
   }
   workerCaps(worker: string): Promise<Record<string, unknown>> { return this.send('GET', `/workers/${encodeURIComponent(worker)}/caps`); }
   net(pings = 20, sustainedMb = 0): Promise<Record<string, unknown>> { return this.send('GET', `/net?pings=${pings}&sustained_mb=${sustainedMb}`); }

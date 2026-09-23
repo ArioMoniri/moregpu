@@ -141,8 +141,9 @@ Caps: one blob is at most `MOREGPU_PUSH_MAX_BYTES` (default 20 GiB), and all sta
 `MOREGPU_BLOB_TOTAL_MAX_BYTES` (default 40 GiB). `blob_begin` is also refused when the staging filesystem has less
 free space than the blob's declared size.
 
-The same store also serves `pushed://` **model** sources (docs/MODELS.md), so `/data/push` can deliver a model
-artefact as well as data.
+The same store also serves `pushed://` **model** sources (docs/MODELS.md) and segment/classify **encoder** weights
+(docs/TRAINING.md), so `/data/push` can deliver a model artefact as well as data. A `suffix` is up to three
+`.`-separated parts of 1–16 letters or digits each, for example `.nii.gz` or `.safetensors`.
 
 ### Security properties
 

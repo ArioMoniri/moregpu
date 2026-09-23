@@ -158,7 +158,9 @@ These surfaces were added in 0.7. The rules below describe what the code does to
   - `https://` hosts must be allowlisted in `MOREGPU_DATA_HOSTS` or `MOREGPU_MODEL_HOSTS`. Every redirect is checked
     again, sizes are capped and sha256 is required.
   - Public buckets are accessed anonymously, and credential environment variables are stripped.
-  - `pushed://` blobs are verified by sha256 and size-capped.
+  - `pushed://` blobs are verified by sha256 and size-capped. Pushed weights for training (a finetune model or a
+    segment/classify encoder) are re-hashed at load time, capped at `MOREGPU_MODEL_MAX_BYTES`, and must be
+    safetensors; a pickle is refused before it is parsed.
 - **Outputs.** Worker-side outputs (predictions, exports) are confined to `MOREGPU_OUTPUT_DIR`. Coordinator checkpoints
   go under `MOREGPU_TRAIN_DIR`, and session ids may not contain dots or slashes.
 - **No pickles.** Model loading refuses pickled full models. `torch.load` is only used with `weights_only=True`, which

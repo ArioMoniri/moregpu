@@ -221,4 +221,6 @@ artefact and `vision_infer_*` model is dropped, and the data plane's staged blob
 | `MOREGPU_STAGE_DIR` (alias `MOREGPU_PUSHED_DIR`) | Where `pushed://` blobs are staged, for data and models alike (docs/VISION.md). `MOREGPU_PUSHED_DIR` used to be a directory the worker read `pushed://<id>` files from. Now it only sets the staging directory: a file placed there by hand does not resolve as a pushed blob. |
 
 One `BlobStore` per worker process holds `pushed://` blobs, so a model artefact sent with `/data/push` is loadable as
-`pushed://<id>` with its `sha256` in the spec.
+`pushed://<id>` with its `sha256` in the spec. A pushed artefact is also capped at `MOREGPU_MODEL_MAX_BYTES`, like a
+download. Training tasks (`finetune_model`, and a segment/classify `encoder`) accept pushed weights only as safetensors;
+see [TRAINING.md](TRAINING.md#initial-weights-a-path-or-a-pushed-blob).

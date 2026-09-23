@@ -3,7 +3,8 @@
 * `file:///p`   — only under an allowed root (MOREGPU_MODEL_ROOTS, os.pathsep-separated); symlinks are resolved first.
 * `pushed://id` — a blob pushed to this worker through the data plane (`/data/push` → `blob_begin/chunk/end`) and held
   by its :class:`~moregpu_worker.data.blobs.BlobStore`: only a fully received blob whose size + sha256 were verified at
-  `blob_end` resolves, and its sha256 must equal the spec's. A file that merely exists in a directory never resolves.
+  `blob_end` resolves, its sha256 must equal the spec's, and it is capped at MOREGPU_MODEL_MAX_BYTES like a
+  download. A file that merely exists in a directory never resolves.
 * `https://…`   — host must be in MOREGPU_MODEL_HOSTS (comma-separated; falls back to MOREGPU_DATA_HOSTS when unset),
   every redirect hop is re-checked, the body is capped at MOREGPU_MODEL_MAX_BYTES (default 20 GiB) and sha256 is
   mandatory; downloaded into a content-addressed cache (MOREGPU_MODEL_CACHE) named by its sha256. Plain `http://` only
@@ -101,12 +102,16 @@ def _pushed(bid: str, sha256: str | None, blobs) -> Path:
         blobs = default_store()
     try:
         p = blobs.path(bid)                      # KeyError unless fully received AND verified at blob_end
-        have = blobs.info(bid)["sha256"]
+        info = blobs.info(bid)
+        have = info["sha256"]
     except KeyError:
         raise RefusedSource(f"pushed blob {bid!r} was not pushed to this worker (or is incomplete) — "
                             f"push it with /data/push first") from None
     if sha256 is not None and sha256 != have:
         raise IntegrityError(f"pushed://{bid}: blob sha256 {have} != spec sha256 {sha256}")
+    cap = model_max_bytes()                      # the same cap as an https:// model download
+    if int(info["size"]) > cap:
+        raise RefusedSource(f"pushed://{bid}: {info['size']} bytes exceeds the model size cap {cap} (MOREGPU_MODEL_MAX_BYTES)")
     return p
 
 

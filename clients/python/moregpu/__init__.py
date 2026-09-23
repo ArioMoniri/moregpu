@@ -39,6 +39,21 @@ def _b64_f32(s: str) -> list[float]:
     a = array.array("f"); a.frombytes(base64.b64decode(s)); return list(a)
 
 
+def _check_safetensors(data: bytes) -> None:
+    """Refuse (ValueError) anything that is not a safetensors file: a pickle / torch.save zip, or bad header bytes."""
+    if data[:2] == b"PK" or data[:1] == b"\x80":
+        raise ValueError("this is a pickle / torch.save archive; only safetensors weights can be pushed for init")
+    n = int.from_bytes(data[:8], "little") if len(data) >= 8 else 0
+    if n < 2 or n > len(data) - 8:
+        raise ValueError("not a safetensors file (bad header length)")
+    try:
+        hdr = json.loads(data[8:8 + n].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("not a safetensors file (the header is not JSON)") from None
+    if not isinstance(hdr, dict):
+        raise ValueError("not a safetensors file (the header is not a JSON object)")
+
+
 def _transpose(x: Sequence[float], rows: int, cols: int) -> list[float]:
     return [x[r * cols + c] for c in range(cols) for r in range(rows)]
 
@@ -397,6 +412,24 @@ class MoreGPU:
         if workers:
             body["workers"] = list(workers)
         return self._req("/data/push", "POST", body)
+
+    def push_safetensors(self, src: "str | bytes", id: str | None = None, workers: Sequence[str] | None = None) -> dict:
+        """Push a safetensors file (a path or its bytes) to the workers' blob store for weight init, and return the ref:
+        ``{"ok", "uri": "pushed://<id>", "sha256", "size", "ref": {"path", "sha256"}, "results"}``.
+
+        Use ``ref`` as a segment/classify ``encoder: {"init": "export", **ref}`` (a JEPA export's
+        ``encoder.safetensors`` carries its own config), or ``uri`` + ``sha256`` as a model spec's ``source`` /
+        ``sha256``. The file is checked locally first: pickles / ``torch.save`` archives and non-safetensors bytes are
+        refused (``ValueError``) and never sent. ``id`` defaults to ``st-<first 16 hex of the sha256>``."""
+        import hashlib
+        data = bytes(src) if isinstance(src, (bytes, bytearray, memoryview)) else open(src, "rb").read()
+        _check_safetensors(data)
+        sha = hashlib.sha256(data).hexdigest()
+        bid = id or f"st-{sha[:16]}"
+        r = self.data_push(bid, data, suffix=".safetensors", workers=workers)
+        uri = f"pushed://{bid}"
+        return {"ok": bool(r.get("ok")), "uri": uri, "sha256": sha, "size": len(data),
+                "ref": {"path": uri, "sha256": sha}, "results": r.get("results", [])}
 
     def worker_caps(self, worker: str) -> dict:
         return self._req(f"/workers/{worker}/caps")

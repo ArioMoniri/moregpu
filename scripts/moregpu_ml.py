@@ -463,6 +463,8 @@ def cmd_train(a) -> int:
             task = a.task
         else:
             enc = {"init": "export", "path": a.encoder} if a.encoder else {"init": "random", "model": a.model, "patch": int(a.patch)}
+            if a.encoder and a.encoder_sha256:
+                enc["sha256"] = a.encoder_sha256
             cfg = {"kind": a.task.split("_")[-1] if a.task in ("seg_2d", "seg_3d") else "2p5d", "num_classes": a.num_classes,
                    "encoder": enc, "mode": a.mode}
             task = a.kind
@@ -626,7 +628,9 @@ def main(argv=None) -> int:
     t.add_argument("--model", default="tiny"); t.add_argument("--patch", default="16")
     t.add_argument("--n-targets", dest="n_targets", type=int, default=4); t.add_argument("--ema", type=float, default=0.996)
     t.add_argument("--grad-checkpointing", dest="grad_checkpointing", action="store_true")
-    t.add_argument("--encoder", help="(segment/classify) JEPA encoder export dir on the workers")
+    t.add_argument("--encoder", help="(segment/classify) JEPA encoder export dir on the workers, or pushed://<id>")
+    t.add_argument("--encoder-sha256", dest="encoder_sha256",
+                   help="sha256 of the encoder weights (required for pushed://, checked for an export dir)")
     t.add_argument("--num-classes", dest="num_classes", type=int, default=3); t.add_argument("--mode", default="full", choices=["full", "frozen", "lora"])
     t.add_argument("--workers", help="comma-separated worker ids (default: all torch workers)")
     t.add_argument("--rounds", type=int, help="stop after N rounds (default: until the stopping rule)")

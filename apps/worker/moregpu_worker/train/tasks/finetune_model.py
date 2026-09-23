@@ -13,6 +13,9 @@ import torch.nn.functional as F
 
 from ...vision import adapters as A
 from ...vision import losses as L
+from ...vision import weights as W
+from ...vision.errors import RefusedFormat
+from ...vision.fetch import _env_paths, make_fetch
 from ..synthetic import SyntheticSeg, SyntheticVolumes
 from ..task import StepReport, TaskContext, Timer, TrainTask
 from .llm_lora import LoRAWrap
@@ -73,7 +76,16 @@ class FinetuneModelTask(TrainTask):
         else:
             raise ValueError("finetune_model needs cfg.synthetic or cfg.data")
         self.spec = cfg["spec"]
-        h = A.load(self.spec)
+        src = self.spec.get("source") if isinstance(self.spec, dict) else None
+        blobs = W.blobs_of(ctx.data)
+        if isinstance(src, str) and src.startswith("pushed://"):
+            # pushed training weights: safetensors only — checked (size cap, sha256, header) before the adapters open it
+            W.resolve_pushed(src, self.spec.get("sha256"), blobs)
+            if self.spec.get("format") != "safetensors":
+                raise RefusedFormat(f"{src}: pushed:// training weights must be format 'safetensors' "
+                                    f"(got {self.spec.get('format')!r})")
+        # file:// stays confined to MOREGPU_MODEL_ROOTS; pushed:// resolves in the same BlobStore as the data plane
+        h = A.load(self.spec, make_fetch(roots=_env_paths("MOREGPU_MODEL_ROOTS"), blobs=blobs))
         self.model = A.train_handle(h).to(ctx.device)          # raises NotNative for torch.export/TorchScript/ONNX
         self.model.train()
         mode = cfg.get("trainable", "all")
