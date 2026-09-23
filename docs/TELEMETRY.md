@@ -44,7 +44,7 @@ The field set matches `emitTelemetry` in `apps/coordinator/lib/train_session.ts`
 | `gpu_power_w` | number \| null | worker `report.metrics.gpu_power_w` (NVML mean) |
 | `energy_j` | number \| null | worker `report.metrics.energy_j` (NVML) |
 | `mem_peak_bytes` | int \| null | worker `report.metrics.mem_peak_bytes` (`torch.cuda.max_memory_allocated`) |
-| `hw` | object \| null | worker `report.metrics.hw` (`hw.fingerprint()`) |
+| `hw` | object \| null | worker `report.metrics.hw` (`hw.fingerprint()`). `hw.vram_fraction` is the `MOREGPU_VRAM_FRACTION` the worker applied at start-up (`null` when unset or without CUDA). |
 | `wire_error` | `{max_abs, rel_l2}` \| null | reconstruction error of a lossy sync dtype |
 | `git_sha` | string \| null | `MOREGPU_GIT_SHA` of the coordinator |
 | `config_hash` | string | sha256 of the canonical session config |

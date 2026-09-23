@@ -152,6 +152,7 @@ Start these with `moregpu torch-join --server wss://HOST:8787/ws --token … --p
 | `MOREGPU_OUTPUT_DIR` | The only directory exports and checkpoints are written to. The worker refuses paths outside it. |
 | `MOREGPU_MODEL_HOSTS` / `MOREGPU_MODEL_ROOTS` | The https hosts and local roots that published models may be fetched from ([MODELS.md](MODELS.md#worker-environment)). |
 | `MOREGPU_VERIFY_MANIFEST=1` | Refuse to start from a tree with no signed `apps/worker/MANIFEST.sha256`. |
+| `MOREGPU_VRAM_FRACTION` | Cap on this worker's share of each CUDA device, `0 < f ≤ 1` (e.g. `0.5`). At start-up the worker calls `torch.cuda.set_per_process_memory_fraction(f)` on every visible CUDA device, so allocations past `f × total memory` fail with out-of-memory instead of taking the whole GPU. NaN, infinities, non-numbers and values outside `(0, 1]` stop the worker with an error. It has no effect on CPU/MPS workers. The applied value is reported as `hw.vram_fraction` in telemetry. |
 
 The worker needs `torch>=2.6` and refuses to start on anything older (CVE-2025-32434). Session ids must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`. See [SECURITY.md](../SECURITY.md) for the trust model.
 

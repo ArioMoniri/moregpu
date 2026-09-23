@@ -12,6 +12,8 @@ import os
 import platform
 import socket
 
+from .. import vram
+
 _SALT = b"moregpu.telemetry/1:host:" + os.urandom(16)   # per-run random salt (see module doc)
 
 
@@ -43,6 +45,7 @@ def fingerprint(torch_mod=None) -> dict:
         "python": platform.python_version(),
         "torch": None, "cuda": None, "device": None, "capability": None, "total_mem_bytes": None,
         "cpu_count": os.cpu_count(), "ram_bytes": _ram_bytes(),
+        "vram_fraction": vram.applied(),   # MOREGPU_VRAM_FRACTION as applied at start-up (None: unset / no CUDA)
     }
     if t is None:
         return fp

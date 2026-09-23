@@ -52,6 +52,9 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
 - **AMP** (`amp: auto|bf16|fp16|fp32`):
   - `auto` picks bf16 where the GPU supports it, fp16 with GradScaler on other CUDA GPUs, and fp32 on CPU/MPS.
   - A forced mode the device cannot run is an error, never a silent downgrade.
+- **GPU memory cap.** `MOREGPU_VRAM_FRACTION=f` (`0 < f ≤ 1`) on a CUDA worker calls
+  `torch.cuda.set_per_process_memory_fraction(f)` at start-up. An invalid value stops the worker. The applied value
+  appears as `hw.vram_fraction` in each `worker_round` telemetry record ([ADMIN.md](ADMIN.md#native-torch-workers-training--vision)).
 - **Sessions** are keyed by id on each worker. The admission limit is `MOREGPU_MAX_TRAIN_SESSIONS` (default 1 on GPU,
   2 on CPU). The legacy `/train` and `/train/diloco` routes keep their reserved slot and their behaviour.
 - **Checkpoint and resume.**

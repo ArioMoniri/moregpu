@@ -51,6 +51,14 @@ if A.cpu:
 # The coordinator tallies GPU vs CPU shards by whether the result `backend` string startsWith('gpu')
 # (server.ts:399) and counts GPU *slots* by node.backend==='gpu' (server.ts:518). A real accelerator
 # must therefore register backend='gpu' AND label/result-backend starting with 'gpu:'.
+# MOREGPU_VRAM_FRACTION (0 < f <= 1): cap this process's share of each CUDA device BEFORE anything is allocated there.
+# A bad value (NaN, out of range, not a number) stops the start-up with a clear error instead of being ignored. The
+# applied value is reported as hw.vram_fraction in telemetry (moregpu_worker.telemetry.hw.fingerprint).
+from moregpu_worker import vram as _vram  # noqa: E402
+try:
+    VRAM_FRACTION = _vram.apply(device=DEV)
+except _vram.VramFractionError as _e:
+    raise SystemExit(f"[torch-worker] {_e}") from None
 NODE_BACKEND = "cpu" if DEV == "cpu" else "gpu"
 BACKEND = f"cpu:torch" if DEV == "cpu" else f"gpu:torch-{DEV}"
 NAME = A.name
@@ -1846,7 +1854,8 @@ async def run():
             print(f"[torch-worker] disconnected ({e}); retrying in 2s"); await asyncio.sleep(2)
 
 if __name__ == "__main__":
-    print(f"[torch-worker] {NAME} · device={DEV} · backend={BACKEND} · server={A.server}")
+    print(f"[torch-worker] {NAME} · device={DEV} · backend={BACKEND} · server={A.server}"
+          + (f" · vram fraction {VRAM_FRACTION}" if VRAM_FRACTION is not None else ""))
     if not A.token:
         print("[torch-worker] warning: no --token / MOREGPU_TOKEN set; the coordinator will reject me")
     try:
