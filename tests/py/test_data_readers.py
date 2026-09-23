@@ -80,7 +80,7 @@ def test_nifti_4d_keeps_trailing_axis(tmp_path):
 
 
 def _write_dicom_slice(path, pixels, z, inst, slope=None, intercept=None):
-    pydicom = pytest.importorskip("pydicom")
+    pytest.importorskip("pydicom")
     from pydicom.dataset import Dataset, FileMetaDataset
     from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 

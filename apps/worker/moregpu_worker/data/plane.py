@@ -131,18 +131,34 @@ class DataPlane:
             self._stats["cache_hits" if p is not None else "cache_misses"] += 1
         return p
 
+    def _fetch(self, uri: str, sha: str, download) -> Path:
+        """Cache hit, or ``download(tmp_path)`` into a temp file in the cache dir, cap its size, verify + store it."""
+        hit = self._cached(sha)
+        if hit is not None:
+            return hit
+        fd, tmp = tempfile.mkstemp(prefix=".dl-", dir=self.cache.dir)
+        os.close(fd)
+        try:
+            download(tmp)
+            if os.path.getsize(tmp) > self.policy.max_download_bytes:
+                raise RefDenied(f"{uri}: exceeds download cap {self.policy.max_download_bytes}")
+            return self.cache.put(tmp, sha256=sha, move=True)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
     def _resolve_http(self, uri: str, sha: str | None) -> Path:
         self._host_allowed(uri)
         if sha is None:
             raise RefDenied("remote refs need a sha256")
-        hit = self._cached(sha)
-        if hit is not None:
-            return hit
+        return self._fetch(uri, sha, lambda tmp: self._http_get(uri, tmp))
+
+    def _http_get(self, uri: str, tmp: str) -> None:
         plane = self
 
         class _Redirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
-                plane._host_allowed(newurl)
+                plane._host_allowed(newurl)  # every hop must stay on the allowlist
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
 
         handlers: list = [_Redirect()]
@@ -150,32 +166,25 @@ class DataPlane:
             handlers.append(urllib.request.ProxyHandler({}))
         opener = urllib.request.build_opener(*handlers)
         cap = self.policy.max_download_bytes
-        fd, tmp = tempfile.mkstemp(prefix=".dl-", dir=self.cache.dir)
         try:
-            with os.fdopen(fd, "wb") as out:
-                try:
-                    resp = opener.open(urllib.request.Request(uri, headers={"User-Agent": "moregpu-worker"}), timeout=60)
-                except urllib.error.HTTPError as e:
-                    if e.code == 404:
-                        raise FileNotFoundError(uri) from e
-                    raise OSError(f"GET {uri}: HTTP {e.code}") from e  # pragma: no cover
-                with resp:
-                    declared = resp.headers.get("Content-Length")
-                    if declared is not None and int(declared) > cap:
-                        raise RefDenied(f"{uri}: {declared} bytes exceeds download cap {cap}")
-                    n = 0
-                    while True:
-                        b = resp.read(_BUF)
-                        if not b:
-                            break
-                        n += len(b)
-                        if n > cap:  # pragma: no cover - server lied about Content-Length
-                            raise RefDenied(f"{uri}: exceeds download cap {cap}")
-                        out.write(b)
-            return self.cache.put(tmp, sha256=sha, move=True)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+            resp = opener.open(urllib.request.Request(uri, headers={"User-Agent": "moregpu-worker"}), timeout=60)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise FileNotFoundError(uri) from e
+            raise OSError(f"GET {uri}: HTTP {e.code}") from e  # pragma: no cover
+        with resp, open(tmp, "wb") as out:
+            declared = resp.headers.get("Content-Length")
+            if declared is not None and int(declared) > cap:
+                raise RefDenied(f"{uri}: {declared} bytes exceeds download cap {cap}")
+            n = 0
+            while True:
+                b = resp.read(_BUF)
+                if not b:
+                    break
+                n += len(b)
+                if n > cap:  # pragma: no cover - server sent more than its Content-Length
+                    raise RefDenied(f"{uri}: exceeds download cap {cap}")
+                out.write(b)
 
     def _resolve_bucket(self, uri: str, scheme: str, sha: str | None) -> Path:
         if not self.policy.allow_buckets:
@@ -184,16 +193,13 @@ class DataPlane:
             raise RefDenied("bucket refs need a sha256")
         if not _BUCKET_RE.match(uri):
             raise RefDenied(f"bad bucket uri {uri[:120]!r}")
-        tool = shutil.which("s5cmd" if scheme == "s3" else "gsutil")
+        name = "s5cmd" if scheme == "s3" else "gsutil"
+        tool = shutil.which(name)
         if tool is None:
-            raise RefDenied(f"{'s5cmd' if scheme == 's3' else 'gsutil'} is not on PATH")
-        hit = self._cached(sha)
-        if hit is not None:
-            return hit
-        env = {k: v for k, v in os.environ.items() if k not in _CRED_ENV}
-        fd, tmp = tempfile.mkstemp(prefix=".dl-", dir=self.cache.dir)
-        os.close(fd)
-        try:
+            raise RefDenied(f"{name} is not on PATH")
+
+        def download(tmp: str) -> None:
+            env = {k: v for k, v in os.environ.items() if k not in _CRED_ENV}  # anonymous only
             with tempfile.TemporaryDirectory() as empty_cfg:
                 if scheme == "s3":
                     cmd = [tool, "--no-sign-request", "cp", uri, tmp]
@@ -203,14 +209,10 @@ class DataPlane:
                     cmd = [tool, "-q", "cp", uri, tmp]
                 r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=6 * 3600)
             if r.returncode != 0:
-                raise FileNotFoundError(f"{uri}: {os.path.basename(tool)} exited {r.returncode}: "
+                raise FileNotFoundError(f"{uri}: {name} exited {r.returncode}: "
                                         f"{r.stderr.decode(errors='replace')[-300:]}")
-            if os.path.getsize(tmp) > self.policy.max_download_bytes:  # pragma: no cover
-                raise RefDenied(f"{uri}: exceeds download cap {self.policy.max_download_bytes}")
-            return self.cache.put(tmp, sha256=sha, move=True)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+
+        return self._fetch(uri, sha, download)
 
     def _resolve_pushed(self, uri: str, sha: str | None) -> Path:
         bid = uri[len("pushed://"):] if uri.lower().startswith("pushed://") else ""
