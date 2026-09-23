@@ -1,5 +1,55 @@
 # Vision
 
+MoreGPU runs vision models on three kinds of workers:
+- **native torch workers** (`apps/worker/worker_torch.py`, CUDA / MPS / CPU);
+- **Deno WebGPU workers** (`apps/worker/worker.ts`);
+- **browser tabs** (the same `worker.ts`, bundled).
+
+The subsystems are documented separately:
+
+| Document | Covers |
+|---|---|
+| this file | the matrix of what works where, plus the data plane |
+| [MODELS.md](MODELS.md) | running published models exactly as released |
+| [TRAINING.md](TRAINING.md) | training sessions and DiLoCo |
+| [JEPA.md](JEPA.md) | self-supervised pretraining |
+| [WEBGPU_VISION.md](WEBGPU_VISION.md) | the WGSL executor |
+| [TELEMETRY.md](TELEMETRY.md) | what is measured |
+
+## Support matrix
+
+Every ✅ cell has an automated test (unit, e2e or real-adapter), named in the last column.
+
+| Capability | Native torch worker | Deno WebGPU worker | Browser tab | Evidence (tests) |
+|---|---|---|---|---|
+| **Load a published model exactly as released**: state_dict / safetensors + named arch (torchvision, timm, MONAI, HF), allowlisted plugins, torch.export, TorchScript, ONNX | ✅ sha256-verified; pickled full models refused | via lowering only (below) | via lowering only | `tests/py/test_vision_adapters.py`, `tests/e2e/published_model.py` |
+| **Automatic lowering** (torch.export graph → MoreGPU op-graph; or ONNX for onnxruntime-web) | ✅ produces it; parity-probed ≤ 1e-4 | consumes it | consumes it | `tests/py/test_vision_lowering.py`, `tests/webgpu/*` |
+| **Inference: one tensor** | ✅ | ✅ conv2d/3d, norms, pooling, upsampling, attention, … (see WEBGPU_VISION.md) | ✅ (verified on SwiftShader) | `tests/py/test_vision_infer.py`, `tests/webgpu/deno_webgpu_test.ts`, `browser.spec.ts` |
+| **Whole-volume inference** (sliding window, gaussian blend, flip TTA; MONAI-equivalent) | ✅ | ✅ (host-side blend) | ✅ | `tests/py/test_vision_core.py` (MONAI goldens) |
+| **Distributed batch inference**: case queue with work stealing, retry on churn | ✅ | via mixed-fleet `/vision/infer_batch` | same | `apps/coordinator/lib/vision_batch.test.ts`, `tests/e2e/vision_pipeline.py` |
+| **Tile sharding**: one volume split across workers, merged exactly | ✅ (`split: "tiles"`) | — | — | `tests/py/test_vision_infer.py`, `tests/e2e/vision_pipeline.py` |
+| **JEPA pretraining** (`ijepa_2d`, `jepa_2p5d`, `jepa_3d`) | ✅ DiLoCo across N workers | ❌ no autograd in WGSL | ❌ | `tests/py/test_jepa_*.py`, `tests/e2e/jepa_sessions.py` |
+| **JEPA feature extraction** (frozen encoder) | ✅ | ✅ (lowered ViT) | ✅ | `tests/py/test_vision_infer.py`, `tests/webgpu/*` |
+| **Fine-tune MoreGPU models** (`segment` 2D/2.5D/3D, `classify`; full / frozen / LoRA) | ✅ DiLoCo | ❌ | ❌ | `tests/py/test_vision_tasks.py`, `tests/e2e/vision_pipeline.py` |
+| **Fine-tune ANY published native model** (`finetune_model`: torchvision / timm / MONAI / HF / plugin; all / head / LoRA; segment, classify, regress) | ✅ DiLoCo | ❌ | ❌ | `tests/py/test_finetune_model.py` |
+| **Data plane**: file:// under roots, https / public buckets with sha256, pushed:// blobs; NumPy, NIfTI, DICOM, PNG/JPEG/TIFF | ✅ | pushed tensors only | pushed tensors only, kept in memory | `tests/py/test_data_*.py`, `tests/e2e/data_plane_jepa.py` |
+| **Telemetry** (compute/data/serialise/network/wait, bytes, GPU util, energy, AMP) | ✅ | job-level | job-level | `tests/py/test_telemetry_*.py` |
+
+### Why training is native-only
+
+Training needs autograd plus optimiser state. The WGSL executor only runs the forward pass, which is enough for inference and
+feature extraction. Adding WGSL backward kernels is listed as a stretch item in `docs/dev/adr/`. In a mixed fleet, the
+WebGPU and browser workers therefore help with inference and evaluation, while the torch workers train.
+
+### How the swarm parallelises vision work
+
+| Kind of work | How it is split | Why |
+|---|---|---|
+| Training (pretraining and fine-tuning) | **Data-parallel DiLoCo** | Each worker holds the whole model and trains on its own seeded shard for H local steps. The coordinator then averages, weighted by samples, and applies an outer Nesterov step. The only traffic is one state transfer per round. |
+| Inference | **By data** | Many studies go through a work-stealing case queue. A single large study can be split tile-by-tile across workers (`split: "tiles"`), which gives exactly the single-node result. |
+| — | Not by layers | Pipeline or layer sharding, as used for LLM/MoE models (`/model/shard`), is only needed when a model does not fit on one device. Vision models of the sizes above fit easily. |
+
+
 ## Data plane
 
 The data plane is how a native torch worker gets training arrays. It lives in `apps/worker/moregpu_worker/data/`
