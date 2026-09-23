@@ -70,3 +70,4 @@ clients/python/build/
 
 *.tar.gz
 .claude/worktrees/
+.coverage
