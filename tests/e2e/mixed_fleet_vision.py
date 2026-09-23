@@ -6,7 +6,8 @@
       vision_loads it there;
   (b) /vision/infer routes to either holder and returns the same {shape, data} shape from both kinds;
   (c) /vision/infer_batch spreads 8 inputs over BOTH workers (work-stealing queue), returns outputs in order, per-worker
-      counts and max|Δ| vs the torch reference (check_parity) — every output equals local PyTorch within 1e-4.
+      counts and max|Δ| vs the torch reference (check_parity) — every output equals local PyTorch within 1e-4;
+  (d) both kinds report the same pred_sha256 (argmax labels over the class axis, moregpu.pred/1) as local PyTorch.
 
 The WebGPU worker needs a real adapter (Mesa lavapipe works: `apt install mesa-vulkan-drivers`). Without one this test
 prints a SKIP line and exits 0.
@@ -19,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "apps", "worker"))
 from _pool import REPO, Pool, Checks, tail  # noqa: E402
+from moregpu_worker.vision import pred_hash as P  # noqa: E402
 
 ADAPTER_PROBE = "const a = await navigator.gpu?.requestAdapter(); console.log(a ? 'ADAPTER ' + (a.info?.description || a.info?.device || '?') : 'NO_ADAPTER');\n"
 
@@ -108,6 +110,8 @@ def main():
             good = one.get("ok") and one.get("worker") == w and one.get("shape") == list(ref[0].shape)
             err = float(np.abs(unb64(one["data"], one["shape"]) - ref[0]).max()) if good else float("inf")
             ck(bool(good) and err <= 1e-4, f"/vision/infer on {w} ({one.get('kind')}) → {one.get('shape')}, max|Δ| vs torch {err:.2e}")
+            ck(one.get("pred_sha256") == P.pred_sha256(P.labels_from_logits(ref[0])),
+               f"/vision/infer on {w}: pred_sha256 == local PyTorch labels ({str(one.get('pred_sha256'))[:12]}…)")
 
         res = pool.api("/vision/infer_batch", "POST", {"id": "seg", "inputs": [{"shape": [1, 3, 32, 32], "data": b64(x)} for x in xs],
                                                        "check_parity": True})
@@ -119,6 +123,8 @@ def main():
         ck(per.get("t1", 0) > 0 and per.get("g1", 0) > 0 and sum(per.values()) == 8, f"both workers served items: {per}")
         errs = [float(np.abs(unb64(o["data"], o["shape"]) - r_).max()) for o, r_ in zip(outs, ref)] if len(outs) == 8 else [float("inf")]
         ck(max(errs) <= 1e-4, f"every output == local PyTorch within 1e-4 (max {max(errs):.2e})")
+        ck(len(outs) == 8 and all(o["pred_sha256"] == P.pred_sha256(P.labels_from_logits(r_)) for o, r_ in zip(outs, ref)),
+           "infer_batch: every output's pred_sha256 (torch and WebGPU) == local PyTorch labels")
         par = res.get("parity") or {}
         ck(par.get("reference") == "t1" and par.get("max_abs", 1) <= 1e-4 and "g1" in (par.get("per_worker") or {}),
            f"check_parity: max|Δ| vs torch reference {par.get('max_abs')} (per worker {par.get('per_worker')})")
