@@ -198,6 +198,20 @@ ml_run() {
   exec python3 "$f" ${conn[@]+"${conn[@]}"} "$@"
 }
 
+# benchmark (ADR-0111): seeded repeats + emulated limits. Needs the moregpu_worker package: a clone
+# (apps/worker next to this script), MOREGPU_WORKER_DIR, or `pip install ./apps/worker`.
+bench_run() {
+  command -v python3 >/dev/null 2>&1 || { echo "[moregpu] bench needs python3." >&2; exit 1; }
+  local self_dir wdir
+  self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
+  wdir="${MOREGPU_WORKER_DIR:-$self_dir/../apps/worker}"
+  if [ -d "$wdir/moregpu_worker" ]; then
+    PYTHONPATH="$wdir${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m moregpu_worker.bench "$@"
+  fi
+  python3 -c 'import moregpu_worker' 2>/dev/null || { echo "[moregpu] bench needs the moregpu_worker package: run from a clone, set MOREGPU_WORKER_DIR=<clone>/apps/worker, or pip install ./apps/worker" >&2; exit 1; }
+  exec python3 -m moregpu_worker.bench "$@"
+}
+
 cmd="${1:-__menu__}"; [ $# -gt 0 ] && shift || true
 
 case "$cmd" in
@@ -208,6 +222,7 @@ case "$cmd" in
   install) exec sh -c "curl -fsSL $RAW/scripts/install.sh | MOREGPU_SERVICE=1 sh" ;;
 
   finetune|generate|chat|shard) ml_run "$cmd" "$@" ;;
+  bench)   bench_run "$@" ;;
 
   isolate) need_deno
     command -v bash >/dev/null 2>&1 || { echo "[moregpu] isolate needs bash (Linux, systemd + cgroups v2)"; exit 1; }
@@ -282,6 +297,14 @@ case "$cmd" in
                                                --actq int8: int8 activations between middle stages (~4x less per-hop
                                                  wire; lossy, fp32 kept into the last stage).
                                                --prompt: after sharding, chat it (the first stage tokenizes on-device).
+
+  BENCHMARK   (seeded repeats; limits are EMULATION, labelled so in the JSON; needs a clone or MOREGPU_WORKER_DIR)
+    moregpu bench [--repeats N | --seeds 0,1,2] [--out FILE.jsonl] -- CMD ARGS...
+                                               time CMD per seed; collects its moregpu.telemetry/1 JSONL
+                  [--limit-vram 0.5]           torch per-process VRAM fraction (CUDA)
+                  [--limit-cpus 4 --limit-mem 8G] [--backend systemd|docker --docker-image IMG]
+                  [--simulate-latency 50 --bandwidth 100 --iface eth0]   tc netem (Linux, root)
+                  [--dry-run | --apply]        cpu/mem/netem only run with --apply; else the commands are printed
 
   ADMIN FLEET CONTROL   (env: MOREGPU_SERVER, MOREGPU_ADMIN_TOKEN)
     moregpu workers | monitor                  list workers / pool device

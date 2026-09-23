@@ -79,7 +79,7 @@ def test_trapezoid_energy_and_means_manual_sampling():
 
 def test_energy_counter_preferred_when_supported():
     c = Clock()
-    s = N.GpuSampler(nvml=fake_nvml(energy_mj=(5_000, 5_000, 9_500)), clock=c, thread=False)
+    s = N.GpuSampler(nvml=fake_nvml(energy_mj=(5_000, 9_500)), clock=c, thread=False)
     s.start()
     c.t = 2.0
     out = s.stop()

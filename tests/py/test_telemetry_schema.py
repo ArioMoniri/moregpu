@@ -180,6 +180,22 @@ def test_breakdown_ok():
     assert S.breakdown_ok(zero)
 
 
+@pytest.mark.parametrize("x,js", [(1e-7, "1e-7"), (0.000001, "0.000001"), (1e21, "1e+21"), (123.45, "123.45"),
+                                  (-2.5, "-2.5"), (100.0, "100"), (1.5e300, "1.5e+300"), (float("nan"), "null"),
+                                  (True, "true"), (False, "false"), (10 ** 22, "1e+22"), (0.0, "0"), (7, "7"),
+                                  (0.1, "0.1"), (2.5e-7, "2.5e-7")])
+def test_js_number_formatting(x, js):
+    assert S.canonical_json(x) == js
+
+
+def test_canonical_json_structure():
+    assert S.canonical_json({"b": [1, (2.0, None)], "a": "é\n"}) == '{"a":"é\\n","b":[1,[2,null]]}'
+
+
+def test_range_checks():
+    assert any("gpu_util" in e for e in S.validate(worker_round(gpu_util=150.0)))
+
+
 def test_config_hash_is_canonical():
     a = S.config_hash({"b": 1, "a": {"y": 2.0, "x": [1, 2]}})
     b = S.config_hash({"a": {"x": [1, 2], "y": 2}, "b": 1})
