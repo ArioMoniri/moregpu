@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moregpu-worker"
+version = "0.7.0.dev0"
+description = "MoreGPU native torch worker: training-task framework, DiLoCo, JEPA, vision"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy", "cryptography", "websockets", "safetensors"]
+
+[project.optional-dependencies]
+llm = ["transformers>=4.44"]
+vision = ["nibabel", "pydicom", "SimpleITK", "pillow", "tifffile", "scipy"]
+onnx = ["onnx", "onnxruntime", "onnxscript"]
+monai = ["monai"]
+timm = ["timm"]
+telemetry = ["nvidia-ml-py"]
+dev = ["pytest", "pytest-cov"]
+
+[project.entry-points."moregpu.train_tasks"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["moregpu_worker"]
+
+[tool.pytest.ini_options]
+markers = [
+  "gpu: needs any accelerator (skipped in CI)",
+  "cuda: needs CUDA (skipped in CI)",
+  "webgpu: needs WebGPU (skipped in CI)",
+  "slow: long-running",
+]
