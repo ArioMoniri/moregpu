@@ -3011,6 +3011,20 @@ pre.logs{background:#0a0f1b;border:1px solid var(--line);border-radius:12px;padd
     </div>
   </div>
 
+  <!-- TRAINING SESSIONS / VISION JOBS / CAPABILITIES (v0.7) -->
+  <div class="section-title"><h2>Training sessions</h2><div class="ln"></div></div>
+  <div class="card">
+    <p class="hint">JEPA pretraining and segment/classify fine-tuning across torch workers (DiLoCo). Per round: loss, collapse monitors (RankMe, per-dim std) and where the time went (compute / data / serialise / network / wait).</p>
+    <div id="trainOut"><span class="empty">no training sessions</span></div>
+  </div>
+  <div class="section-title"><h2>Vision jobs</h2><div class="ln"></div></div>
+  <div class="card"><div id="visionOut"><span class="empty">no vision jobs</span></div></div>
+  <div class="section-title"><h2>Worker capabilities</h2><div class="ln"></div></div>
+  <div class="card">
+    <div class="row"><button class="grad" id="capsBtn">Probe capabilities</button><span class="mstatus" id="capsNote"></span></div>
+    <div id="capsOut"></div>
+  </div>
+
   <!-- NETWORK SELF-TEST -->
   <div class="section-title"><h2>Network self-test</h2><div class="ln"></div></div>
   <div class="card">
@@ -3327,7 +3341,7 @@ $("netBtn").addEventListener("click",function(){
     $("netNote").className="mstatus ok";
     $("netNote").textContent="median RTT "+(d.median_rtt_ms==null?"–":d.median_rtt_ms+" ms")+(d.median_up_mbps!=null?" · "+d.median_up_mbps+" Mbps up":"");
     var rows=(d.workers||[]).map(function(w){
-      return '<tr><td>'+esc(w.id)+'</td><td class="mono">'+esc(w.backend||"")+'</td><td class="mono">'+(w.rtt_ms==null?"–":w.rtt_ms+" ms")+'</td><td class="mono">'+(w.up_mbps==null?esc(w.up_note||"–"):w.up_mbps+" Mbps")+'</td></tr>';
+      return '<tr><td>'+esc(w.id)+'</td><td class="mono">'+esc(w.backend||"")+'</td><td class="mono">'+(w.rtt_ms==null?"–":w.rtt_ms+" ms"+(w.rtt_p50_ms!=null?" (p50 "+w.rtt_p50_ms+" · p99 "+w.rtt_p99_ms+")":""))+'</td><td class="mono">'+(w.up_mbps==null?esc(w.up_note||"–"):w.up_mbps+" Mbps")+'</td></tr>';
     }).join("");
     var li=function(a){return (a||[]).map(function(x){return "<li>"+esc(x)+"</li>";}).join("");};
     var out='<table class="nettbl"><thead><tr><th>worker</th><th>type</th><th>RTT</th><th>up</th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="empty">no torch workers to probe</td></tr>')+'</tbody></table>';
@@ -3344,10 +3358,80 @@ $("netBtn").addEventListener("click",function(){
   });
 });
 
+/* ---------- training sessions / vision jobs / capabilities ---------- */
+var BRK=[["compute_s","#7c5cff","compute"],["data_s","#22c55e","data"],["serialize_s","#f59e0b","serialise"],["network_s","#38bdf8","network"],["wait_s","#94a3b8","wait"]];
+function breakdownBar(recs){
+  var sums={},tot=0;BRK.forEach(function(b){sums[b[0]]=0;});
+  recs.forEach(function(r){BRK.forEach(function(b){var v=+r[b[0]]||0;sums[b[0]]+=v;tot+=v;});});
+  if(!tot)return "";
+  var segs=BRK.map(function(b){var pc=100*sums[b[0]]/tot;return pc<0.5?"":'<span title="'+b[2]+' '+pc.toFixed(1)+'%" style="display:inline-block;height:10px;width:'+pc.toFixed(2)+'%;background:'+b[1]+'"></span>';}).join("");
+  var legend=BRK.map(function(b){return '<span class="mono" style="margin-right:10px;color:'+b[1]+'">■ '+b[2]+' '+(100*sums[b[0]]/tot).toFixed(0)+'%</span>';}).join("");
+  return '<div style="display:flex;width:100%;border-radius:4px;overflow:hidden;margin:6px 0">'+segs+'</div><div style="font-size:11px">'+legend+'</div>';
+}
+function refreshTraining(){
+  if(AUTH_BAD||!tok())return;
+  fetch("/train/sessions",{headers:H()}).then(function(r){return r.json();}).then(function(d){
+    var ss=(d&&d.sessions)||[];
+    if(!ss.length){$("trainOut").innerHTML='<span class="empty">no training sessions</span>';return;}
+    return Promise.all(ss.slice(0,6).map(function(s){
+      return Promise.all([fetch("/train/sessions/"+encodeURIComponent(s.id),{headers:H()}).then(function(r){return r.json();}),
+                          fetch("/train/sessions/"+encodeURIComponent(s.id)+"/telemetry?n=60",{headers:H()}).then(function(r){return r.json();})]);
+    })).then(function(rows){
+      $("trainOut").innerHTML=rows.map(function(x){
+        var s=x[0],h=s.history||[],tel=(x[1].records||[]).filter(function(r){return r.kind==="worker_round";});
+        var lastRound=h.length?h[h.length-1].round:0;
+        var recent=tel.filter(function(r){return r.round>=lastRound-2;});
+        var pct=s.target_samples?Math.min(100,100*s.samples_seen/s.target_samples):null;
+        var mons=h.map(function(r){return r.monitors&&r.monitors.rankme||0;});
+        var alarms=[];h.forEach(function(r){(r.alarms||[]).forEach(function(a){if(alarms.indexOf(a)<0)alarms.push(a);});});
+        var last=s.last||{};
+        return '<div class="card wk" style="margin:8px 0">'
+          +'<div class="row"><b>'+esc(s.id)+'</b><span class="mono">'+esc(s.task)+'</span><span class="mono">'+esc(s.status)+'</span>'
+          +'<span class="mono">round '+s.round+' · '+(s.samples_seen||0)+(s.target_samples?' / '+s.target_samples:'')+' samples · '+(s.workers||[]).length+' workers</span></div>'
+          +(pct==null?'':'<div class="bar"><i style="width:'+pct.toFixed(1)+'%"></i></div>')
+          +'<div class="row"><span class="mono">loss '+(last.avg_last_loss!=null?(+last.avg_last_loss).toFixed(4):'–')+'</span>'+spark(h.map(function(r){return r.avg_last_loss||0;}),160,28,"#7c5cff")
+          +(mons.some(function(v){return v>0;})?'<span class="mono">RankMe '+(+mons[mons.length-1]).toFixed(1)+'</span>'+spark(mons,120,28,"#22c55e"):'')
+          +'<span class="mono">lr '+(last.lr!=null?(+last.lr).toExponential(2):'–')+' · '+(last.wall_s!=null?(+last.wall_s).toFixed(1)+'s/round':'')+'</span></div>'
+          +breakdownBar(recent)
+          +(alarms.length?'<div class="note err">⚠ '+alarms.map(esc).join(' · ')+'</div>':'')
+          +'</div>';
+      }).join("");
+    });
+  }).catch(function(e){if(e&&e.auth)onAuthErr();});
+  fetch("/vision/jobs",{headers:H()}).then(function(r){return r.json();}).then(function(d){
+    var js=(d&&d.jobs)||[];
+    $("visionOut").innerHTML=js.length?js.slice(-8).reverse().map(function(j){
+      var pct=j.items?100*(j.done+j.failed)/j.items:0;
+      return '<div class="row"><b>'+esc(j.id)+'</b><span class="mono">'+esc(j.model)+'</span><span class="mono">'+esc(j.status)+'</span>'
+        +'<span class="mono">'+j.done+'/'+j.items+' done · '+j.failed+' failed · retries '+j.retries+' · stolen '+j.stolen+'</span>'
+        +'<span class="mono">'+Object.keys(j.per_worker||{}).map(function(k){return esc(k)+':'+j.per_worker[k];}).join(' ')+'</span></div>'
+        +'<div class="bar"><i style="width:'+pct.toFixed(1)+'%"></i></div>';
+    }).join(""):'<span class="empty">no vision jobs</span>';
+  }).catch(function(){});
+}
+$("capsBtn").addEventListener("click",function(){
+  $("capsNote").textContent="probing…";
+  fetch("/workers",{headers:H()}).then(function(r){return r.json();}).then(function(ws){
+    return Promise.all((ws||[]).map(function(w){return fetch("/workers/"+encodeURIComponent(w.id)+"/caps",{headers:H()}).then(function(r){return r.json();});}));
+  }).then(function(cs){
+    $("capsNote").textContent="";
+    var rows=cs.map(function(c){
+      var d=c.data||{},rd=d.readers||{},tr=c.train||{};
+      var readers=Object.keys(rd).filter(function(k){return rd[k];}).join(", ");
+      var train=(tr.tasks||[]).join(", ");
+      var vision=(c.caps||[]).indexOf("vision")>=0||(c.label||"").indexOf("torch")>=0;
+      return '<tr><td>'+esc(c.id||"")+'</td><td class="mono">'+esc(c.label||"")+'</td><td class="mono">'+(train?esc(train):'– (inference only)')+'</td>'
+        +'<td class="mono">'+(readers?esc(readers):'–')+'</td><td class="mono">'+(d.n_roots!=null?d.n_roots:'–')+'</td><td class="mono">'+(vision?'✓':'–')+'</td></tr>';
+    }).join("");
+    $("capsOut").innerHTML='<table class="nettbl"><thead><tr><th>worker</th><th>type</th><th>training tasks</th><th>data readers</th><th>data roots</th><th>vision</th></tr></thead><tbody>'+(rows||'<tr><td colspan="6" class="empty">no workers</td></tr>')+'</tbody></table>';
+  }).catch(function(e){$("capsNote").textContent="✗ "+(e&&e.message||e);});
+});
 /* ---------- boot ---------- */
 if(!tok())showGate(true);
 refresh();
 setInterval(refresh,2000);
+refreshTraining();
+setInterval(refreshTraining,4000);
 </script>`;
 
 // ---- /chat : a minimal chatbot page to test a served model (text↔text via the worker's tokenizer) ----
