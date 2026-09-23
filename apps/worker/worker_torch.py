@@ -33,6 +33,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import websockets
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # the moregpu_worker package ships beside this file (ADR-0103)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--server", default=os.environ.get("MOREGPU_SERVER", "ws://localhost:8787/ws"))
@@ -278,106 +280,69 @@ def _check_ctx(model, seq_len: int, extra: int = 0):
 # out, and (on demand) the MB-scale adapter. This is single-worker fine-tuning; the
 # pool hosts one training job, it does not (yet) parallelize training across workers.
 # ---------------------------------------------------------------------------
-class LoRAWrap(nn.Module):
-    """Wrap a frozen Linear/Conv1D so y = base(x) + (x·Aᵀ)·Bᵀ·scale. B starts at 0 → the adapter is a
-    no-op at step 0 (loss then equals the base model's), which makes the run reproducible against a
-    seeded reference."""
-    def __init__(self, base: nn.Module, in_f: int, out_f: int, r: int, alpha: float):
-        super().__init__()
-        self.base = base
-        for p in self.base.parameters():
-            p.requires_grad_(False)
-        self.A = nn.Parameter(torch.randn(r, in_f) * (1.0 / r))
-        self.B = nn.Parameter(torch.zeros(out_f, r))
-        self.scale = alpha / r
-    def forward(self, x):
-        return self.base(x) + (x @ self.A.t() @ self.B.t()) * self.scale
-
-def _in_out(mod: nn.Module):
-    if isinstance(mod, nn.Linear):
-        return mod.in_features, mod.out_features
-    if hasattr(mod, "nf") and hasattr(mod, "weight"):  # transformers Conv1D (GPT-2): weight [in, out=nf]
-        return mod.weight.shape[0], int(mod.nf)
-    return None
+# LoRA primitives live in the package (ADR-0105 llm_lora task); re-exported here for existing callers.
+from moregpu_worker.train.tasks.llm_lora import LoRAWrap, _in_out, attach_lora as _attach_lora, LlmLoraTask  # noqa: E402
+from moregpu_worker.train.task import TaskContext  # noqa: E402
+from moregpu_worker.train.sessions import SessionStore, default_limit  # noqa: E402
 
 def attach_lora(model: nn.Module, targets: list[str], r: int, alpha: float, dev: str | None = None) -> int:
     """Freeze the base model, replace each target module (matched by name suffix) with a LoRAWrap.
-    Returns the count of trainable adapter parameters. `dev` overrides the placement device (used by an
-    out-of-band verification reference so it can reproduce a worker running on a different device)."""
-    dev = dev or DEV
-    for p in model.parameters():
-        p.requires_grad_(False)
-    hits = []
-    for name, mod in model.named_modules():
-        if any(name.split(".")[-1] == t for t in targets):
-            io = _in_out(mod)
-            if io:
-                hits.append((name, mod, io))
-    for name, mod, (in_f, out_f) in hits:
-        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
-        parent.add_module(name.split(".")[-1], LoRAWrap(mod, in_f, out_f, r, alpha).to(dev))
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    `dev` overrides the placement device (used by an out-of-band verification reference)."""
+    return _attach_lora(model, targets, r, alpha, dev=dev or DEV)
 
-TRAIN: dict = {"model": None, "opt": None, "step": 0, "trainable": {}}
+# Per-session training state (ADR-0104). The legacy /train and /train/diloco routes share the reserved session
+# LEGACY (exactly as they shared the old single TRAIN slot); new task sessions get coordinator-minted ids.
+SESSIONS = SessionStore(max_sessions=default_limit(DEV) + 1)   # +1: the legacy slot never blocks a task session
+LEGACY = "legacy"
+
+def _legacy() -> "LlmLoraTask | None":
+    t = SESSIONS.maybe(LEGACY)
+    return t if (t is not None and t.model is not None) else None
 
 def train_load(cfg: dict) -> dict:
-    from transformers import AutoModelForCausalLM
-    torch.manual_seed(int(cfg.get("seed", 0)))
     # Free the previous training model BEFORE allocating the replacement so we never transiently hold two
-    # full models in VRAM (a single global TRAIN slot; loading first would double-allocate).
-    TRAIN.update(model=None, opt=None, trainable={}); _empty_cache()
+    # full models in VRAM (the legacy session is replaced, not duplicated).
+    SESSIONS.close(LEGACY); _empty_cache()
+    task = LlmLoraTask()
+    tcfg = {k: cfg.get(k) for k in ("rank", "alpha", "lr", "seed", "targets", "no_dropout") if cfg.get(k) is not None}
+    tcfg.setdefault("seed", 0)
     if cfg.get("push"):
         # DOWNLOAD-FREE TRAINING: the coordinator streamed the base (config + safetensors + tokenizer) into
         # PUSH[id]'s staging dir, so THIS worker never touches the HF hub — it fine-tunes a model it never
-        # downloaded. Load fp32 from the staged files (LoRA needs an fp32 base for stable AdamW), then drop
-        # staging. This is what lets a no-download node (e.g. a laptop worker) join distributed fine-tuning.
+        # downloaded. Load fp32 from the staged files, then drop staging on EVERY path.
         st = PUSH.get(cfg.get("id"))
         if st is None:
             raise RuntimeError("training weights not staged — the coordinator must push the base before a push train_load")
         try:
-            model = AutoModelForCausalLM.from_pretrained(st["dir"], dtype=torch.float32, local_files_only=True).to(DEV)
+            info = task.init({**tcfg, "model_dir": st["dir"]}, TaskContext(device=DEV, session=LEGACY))
         finally:
-            _push_cleanup(cfg.get("id"))  # drop staging on EVERY path (incl. an OOM/corrupt-load throw) so it never leaks
+            _push_cleanup(cfg.get("id"))
     else:
-        model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(DEV)
-    if cfg.get("no_dropout"):  # deterministic training (e.g. DiLoCo) → reproducible against a reference
-        for mod in model.modules():
-            if isinstance(mod, nn.Dropout):
-                mod.p = 0.0
-    targets = cfg.get("targets") or ["c_attn", "q_proj", "v_proj"]
-    n_train = attach_lora(model, targets, int(cfg.get("rank", 8)), float(cfg.get("alpha", 16)))
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable, lr=float(cfg.get("lr", 1e-3)))
-    TRAIN.update(model=model, opt=opt, step=0,
-                 trainable={n: p for n, p in model.named_parameters() if p.requires_grad})
-    return {"ok": True, "trainable_params": n_train, "targets": targets, "device": DEV}
+        info = task.init({**tcfg, "model": cfg["model"]}, TaskContext(device=DEV, session=LEGACY))
+    SESSIONS.put(LEGACY, task)
+    return info
 
 def train_step(batch: dict) -> dict:
-    model, opt = TRAIN["model"], TRAIN["opt"]
-    if model is None:
+    task = _legacy()
+    if task is None:
         raise RuntimeError("no training session — call /train/load first")
-    if "lr" in batch and batch["lr"]:
-        for g in opt.param_groups:
-            g["lr"] = float(batch["lr"])
+    model = task.model
     vocab = getattr(model.config, "vocab_size", 1 << 30)
     _check_ids(vocab, batch["input_ids"])            # input ids: strictly in-vocab
     _check_labels(vocab, batch.get("labels", []))    # labels: in-vocab OR -100 (HF ignore index)
     _check_ctx(model, len(batch["input_ids"]))       # context-window guard (before the forward)
     ids = torch.tensor(batch["input_ids"], dtype=torch.long, device=DEV).unsqueeze(0)
     labels = torch.tensor(batch.get("labels", batch["input_ids"]), dtype=torch.long, device=DEV).unsqueeze(0)
-    model.train()
-    opt.zero_grad()
-    loss = model(input_ids=ids, labels=labels).loss
-    loss.backward()
-    opt.step()
+    loss = task.train_step(ids, labels, batch.get("lr"))
     if DEV == "mps": torch.mps.synchronize()
-    TRAIN["step"] += 1
-    return {"ok": True, "loss": float(loss.item()), "step": TRAIN["step"]}
+    return {"ok": True, "loss": loss, "step": task.step}
 
 def train_adapter() -> dict:
     """Return the (small) trainable adapter tensors as flat f32 base64 — grads/base weights never leave."""
-    out = {n: {"data": f32_to_b64(p), "shape": list(p.shape)} for n, p in TRAIN["trainable"].items()}
-    return {"ok": True, "step": TRAIN["step"], "tensors": out}
+    task = _legacy()
+    trainable = task.trainable if task else {}
+    out = {n: {"data": f32_to_b64(p), "shape": list(p.shape)} for n, p in trainable.items()}
+    return {"ok": True, "step": task.step if task else 0, "tensors": out}
 
 # --- DiLoCo / local-SGD building blocks (distributed LoRA across many workers) ---
 # Each round: every worker starts from the SAME broadcast adapter, runs H local AdamW steps on its OWN
@@ -385,48 +350,36 @@ def train_adapter() -> dict:
 # Nesterov step and broadcasts the result (train_set_adapter). Inner optimizer state resets each round
 # (standard DiLoCo), so a round is a pure function of {broadcast adapter, this worker's batches}.
 def train_inner(payload: dict) -> dict:
-    model = TRAIN["model"]
-    if model is None:
+    task = _legacy()
+    if task is None:
         raise RuntimeError("no training session — call train_load first")
+    model = task.model
     batches = payload["batches"]          # list of token-id windows (this worker's shard)
     if not batches:
         raise RuntimeError("no batches supplied for this worker's DiLoCo shard")
     _check_ids(getattr(model.config, "vocab_size", 1 << 30), *batches)
     _check_ctx(model, max(len(b) for b in batches))  # longest window must fit the context (before the forward)
     steps = int(payload.get("steps", len(batches)))
-    lr = float(payload.get("lr", 1e-3))
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable, lr=lr)   # fresh inner optimizer each round (DiLoCo)
-    model.train()
-    losses = []
-    for i in range(steps):
-        b = batches[i % len(batches)]
-        ids = torch.tensor(b, dtype=torch.long, device=DEV).unsqueeze(0)
-        opt.zero_grad()
-        loss = model(input_ids=ids, labels=ids).loss
-        loss.backward(); opt.step()
-        losses.append(float(loss.item()))
+    rep = task.inner_steps(batches, steps, float(payload.get("lr", 1e-3)))
     if DEV == "mps": torch.mps.synchronize()
-    TRAIN["step"] += steps
-    out = {n: {"data": f32_to_b64(p), "shape": list(p.shape)} for n, p in TRAIN["trainable"].items()}
-    return {"ok": True, "losses": losses, "tensors": out}
+    out = {n: {"data": f32_to_b64(p), "shape": list(p.shape)} for n, p in task.trainable.items()}
+    return {"ok": True, "losses": rep.losses, "tensors": out}
 
 def train_set_adapter(payload: dict) -> dict:
     """Overwrite the resident LoRA adapter with broadcast tensors (the coordinator's averaged global)."""
-    with torch.no_grad():
-        for n, p in TRAIN["trainable"].items():
-            t = payload["tensors"].get(n)
-            if t is not None:
-                p.copy_(b64_to_t(t["data"]).reshape(p.shape).to(DEV))
-    return {"ok": True, "step": TRAIN["step"]}
+    task = _legacy()
+    if task is not None:
+        task.load_sync_state({n: b64_to_t(t["data"]) for n, t in payload["tensors"].items()})
+    return {"ok": True, "step": task.step if task else 0}
 
 def train_generate(payload: dict) -> dict:
     """Greedy generation from the LIVE training model — frozen base + the LoRA adapter as trained SO FAR.
     Lets you chat with the model you just fine-tuned without a separate load (the adapter is already resident).
     Read-only: flips to eval() for the decode, then restores train() so the next /train/step is unaffected."""
-    model = TRAIN["model"]
-    if model is None:
+    task = _legacy()
+    if task is None:
         raise RuntimeError("no training session — call train_load first")
+    model = task.model
     _check_ids(getattr(model.config, "vocab_size", 1 << 30), payload["input_ids"])
     n = max(1, min(int(payload.get("max_new_tokens", 32)), 1024))     # cap → one bounded round-trip
     _check_ctx(model, len(payload["input_ids"]), extra=n)             # prompt + decode must fit the context
@@ -445,7 +398,7 @@ def train_generate(payload: dict) -> dict:
     if DEV == "mps": torch.mps.synchronize()
     elif DEV == "cuda": torch.cuda.synchronize()
     new = out[0, ids.shape[1]:].tolist()
-    return {"ok": True, "tokens": new, "n": len(new), "step": TRAIN["step"]}
+    return {"ok": True, "tokens": new, "n": len(new), "step": task.step}
 
 def train_dispatch(op: str, payload: dict) -> dict:
     if op == "load": return train_load(payload)
@@ -1824,7 +1777,7 @@ async def run():
                                 # own task, so the connection stays live meanwhile.
                                 def _reset_session():
                                     resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear()
-                                    MOE_BB.clear(); MOE_EXPERTS.clear(); TRAIN.update(model=None, opt=None, step=0, trainable={})
+                                    MOE_BB.clear(); MOE_EXPERTS.clear(); [SESSIONS.close(_sid) for _sid in SESSIONS.ids()]
                                     RING.clear(); MOE_WIRE.clear(); MOE_PEER.clear()  # a fresh coordinator session re-wires the ring/mesh after (re)load
                                     _empty_cache()
                                 await loop.run_in_executor(TORCH_POOL, _reset_session)
