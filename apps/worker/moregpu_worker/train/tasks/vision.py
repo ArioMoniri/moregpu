@@ -18,6 +18,17 @@ from ..task import StepReport, TaskContext, Timer, TrainTask
 from .llm_lora import LoRAWrap
 
 
+def resize_mask(mask: torch.Tensor, size) -> torch.Tensor:
+    """Label-map resize geometrically aligned with the image path (bilinear, align_corners=False): 'nearest-exact'
+    samples pixel centres; plain 'nearest' shifts labels by up to half an input pixel."""
+    return F.interpolate(mask[None, None].float(), size=tuple(size), mode="nearest-exact")[0, 0].long()
+
+
+def _sync(dev: str):
+    if dev.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
 class _SegDataPlane:
     """Manifest refs carry the image window; ref.meta['mask'] = {uri, slice?} gives the label map
     (2p5d: the centre slice of the window; 3d: the full volume)."""
@@ -47,7 +58,7 @@ class _SegDataPlane:
             arr = torch.as_tensor(self.plane.read(self.Ref.from_json(m)).astype("int64"))
             if self.kind == "2p5d" and arr.dim() == 3:
                 arr = arr[arr.shape[0] // 2]
-            arr = F.interpolate(arr[None, None].float(), size=tuple(size), mode="nearest")[0, 0].long()
+            arr = resize_mask(arr, size)
             out.append(arr)
         return torch.stack(out)
 
@@ -60,7 +71,7 @@ class _VisionBase(TrainTask):
         self.setup(ctx)
         self.cfg = cfg
         self.kind = cfg.get("kind", "2p5d")
-        self.keep_inner_state = bool(cfg.get("keep_inner_state", False))
+        self.keep_inner_state = bool(cfg.get("keep_inner_state", True))
         self.num_classes = int(cfg["num_classes"])
         if cfg.get("synthetic"):
             syn = {"kind": self.kind, **cfg["synthetic"]}
@@ -142,6 +153,7 @@ class _VisionBase(TrainTask):
                     out = self.model(x)
                 loss = self._criterion(out, y)
                 self.amp.backward_step(loss, opt, clip=self.clip, params=self._trainable())
+                _sync(self.ctx.device)                # GPU time belongs to compute, not to whatever reads it next
             losses.append(float(loss.detach()))
             self.step += 1
         return StepReport(losses, len(batch_refs), tm.t, {"amp": self.amp.mode})

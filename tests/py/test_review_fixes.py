@@ -116,7 +116,7 @@ def test_p1_8_finetune_model_syncs_batchnorm_buffers(tmp_path, monkeypatch):
                    outer_momentum=0.0, seed=0, manifest_len=16)
     a, b = (dict(w.model.named_buffers()) for w in r["workers"])
     assert torch.equal(a["bn1.running_mean"], b["bn1.running_mean"])
-    assert "bn1.running_mean" in r["workers"][0].state_for_sync()
+    assert "buffer:bn1.running_mean" in r["workers"][0].state_for_sync()
     assert not any(k.endswith("num_batches_tracked") for k in r["workers"][0].state_for_sync())
 
 

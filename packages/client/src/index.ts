@@ -134,8 +134,8 @@ export class MoreGPUClient {
   trainSessionEval(id: string, refs: unknown[], kind = 'loss', worker?: string): Promise<{ ok: boolean; metrics: Record<string, unknown> }> {
     return this.send('POST', `/train/sessions/${encodeURIComponent(id)}/eval`, { refs, kind, ...(worker ? { worker } : {}) });
   }
-  trainSessionExport(id: string, fmt: 'safetensors' | 'torch_export' | 'onnx', path: string, worker?: string): Promise<Record<string, unknown>> {
-    return this.send('POST', `/train/sessions/${encodeURIComponent(id)}/export`, { fmt, path, ...(worker ? { worker } : {}) });
+  trainSessionExport(id: string, fmt: 'safetensors' | 'torch_export' | 'onnx', path: string, worker?: string, which?: 'target' | 'context'): Promise<Record<string, unknown>> {
+    return this.send('POST', `/train/sessions/${encodeURIComponent(id)}/export`, { fmt, path, ...(worker ? { worker } : {}), ...(which ? { which } : {}) });
   }
   trainSessionState(id: string, dtype: 'f32' | 'bf16' | 'fp16' = 'f32'): Promise<{ ok: boolean; round: number; header: unknown; blob_b64: string }> {
     return this.send('GET', `/train/sessions/${encodeURIComponent(id)}/state?dtype=${dtype}`);

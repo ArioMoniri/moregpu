@@ -20,6 +20,9 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
 
 ## Semantics and guarantees
 
+- **Inner optimizer state** persists across rounds on each worker (DiLoCo); it is never synced.
+- **After-outer hook** receives identical `{progress, h}` from the coordinator on every worker (h = global optimizer steps this round).
+- **Alarms:** `stop_on_alarm` (default `["diverged"]`) fails the session; the study adds `"collapse"`.
 - **Deterministic shards.** A seeded SplitMix64 Fisher–Yates permutation is drawn per epoch over the manifest indices.
   Each round takes the next Σ allocation indices and splits them contiguously in worker order.
   - The coordinator (TS) and the reference (Python) are identical; a cross-language golden test checks this.
@@ -33,6 +36,7 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
   - Matched-samples experiments therefore need only a config flag.
 - **Averaging** is weighted by samples: `w_i = s_i / Σ s`.
   - A worker whose state contains NaN or Inf is dropped from the average but is resynced.
+  - BatchNorm running statistics (`buffer:` tensors) are averaged, never outer-stepped; frozen norm layers stay in eval mode.
   - A worker that fails to receive the broadcast leaves the session.
 - **Outer step**, with Δ = global − average:
   - `v ← μv + Δ`
@@ -54,7 +58,7 @@ With N=1, H=1, η=1 and μ=0, this is exactly plain training. That equivalence i
   - `checkpoint_every: k` writes the global state, momentum, sample stream and counters atomically to
     `MOREGPU_TRAIN_DIR`.
   - `POST /train/sessions/resume` continues bit-identically. This is tested.
-  - A task with non-synced state (for example the JEPA EMA target) rebuilds it from the next broadcast.
+  - Non-synced task state (e.g. the JEPA EMA target and step counters) is checkpointed via `extra_state` and restored on resume (tested).
 - **Churn.** A lost worker is excluded from that round, and its samples are not counted. `POST
   /train/sessions/:id/workers {add}` brings a new worker in on the current global state.
 

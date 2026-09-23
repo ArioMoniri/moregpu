@@ -38,7 +38,7 @@ def test_emit_fills_header_and_validates(tmp_path):
 
 def test_emit_only_fills_fields_the_kind_has(tmp_path):
     em = E.JsonlEmitter(tmp_path / "r.jsonl", git_sha="cafe", config_hash="b" * 64, hw={"os": "Linux"})
-    rec = em.emit("round", session="s", task="toy", round=1, wall_s=1.0, reduce_s=0.1, workers=["w"], dropped=[],
+    rec = em.emit("round", session="s", task="toy", round=1, wall_s=1.0, reduce_s=0.1, hook_s=0.0, eval_s=0.0, workers=["w"], dropped=[],
                   samples=1, samples_seen=1, avg_last_loss=None, lr=None, bytes_up=0, bytes_down=0, alarms=[], eval=None,
                   monitors=None)
     assert "hw" not in rec                     # `round` has no hw field

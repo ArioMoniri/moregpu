@@ -6,7 +6,7 @@ import { decodeTensors, encodeTensors, b64ToBytes, bytesToB64, chunkBytes, conca
 class FakeWorker {
   state = new Map<string, Float32Array>([['w', new Float32Array([1, 2, 3, 4])]]);
   out: Uint8Array[] = []; inParts: Uint8Array[] = []; inHdr: WireHeader | null = null;
-  calls: string[] = []; dead = false; poison = false; failPut = false;
+  calls: string[] = []; dead = false; poison = false; failPut = false; afterInfo: Array<{ progress: unknown; h: unknown }> = []; hashOverride?: string;
   constructor(public bias: number, public speed = 1) {}
   async handle(op: string, p: any): Promise<RpcResult> {
     this.calls.push(op);
@@ -18,7 +18,7 @@ class FakeWorker {
     };
     switch (op) {
       case 'task_init': return { ok: true, data: { describe: { task: p.task } } };
-      case 'task_state_get': return { ok: true, data: await enc() };
+      case 'task_state_get': if (p.which === 'extra') return { ok: true, data: { header: { v: 1, dtype: 'f32', sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', tensors: [] }, nchunks: 1, chunk0: '' } }; return { ok: true, data: await enc() };
       case 'task_inner': {
         const w = this.state.get('w')!;
         for (let i = 0; i < w.length; i++) w[i] = this.poison ? NaN : w[i]! - p.lr * p.refs.length * this.bias;
@@ -33,7 +33,7 @@ class FakeWorker {
         this.state = await decodeTensors(this.inHdr!, concatBytes(this.inParts));
         return { ok: true, data: { applied: true, deserialize_s: 0 } };
       }
-      case 'task_after_outer': return { ok: true, data: { target_sha256: 'same' } };
+      case 'task_after_outer': this.afterInfo.push({ progress: p.progress, h: p.h }); return { ok: true, data: { target_sha256: this.hashOverride ?? 'same' } };
       case 'task_eval': return { ok: true, data: { metrics: { loss: 0.1 } } };
       case 'task_close': return { ok: true, data: {} };
       default: return { ok: false, error: `unknown ${op}` };
@@ -174,5 +174,23 @@ describe('TrainSession', () => {
     const f = fleet(new FakeWorker(1));
     const s = new TrainSession('s', CFG, f.ids, f.rpc); await s.init();
     const p = s.runRound(); await expect(s.runRound()).rejects.toThrow(/serialized/); await p;
+  });
+
+  it('every worker gets the same global progress/h in the after-outer hook (proportional allocation)', async () => {
+    const f = fleet(new FakeWorker(1, 1), new FakeWorker(1, 3));
+    const s = new TrainSession('s', { ...CFG, alloc: 'proportional', target_samples: 40 }, f.ids, f.rpc);
+    await s.init(); await s.runRound(); await s.runRound();
+    const a = f.map.get('w0')!.afterInfo, b = f.map.get('w1')!.afterInfo;
+    expect(a).toEqual(b);
+    expect(a[0]).toEqual({ progress: 4 / 40, h: 2 });           // 8 samples / (batch 2 × 2 workers)
+  });
+
+  it('EMA divergence alarm is fatal by default', async () => {
+    const f = fleet(new FakeWorker(1), new FakeWorker(1));
+    f.map.get('w1')!.hashOverride = 'other';
+    const s = new TrainSession('s', CFG, f.ids, f.rpc);
+    await s.init();
+    await expect(s.runRound()).rejects.toThrow(/stopped on alarm: target encoders diverged/);
+    expect(s.status).toBe('failed');
   });
 });

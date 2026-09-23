@@ -60,3 +60,16 @@ describe('DiLoCo outer loop (matches moregpu_worker.train.diloco)', () => {
     expect(kept.map((x) => x.id)).toEqual(['a']); expect(dropped).toEqual(['b']);
   });
 });
+
+describe('outerStep extras', () => {
+  it('buffers are averaged, not outer-stepped', () => {
+    const st = OuterState.init(new Map([['w', f32([1])], ['buffer:bn.running_var', f32([1])]]));
+    outerStep(st, new Map([['w', f32([0])], ['buffer:bn.running_var', f32([0.1])]]), 0.7, 0.9);
+    expect(st.global.get('buffer:bn.running_var')![0]).toBeCloseTo(0.1, 7);
+  });
+  it('Δ uses the lossy broadcast start when given', () => {
+    const st = OuterState.init(new Map([['w', f32([1.0])]]));
+    outerStep(st, new Map([['w', f32([0.5])]]), 1, 0, new Map([['w', f32([0.75])]]));
+    expect(st.global.get('w')![0]).toBeCloseTo(0.75, 7);      // 1 − (0.75 − 0.5)
+  });
+});

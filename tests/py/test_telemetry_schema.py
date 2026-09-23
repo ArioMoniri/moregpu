@@ -16,11 +16,11 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "ts_emit_telemetry.ts"
 # Field sets emitted by apps/coordinator/lib/train_session.ts emitTelemetry (kept literal on purpose: drift must fail).
 WORKER_ROUND_FIELDS = {
     "schema", "kind", "ts", "session", "task", "round", "worker", "wall_s", "compute_s", "data_s", "serialize_s",
-    "network_s", "wait_s", "bytes_up", "bytes_down", "samples", "samples_seen", "samples_per_s", "loss_last", "amp",
+    "network_s", "wait_s", "bytes_up", "bytes_down", "wire_bytes_up", "wire_bytes_down", "samples", "samples_seen", "samples_per_s", "loss_last", "amp",
     "gpu_util", "gpu_power_w", "energy_j", "mem_peak_bytes", "hw", "wire_error", "git_sha", "config_hash",
 }
 ROUND_FIELDS = {
-    "schema", "kind", "ts", "session", "task", "round", "wall_s", "reduce_s", "workers", "dropped", "samples",
+    "schema", "kind", "ts", "session", "task", "round", "wall_s", "reduce_s", "hook_s", "eval_s", "workers", "dropped", "samples",
     "samples_seen", "avg_last_loss", "lr", "bytes_up", "bytes_down", "alarms", "eval", "monitors", "git_sha", "config_hash",
 }
 TS = "2026-09-23T08:00:00.123Z"
@@ -30,7 +30,7 @@ H64 = "a" * 64
 def worker_round(**over):
     r = {"schema": "moregpu.telemetry/1", "kind": "worker_round", "ts": TS, "session": "s1", "task": "toy", "round": 3,
          "worker": "w0", "wall_s": 1.0, "compute_s": 0.5, "data_s": 0.1, "serialize_s": 0.05, "network_s": 0.2,
-         "wait_s": 0.15, "bytes_up": 1024, "bytes_down": 2048, "samples": 8, "samples_seen": 24, "samples_per_s": 16.0,
+         "wait_s": 0.15, "bytes_up": 1024, "bytes_down": 2048, "wire_bytes_up": 1366, "wire_bytes_down": 2732, "samples": 8, "samples_seen": 24, "samples_per_s": 16.0,
          "loss_last": 0.42, "amp": "bf16", "gpu_util": 88.0, "gpu_power_w": 210.5, "energy_j": 105.2,
          "mem_peak_bytes": 1 << 30, "hw": {"os": "Linux"}, "wire_error": {"max_abs": 0.01, "rel_l2": 0.002},
          "git_sha": "abc123", "config_hash": H64}
@@ -40,7 +40,7 @@ def worker_round(**over):
 
 def round_rec(**over):
     r = {"schema": "moregpu.telemetry/1", "kind": "round", "ts": TS, "session": "s1", "task": "toy", "round": 3,
-         "wall_s": 1.0, "reduce_s": 0.01, "workers": ["w0", "w1"], "dropped": [], "samples": 16, "samples_seen": 48,
+         "wall_s": 1.0, "reduce_s": 0.01, "hook_s": 0.02, "eval_s": 0.0, "workers": ["w0", "w1"], "dropped": [], "samples": 16, "samples_seen": 48,
          "avg_last_loss": 0.4, "lr": 1e-3, "bytes_up": 2048, "bytes_down": 4096, "alarms": [], "eval": {"loss": 0.3},
          "monitors": None, "git_sha": None, "config_hash": H64}
     r.update(over)

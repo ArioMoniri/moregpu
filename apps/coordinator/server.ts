@@ -1744,9 +1744,9 @@ async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
       return json({ ok: true, metrics: await s.evaluate(body.refs ?? [], body.kind ?? 'loss', body.worker) });
     }
     if (action === 'export' && req.method === 'POST') {
-      const body = await req.json().catch(() => ({})) as { fmt?: string; path?: string; worker?: string };
+      const body = await req.json().catch(() => ({})) as { fmt?: string; path?: string; worker?: string; which?: string };
       if (!body.path) return json({ error: 'path required (a path on the worker)' }, 400);
-      return json({ ok: true, ...(await s.export(body.fmt ?? 'safetensors', body.path, body.worker)) });
+      return json({ ok: true, ...(await s.export(body.fmt ?? 'safetensors', body.path, body.worker, body.which)) });
     }
     if (action === 'state' && req.method === 'GET') {
       const dt = (url.searchParams.get('dtype') ?? 'f32') as 'f32' | 'bf16' | 'fp16';

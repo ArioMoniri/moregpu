@@ -6,6 +6,8 @@ tokens). Each is a `TrainTask`, so it runs on one worker or across N workers wit
 ## Model
 
 - **Encoder.** A ViT with 2D or 3D patches: `micro`, `tiny` (192, 12 blocks, 3 heads), `small` or `base`.
+  - Weight decay excludes biases, norm scales and other 1-D parameters.
+  - Mask block sizes are drawn once per batch (as in I-JEPA), so targets are never truncated; the mask RNG depends only on (seed, the batch's sample indices).
   - Its state dict uses **timm-compatible keys**, so an export loads strictly into `timm`'s VisionTransformer
     (`class_token=False, global_pool=''`). This is tested.
   - Positional embedding is fixed sin-cos.
@@ -23,8 +25,12 @@ The EMA target is **only updated after each outer step**, from the freshly synce
 worker. The momentum for a round is the product of the per-step schedule over the steps that round covered:
 
 ```
-m_k = Π m_j        target ← m_k·target + (1 − m_k)·global
+m_k = m(p_k)^{h_k}      target ← m_k·target + (1 − m_k)·global
 ```
+
+`p_k` is the coordinator's round-midpoint progress and `h_k` the number of global optimizer steps in the round, sent
+identically to every worker (so proportional allocation or a worker that ran extra local steps can never make targets
+diverge). The horizon is matched in global optimizer steps, as for DDP with the same global batch.
 
 - With N=1 and H=1 this is exactly per-step I-JEPA. This is tested.
 - Workers report the target's SHA-256 every round. A mismatch raises the "target encoders diverged" alarm, which should
@@ -48,7 +54,7 @@ m_k = Π m_j        target ← m_k·target + (1 − m_k)·global
 
 | Format | Output | Guarantee |
 |---|---|---|
-| `safetensors` | `encoder.safetensors` + `encoder_config.json` | reloads bit-exactly |
+| `safetensors` | `encoder.safetensors` + `encoder_config.json` (`which: target` by default — the EMA encoder, as I-JEPA evaluates; or `context`) | reloads bit-exactly |
 | `torch_export` | `.pt2` | — |
 | `onnx` | `.onnx` | parity probe vs PyTorch ≤ 1e-4 |
 

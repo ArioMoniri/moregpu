@@ -69,6 +69,8 @@
         "ts",
         "wait_s",
         "wall_s",
+        "wire_bytes_down",
+        "wire_bytes_up",
         "wire_error",
         "worker"
       ],
@@ -129,11 +131,23 @@
         },
         "bytes_up": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "raw payload bytes worker\u2192coordinator"
         },
         "bytes_down": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "raw payload bytes coordinator\u2192worker"
+        },
+        "wire_bytes_up": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "encoded (base64) bytes on the sealed relay, worker\u2192coordinator"
+        },
+        "wire_bytes_down": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "encoded (base64) bytes on the sealed relay, coordinator\u2192worker"
         },
         "samples": {
           "type": "integer",
@@ -248,7 +262,9 @@
         "config_hash",
         "dropped",
         "eval",
+        "eval_s",
         "git_sha",
+        "hook_s",
         "kind",
         "lr",
         "monitors",
@@ -294,6 +310,16 @@
         "reduce_s": {
           "type": "number",
           "minimum": 0
+        },
+        "hook_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "after-outer-step hook (e.g. EMA update + collapse monitors), included in workers' wait_s"
+        },
+        "eval_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "periodic evaluation time, included in workers' wait_s"
         },
         "workers": {
           "type": "array",

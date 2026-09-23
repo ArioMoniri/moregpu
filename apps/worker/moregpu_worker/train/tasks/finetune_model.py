@@ -16,9 +16,37 @@ from ...vision import losses as L
 from ..synthetic import SyntheticSeg, SyntheticVolumes
 from ..task import StepReport, TaskContext, Timer, TrainTask
 from .llm_lora import LoRAWrap
-from .vision import _SegDataPlane
+from .vision import _SegDataPlane, _sync
 
 OBJECTIVES = ("classify", "segment", "regress")
+
+
+def apply_label_map(y: torch.Tensor, mapping: dict[int, int]) -> torch.Tensor:
+    """Remap labels through a lookup table (simultaneous, so swaps like {1: 2, 2: 1} work)."""
+    if not mapping:
+        return y
+    lut = torch.arange(max(int(y.max()) + 1, max(mapping) + 1, 1), device=y.device)
+    for a, b in mapping.items():
+        lut[a] = b
+    return lut[y.long()]
+
+
+def _frozen_norms(model: torch.nn.Module) -> list[torch.nn.Module]:
+    """Normalisation layers with no trainable parameters: kept in eval mode (their running stats never change)."""
+    out = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._NormBase):
+            ps = list(m.parameters(recurse=False))
+            if ps and not any(p.requires_grad for p in ps):
+                out.append(m)
+    return out
+
+
+def _sync_buffers(model: torch.nn.Module, frozen: list[torch.nn.Module] = ()) -> dict[str, torch.Tensor]:
+    """Floating buffers of TRAINED layers that must be averaged across workers (BatchNorm running stats);
+    integer counters and frozen layers' buffers are excluded."""
+    skip = {id(b) for m in frozen for b in m.buffers(recurse=False)}
+    return {"buffer:" + k: b for k, b in model.named_buffers() if b.is_floating_point() and id(b) not in skip}
 
 
 class FinetuneModelTask(TrainTask):
@@ -30,7 +58,7 @@ class FinetuneModelTask(TrainTask):
         self.objective = cfg.get("objective", "classify")
         if self.objective not in OBJECTIVES:
             raise ValueError(f"objective must be one of {OBJECTIVES}")
-        self.keep_inner_state = bool(cfg.get("keep_inner_state", False))
+        self.keep_inner_state = bool(cfg.get("keep_inner_state", True))
         self.num_classes = int(cfg.get("num_classes", 2))
         self.label_map = {int(k): int(v) for k, v in (cfg.get("label_map") or {}).items()}
         syn = cfg.get("synthetic")
@@ -64,6 +92,7 @@ class FinetuneModelTask(TrainTask):
         elif mode not in ("all", "head"):
             raise ValueError("trainable must be all | head | lora")
         self.mode = mode
+        self._frozen = _frozen_norms(self.model)
         self.opt_kind, self.wd, self.clip = cfg.get("optimizer", "adamw"), float(cfg.get("weight_decay", 1e-4)), cfg.get("clip_grad")
         n = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         return {"ok": True, "trainable_params": n, "arch": self.spec.get("arch"), "mode": mode}
@@ -77,10 +106,7 @@ class FinetuneModelTask(TrainTask):
 
     def _y(self, refs):
         if self.objective == "segment":
-            y = self.data.masks(refs).clone()
-            for a, b in self.label_map.items():
-                y[y == a] = b
-            return y.to(self.ctx.device)
+            return apply_label_map(self.data.masks(refs), self.label_map).to(self.ctx.device)
         return torch.tensor([self.data.label(r) for r in refs], device=self.ctx.device)
 
     def _crit(self, out, y):
@@ -99,6 +125,8 @@ class FinetuneModelTask(TrainTask):
             raise ValueError("no samples for this worker")
         opt = self.inner_optimizer(self._trainable(), lr, self.opt_kind, self.wd)
         self.model.train()
+        for m in self._frozen:
+            m.eval()
         tm, losses = Timer(), []
         per = max(1, len(batch_refs) // steps)
         for s in range(steps):
@@ -111,17 +139,23 @@ class FinetuneModelTask(TrainTask):
                     out = self.model(x)
                 loss = self._crit(out, y)
                 self.amp.backward_step(loss, opt, clip=self.clip, params=self._trainable())
+                _sync(self.ctx.device)
             losses.append(float(loss.detach())); self.step += 1
         return StepReport(losses, len(batch_refs), tm.t, {"amp": self.amp.mode})
 
     def state_for_sync(self):
-        return {k: p.detach().clone() for k, p in self.model.named_parameters() if p.requires_grad}
+        st = {k: p.detach().clone() for k, p in self.model.named_parameters() if p.requires_grad}
+        st.update({k: b.detach().clone() for k, b in _sync_buffers(self.model, self._frozen).items()})   # BN stats are averaged too
+        return st
 
     def load_sync_state(self, tensors):
         with torch.no_grad():
             for k, p in self.model.named_parameters():
                 if p.requires_grad and k in tensors:
                     p.copy_(tensors[k].reshape(p.shape).to(p.device, p.dtype))
+            for k, b in _sync_buffers(self.model, self._frozen).items():
+                if k in tensors:
+                    b.copy_(tensors[k].reshape(b.shape).to(b.device, b.dtype))
 
     @torch.no_grad()
     def evaluate(self, refs, kind):
@@ -141,6 +175,8 @@ class FinetuneModelTask(TrainTask):
             raise ValueError(f"evaluation {kind!r} not available for objective {self.objective!r}")
         finally:
             self.model.train()
+            for m in self._frozen:
+                m.eval()
 
     def _merged_state(self):
         sd = {k: v for k, v in self.model.state_dict().items() if ".base." not in k and not k.endswith((".A", ".B"))}

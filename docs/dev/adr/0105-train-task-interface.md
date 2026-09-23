@@ -19,7 +19,7 @@ class TrainTask(Protocol):
   (same mechanism as model plugins, ADR-0113). The coordinator can name a task; it can never ship code.
 - `llm_lora` wraps today's `train_load/step/inner/set_adapter/generate` unchanged; `state_for_sync` returns the LoRA A/B
   tensors with identical names, so old and new DiLoCo paths are bit-identical (golden test).
-- The inner optimizer is re-created every round (current DiLoCo semantics) unless the task sets `keep_inner_state`.
+- **Amended after review (2026-09-23):** the inner optimizer state is KEPT across rounds by default (`keep_inner_state: true`, as in DiLoCo — each worker's AdamW moments persist and are never synced); `llm_lora` keeps its legacy fresh-per-round behaviour. `after_outer_step(round, info)` receives coordinator-supplied `{progress, h}`; `extra_state()/load_extra_state()` carry non-synced state (e.g. the JEPA EMA target) through checkpoints.
 
 ## Consequences
 Token-id batches for `llm_lora` stay inline (not refs) to preserve the existing API; vision tasks use refs.

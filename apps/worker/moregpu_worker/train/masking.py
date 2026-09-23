@@ -47,13 +47,18 @@ class MultiBlockMasker:
         m[tuple(slice(st, st + s) for st, s in zip(starts, shape))] = True
         return m.flatten()
 
-    def sample_one(self, g):
-        tshape = self._block_shape(g, self.ts, self.ta)
+    def sample_shapes(self, g):
+        """Block sizes are drawn ONCE per batch (as I-JEPA does), so every sample's target blocks have equal size and
+        nothing is truncated from targets."""
+        return self._block_shape(g, self.ts, self.ta), self._block_shape(g, self.cs, (1.0, 1.0))
+
+    def sample_one(self, g, tshape=None, cshape=None):
+        if tshape is None:
+            tshape, cshape = self.sample_shapes(g)
         targets = [self._place(g, tshape) for _ in range(self.n_targets)]
         union = torch.zeros(self.n, dtype=torch.bool)
         for t in targets:
             union |= t
-        cshape = self._block_shape(g, self.cs, (1.0, 1.0))
         for _ in range(self.max_tries):
             ctx = self._place(g, cshape) & ~union
             if int(ctx.sum()) >= self.min_keep:
@@ -64,11 +69,13 @@ class MultiBlockMasker:
 
     def __call__(self, batch: int, g: torch.Generator):
         ctxs, tgts = [], []
+        tshape, cshape = self.sample_shapes(g)
         for _ in range(batch):
-            c, ts = self.sample_one(g)
+            c, ts = self.sample_one(g, tshape, cshape)
             ctxs.append(c); tgts.append(ts)
         kc = min(len(c) for c in ctxs)
-        kt = min(len(t) for ts in tgts for t in ts)
+        self.last_target_sizes = [len(t) for ts in tgts for t in ts]
+        kt = min(self.last_target_sizes)
         ctx = torch.stack([c[:kc] for c in ctxs])
         targets = [torch.stack([tgts[b][m][:kt] for b in range(batch)]) for m in range(self.n_targets)]
         return ctx, targets

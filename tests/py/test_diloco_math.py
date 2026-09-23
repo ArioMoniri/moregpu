@@ -43,3 +43,10 @@ def test_nonfinite_filter():
     good, bad = ({"w": _t(1)}, 1), ({"w": _t(float("nan"))}, 1)
     kept, dropped = D.drop_nonfinite([("a", *good), ("b", *bad)])
     assert [k for k, *_ in kept] == ["a"] and dropped == ["b"]
+
+
+def test_buffer_tensors_are_plainly_averaged_not_outer_stepped():
+    st = D.OuterState.init({"w": _t(1.0), "buffer:bn.running_var": _t(1.0)})
+    D.outer_step(st, {"w": _t(0.0), "buffer:bn.running_var": _t(0.1)}, lr=0.7, momentum=0.9)
+    assert torch.equal(st.global_["buffer:bn.running_var"], _t(0.1))     # never extrapolated (could go negative)
+    assert not torch.equal(st.global_["w"], _t(0.0))

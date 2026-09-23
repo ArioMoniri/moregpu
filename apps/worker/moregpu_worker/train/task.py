@@ -34,7 +34,7 @@ class StepReport:
 
 class TrainTask(ABC):
     name: str = "abstract"
-    keep_inner_state: bool = False
+    keep_inner_state: bool = True     # DiLoCo keeps each worker's inner optimizer state across rounds (never synced)
 
     def __init__(self) -> None:
         self.ctx: TaskContext | None = None
@@ -55,8 +55,17 @@ class TrainTask(ABC):
     @abstractmethod
     def load_sync_state(self, tensors: dict[str, torch.Tensor]) -> None: ...
 
-    def after_outer_step(self, round: int) -> dict:
+    def after_outer_step(self, round: int, info: dict | None = None) -> dict:
+        """Called on every worker after the new global is loaded. `info` comes from the coordinator and is identical
+        on all workers: {"progress": midpoint of this round in [0,1] or None, "h": global optimizer steps this round}."""
         return {}
+
+    def extra_state(self) -> dict[str, torch.Tensor]:
+        """Non-synced state that a checkpoint must carry (e.g. the JEPA EMA target and step counters)."""
+        return {}
+
+    def load_extra_state(self, tensors: dict[str, torch.Tensor]) -> None:
+        return None
 
     def export(self, fmt: str, path: str) -> dict:
         raise NotImplementedError(f"{self.name} does not export {fmt}")
@@ -81,7 +90,11 @@ class TrainTask(ABC):
     def make_optimizer(self, params, lr: float, kind: str = "adamw", weight_decay: float = 0.0):
         params = [p for p in params if p.requires_grad]
         if kind == "adamw":
-            return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+            # no weight decay on biases / norm scales / 1-D params (I-JEPA, timm convention)
+            decay = [p for p in params if p.ndim >= 2]
+            no_decay = [p for p in params if p.ndim < 2]
+            groups = [g for g in ({"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}) if g["params"]]
+            return torch.optim.AdamW(groups, lr=lr)
         if kind == "sgd":
             return torch.optim.SGD(params, lr=lr)
         raise ValueError(f"unknown optimizer {kind!r}")

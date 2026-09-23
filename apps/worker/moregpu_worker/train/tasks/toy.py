@@ -14,7 +14,7 @@ class ToyLinearTask(TrainTask):
         n, dim = int(cfg.get("n", 64)), int(cfg.get("dim", 5))
         self.batch = int(cfg.get("batch", 4))
         self.kind = cfg.get("optimizer", "sgd")
-        self.keep_inner_state = bool(cfg.get("keep_inner_state", False))
+        self.keep_inner_state = bool(cfg.get("keep_inner_state", True))
         g = torch.Generator().manual_seed(1000 + int(cfg.get("data_seed", 0)))
         w_true = torch.randn(dim, 1, generator=g)
         self.X = torch.randn(n, dim, generator=g)

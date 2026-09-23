@@ -37,6 +37,9 @@ class EmaSchedule:
     def at(self, step: int) -> float:
         return self.m0 + (self.m1 - self.m0) * min(step / self.total, 1.0)
 
+    def at_progress(self, p: float) -> float:
+        return self.m0 + (self.m1 - self.m0) * min(max(p, 0.0), 1.0)
+
     def momentum_between(self, s0: int, s1: int) -> float:
         m = 1.0
         for s in range(s0, s1):
@@ -68,7 +71,7 @@ class _JepaBase(TrainTask):
     def init(self, cfg: dict, ctx: TaskContext) -> dict:
         self.setup(ctx)
         self.cfg = cfg
-        self.keep_inner_state = bool(cfg.get("keep_inner_state", False))
+        self.keep_inner_state = bool(cfg.get("keep_inner_state", True))
         if cfg.get("synthetic"):
             syn = {**cfg["synthetic"]}; syn.setdefault("kind", self.kind)
             self.data = SyntheticVolumes(**syn)
@@ -111,7 +114,7 @@ class _JepaBase(TrainTask):
         self.flip = bool(cfg.get("hflip", False))
         self.monitor_every = int(cfg.get("monitor_every", 1))
         self.std_min, self.rank_min = float(cfg.get("collapse_std_min", 1e-3)), float(cfg.get("collapse_rank_min", 2.0))
-        self.probe_idx = list(range(min(int(cfg.get("probe_batch", 32)), len(self.data))))
+        self.probe_idx = list(range(min(int(cfg.get("probe_batch", 256)), len(self.data))))
         n = sum(p.numel() for p in self.encoder.parameters()) + sum(p.numel() for p in self.predictor.parameters())
         self.info = {"encoder": self.vit_cfg, "params": n, "tokens": self.encoder.num_patches}
         return {"ok": True, "params": n, "tokens": self.encoder.num_patches}
@@ -121,7 +124,11 @@ class _JepaBase(TrainTask):
         return [p for p in list(self.encoder.parameters()) + list(self.predictor.parameters()) if p.requires_grad]
 
     def _gen(self, refs) -> torch.Generator:
-        return torch.Generator().manual_seed((self.ctx.seed * 1_000_003 + self.step * 7919 + int(refs[0])) & 0x7FFFFFFF)
+        """Mask/augmentation RNG derived from (seed, the batch's global sample indices) only — never from a worker-local
+        step counter — so the same batch gets the same masks in every arm and on every worker."""
+        h = hashlib.blake2b(digest_size=8)
+        h.update(str(self.ctx.seed).encode()); h.update(",".join(str(int(r)) for r in refs).encode())
+        return torch.Generator().manual_seed(int.from_bytes(h.digest(), "little") & 0x7FFFFFFFFFFFFFFF)
 
     def _augment(self, x: torch.Tensor, g: torch.Generator) -> torch.Tensor:
         if not self.crop and not self.flip:
@@ -207,8 +214,15 @@ class _JepaBase(TrainTask):
             h.update(k.encode()); h.update(v.detach().float().cpu().numpy().tobytes())
         return h.hexdigest()
 
-    def after_outer_step(self, round: int) -> dict:
-        m = self.ema.momentum_between(self._ema_step, self.step)
+    def after_outer_step(self, round: int, info: dict | None = None) -> dict:
+        """EMA target update from the freshly synced global. With coordinator `info` = {progress, h} the momentum is
+        at_progress(progress)^h — identical on every worker regardless of local step counts (proportional allocation,
+        partial failures). Without info (legacy / ad-hoc use) it falls back to this worker's own step counter."""
+        if info and info.get("progress") is not None:
+            m = self.ema.at_progress(float(info["progress"])) ** float(info.get("h", 1.0))
+            self._global_steps = getattr(self, "_global_steps", 0.0) + float(info.get("h", 1.0))
+        else:
+            m = self.ema.momentum_between(self._ema_step, self.step)
         self._ema_step = self.step
         ema_update(dict(self.target.named_parameters()), dict(self.encoder.named_parameters()), m)
         out = {"target_sha256": self.target_hash(), "ema_momentum": m}
@@ -217,6 +231,23 @@ class _JepaBase(TrainTask):
             out["monitors"] = mon
             out["alarms"] = MON.alarms(mon, self.std_min, self.rank_min)
         return out
+
+    def extra_state(self):
+        st = {"target." + k: v.detach().clone() for k, v in self.target.state_dict().items()}
+        st["_meta.step"] = torch.tensor([float(self.step)])
+        st["_meta.ema_step"] = torch.tensor([float(self._ema_step)])
+        st["_meta.global_steps"] = torch.tensor([float(getattr(self, "_global_steps", 0.0))])
+        return st
+
+    def load_extra_state(self, tensors):
+        with torch.no_grad():
+            for k, v in self.target.state_dict().items():
+                if "target." + k in tensors:
+                    v.copy_(tensors["target." + k].reshape(v.shape).to(v.device, v.dtype))
+        if "_meta.step" in tensors:
+            self.step = int(tensors["_meta.step"].item())
+            self._ema_step = int(tensors["_meta.ema_step"].item())
+            self._global_steps = float(tensors["_meta.global_steps"].item())
 
     # --------------------------------------------------------------- evaluation
     @torch.no_grad()
@@ -248,9 +279,12 @@ class _JepaBase(TrainTask):
         raise ValueError(f"unknown evaluation kind {kind!r} (loss|features|monitors|knn|linear_probe)")
 
     # --------------------------------------------------------------- export
-    def export(self, fmt: str, path: str) -> dict:
+    def export(self, fmt: str, path: str, which: str = "target") -> dict:
+        """which='target' (default; the EMA encoder, as I-JEPA evaluates downstream) or 'context'."""
+        if which not in ("target", "context"):
+            raise ValueError("which must be 'target' or 'context'")
         os.makedirs(path, exist_ok=True)
-        enc = self.encoder.eval()
+        enc = (self.target if which == "target" else self.encoder).eval()
         example = self._to_input(self.data.batch([0, 1]))
         if fmt == "safetensors":
             from safetensors.torch import save_file
@@ -258,12 +292,12 @@ class _JepaBase(TrainTask):
             save_file({k: v.detach().contiguous().cpu() for k, v in enc.state_dict().items()}, w)
             c = os.path.join(path, "encoder_config.json")
             json.dump({k: v for k, v in self.vit_cfg.items()}, open(c, "w"))
-            out = {"format": fmt, "weights": w, "config": c, "sha256": _sha(w)}
+            out = {"format": fmt, "weights": w, "config": c, "sha256": _sha(w), "which": which}
         elif fmt == "torch_export":
             p = os.path.join(path, "encoder.pt2")
             prog = torch.export.export(enc, (example,))
             torch.export.save(prog, p)
-            out = {"format": fmt, "path": p, "sha256": _sha(p)}
+            out = {"format": fmt, "path": p, "sha256": _sha(p), "which": which}
         elif fmt == "onnx":
             p = os.path.join(path, "encoder.onnx")
             torch.onnx.export(enc, (example,), p, input_names=["x"], output_names=["tokens"], opset_version=17,
@@ -278,10 +312,10 @@ class _JepaBase(TrainTask):
                 parity = float(abs(got - ref).max())
             except ImportError:
                 pass
-            out = {"format": fmt, "path": p, "sha256": _sha(p), "parity_max_abs": parity}
+            out = {"format": fmt, "path": p, "sha256": _sha(p), "parity_max_abs": parity, "which": which}
         else:
             raise ValueError(f"unknown export format {fmt!r} (safetensors|torch_export|onnx)")
-        self.encoder.train()
+        self.encoder.train(); self.target.eval()
         return out
 
     def describe(self) -> dict:

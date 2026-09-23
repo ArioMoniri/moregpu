@@ -30,11 +30,18 @@ export function weightedAverage(items: Weighted[]): Tensors {
   return out;
 }
 
-export function outerStep(st: OuterState, avg: Tensors, lr: number, mom: number): OuterState {
+/** Running statistics (e.g. BatchNorm buffers) are averaged and never outer-stepped (extrapolation could make a variance negative). */
+export const BUFFER_PREFIX = 'buffer:';
+
+export function outerStep(st: OuterState, avg: Tensors, lr: number, mom: number, start?: Tensors): OuterState {
   for (const [k, g] of st.global) {
+    if (k.startsWith(BUFFER_PREFIX)) { g.set(avg.get(k)!); continue; }
+    // Δ is taken from where the workers actually started (the decoded broadcast when it was lossy, e.g. bf16),
+    // so the broadcast rounding residual is not fed into the outer momentum every round.
+    const s0 = start?.get(k);
     const v = st.momentum.get(k)!, a = avg.get(k)!;
     for (let i = 0; i < g.length; i++) {
-      const d = Math.fround(g[i]! - a[i]!);
+      const d = Math.fround((s0 ? s0[i]! : g[i]!) - a[i]!);
       v[i] = Math.fround(Math.fround(mom * v[i]!) + d);
       g[i] = Math.fround(g[i]! - Math.fround(lr * Math.fround(d + Math.fround(mom * v[i]!))));
     }

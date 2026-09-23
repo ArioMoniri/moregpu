@@ -4,7 +4,8 @@
 
 ## Decision
 - **Synced state:** online (context) encoder + predictor. **Target encoder is never transmitted.**
-- **EMA timing:** the target is updated only in `after_outer_step`, from the new global:
+- **Amended after review (2026-09-23):** the per-round momentum is `m(p)^h` where `p` is the coordinator's round-midpoint progress (samples_seen/target_samples or round/max_rounds) and `h` = round samples / (batch × workers) = global optimizer steps this round — identical on every worker regardless of local step counts (proportional allocation, partial failures), so targets can never diverge. The EMA horizon is therefore matched in GLOBAL optimizer steps (large-batch view, same as DDP), not in samples; the study matches the global batch across arms. Downstream uses the TARGET encoder (`export(which='target')`, I-JEPA practice). Divergence of target hashes is a fatal alarm (`stop_on_alarm`).
+- **EMA timing (original text):** the target is updated only in `after_outer_step`, from the new global:
   `target ← m_k·target + (1−m_k)·global`, identical on every worker. The per-outer-step momentum is derived from the usual
   per-step schedule as `m_k = Π_{j∈round k} m_j` (≈ `m^H`), so the effective averaging horizon in samples matches
   single-process I-JEPA. With N=1, H=1, η=1, μ=0 this is exactly per-step I-JEPA (equivalence test).

@@ -10,6 +10,7 @@
   (e.g. norm running stats, averaged); integer buffers (`num_batches_tracked`) are not averaged.
 - **Average:** weighted by samples seen this round, `w_i = s_i / Σ s`; equal weights reproduce today's mean exactly.
   Non-finite drop and broadcast-failure drop kept.
+- **Amended after review:** floating buffers (BatchNorm running stats, prefix `buffer:`) are plainly averaged and never outer-stepped; frozen norm layers stay in eval mode and are not synced. With a lossy broadcast (bf16/fp16) Δ is taken from the decoded broadcast the workers actually started from. Telemetry bytes are raw payload bytes (base64 wire bytes reported separately); worker-side decode/apply time counts as serialise; after-outer hook and eval time are reported per round (`hook_s`, `eval_s`).
 - **Outer step:** unchanged Nesterov math (`v = μv + Δ; θ -= η(Δ + μv)`), fp32 state on the coordinator; η=1, μ=0
   reduces to plain averaging (tested).
 - **Payload:** new sealed binary tensor stream (`tensor_begin/chunk/end`, raw little-endian bytes, 4 MiB chunks, per-tensor

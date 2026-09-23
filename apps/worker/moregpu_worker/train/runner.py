@@ -45,10 +45,12 @@ class TaskRunner:
         self._global.pop(sid, None); self._out.pop(sid, None); self._in.pop(sid, None)
         return {"ok": True, "describe": t.describe(), "info": getattr(t, "info", None)}
 
-    def _encode_out(self, sid: str, dtype: str, chunk_bytes: int) -> dict:
+    def _encode_out(self, sid: str, dtype: str, chunk_bytes: int, which: str = "sync") -> dict:
         t = self.sessions.get(sid)
         t0 = time.perf_counter()
-        state = t.state_for_sync()
+        state = t.state_for_sync() if which == "sync" else t.extra_state()
+        if which == "extra":
+            dtype = "f32"                                    # checkpoint state is always lossless
         if dtype == "int8delta" and sid not in self._global:
             raise ValueError("int8delta needs a previously applied global on this worker (push the global first)")
         hdr, blob = tw.encode(state, dtype, ref=self._global.get(sid))
@@ -89,7 +91,8 @@ class TaskRunner:
         return {"ok": True, "report": rep.to_json(), "step": t.step, **out}
 
     def _task_state_get(self, p):
-        out = self._encode_out(p["session"], p.get("dtype", "f32"), int(p.get("chunk_bytes", DEFAULT_CHUNK)))
+        out = self._encode_out(p["session"], p.get("dtype", "f32"), int(p.get("chunk_bytes", DEFAULT_CHUNK)),
+                               p.get("which", "sync"))
         return {"ok": True, **out}
 
     def _task_state_chunk(self, p):
@@ -105,7 +108,7 @@ class TaskRunner:
         if k == 0:
             if not p.get("header"):
                 raise ValueError("first chunk must carry the payload header")
-            self._in[sid] = {"header": p["header"], "parts": [], "n": n}
+            self._in[sid] = {"header": p["header"], "parts": [], "n": n, "which": p.get("which", "sync")}
         st = self._in.get(sid)
         if st is None or len(st["parts"]) != k or st["n"] != n:
             self._in.pop(sid, None)
@@ -116,19 +119,27 @@ class TaskRunner:
         self._in.pop(sid, None)
         t0 = time.perf_counter()
         blob = tw.join(st["parts"], st["header"]["sha256"])
+        if st.get("which") == "extra":
+            self.sessions.get(sid).load_extra_state(tw.decode(st["header"], blob))
+            return {"ok": True, "applied": True, "deserialize_s": time.perf_counter() - t0}
         tensors = tw.decode(st["header"], blob, ref=self._global.get(sid))
         self.sessions.get(sid).load_sync_state(tensors)
         self._global[sid] = {kk: v.clone() for kk, v in tensors.items()}
         return {"ok": True, "applied": True, "deserialize_s": time.perf_counter() - t0}
 
     def _task_after_outer(self, p):
-        return {"ok": True, **(self.sessions.get(p["session"]).after_outer_step(int(p.get("round", 0))) or {})}
+        t0 = time.perf_counter()
+        info = {"progress": p.get("progress"), "h": p.get("h", 1.0)} if "progress" in p else None
+        out = self.sessions.get(p["session"]).after_outer_step(int(p.get("round", 0)), info) or {}
+        return {"ok": True, **out, "hook_s": time.perf_counter() - t0}
 
     def _task_eval(self, p):
         return {"ok": True, "metrics": self.sessions.get(p["session"]).evaluate(p.get("refs", []), p.get("kind", "loss"))}
 
     def _task_export(self, p):
-        return {"ok": True, **self.sessions.get(p["session"]).export(p.get("fmt", "safetensors"), p["path"])}
+        t = self.sessions.get(p["session"])
+        kw = {"which": p["which"]} if p.get("which") else {}
+        return {"ok": True, **t.export(p.get("fmt", "safetensors"), p["path"], **kw)}
 
     def _task_describe(self, p):
         return {"ok": True, "describe": self.sessions.get(p["session"]).describe()}

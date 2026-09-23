@@ -285,9 +285,12 @@ class MoreGPU:
             body["worker"] = worker
         return self._req(f"/train/sessions/{sid}/eval", "POST", body).get("metrics", {})
 
-    def train_session_export(self, sid: str, fmt: str, path: str, worker: str | None = None) -> dict:
-        """Export on a worker (fmt: safetensors | torch_export | onnx). `path` is a directory ON THE WORKER."""
+    def train_session_export(self, sid: str, fmt: str, path: str, worker: str | None = None, which: str | None = None) -> dict:
+        """Export on a worker (fmt: safetensors | torch_export | onnx). `path` is a directory ON THE WORKER.
+        JEPA: which='target' (default, the EMA encoder used downstream) | 'context'."""
         body: dict[str, Any] = {"fmt": fmt, "path": path}
+        if which:
+            body["which"] = which
         if worker:
             body["worker"] = worker
         return self._req(f"/train/sessions/{sid}/export", "POST", body)

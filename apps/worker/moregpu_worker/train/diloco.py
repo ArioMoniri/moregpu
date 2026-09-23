@@ -49,8 +49,14 @@ class OuterState:
         return cls(g, {k: torch.zeros_like(v) for k, v in g.items()}, 0)
 
 
+BUFFER_PREFIX = "buffer:"   # running statistics (e.g. BatchNorm): averaged, never outer-stepped
+
+
 def outer_step(st: OuterState, avg: Tensors, lr: float, momentum: float) -> OuterState:
     for k, g in st.global_.items():
+        if k.startswith(BUFFER_PREFIX):
+            g.copy_(avg[k].to(torch.float32))
+            continue
         d = g - avg[k].to(torch.float32)
         v = st.momentum[k]
         v.mul_(momentum).add_(d)
