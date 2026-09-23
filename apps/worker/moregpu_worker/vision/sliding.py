@@ -146,16 +146,25 @@ def merge_parts(parts: list[dict], shape, roi) -> torch.Tensor:
     return out
 
 
-def predict(x: torch.Tensor, model: Callable, roi=None, overlap: float = 0.5, sw_batch: int = 4,
-            mode: str = "gaussian", tta: str = "none") -> torch.Tensor:
-    run = (lambda t: sliding_window(t, roi, sw_batch, model, overlap, mode)) if roi else model
-    y = run(x)
-    if tta == "flip":
-        n = 1
-        for d in range(2, x.dim()):
-            y = y + torch.flip(run(torch.flip(x, [-(x.dim() - d)])), [-(x.dim() - d)])
-            n += 1
-        y = y / n
-    elif tta not in ("none", None):
+def tta_flips(x_dim: int, tta: str) -> list[list[int]]:
+    """Flip sets for test-time augmentation: identity plus one flip per spatial axis (MONAI/nnU-Net style)."""
+    if tta in ("none", None):
+        return [[]]
+    if tta != "flip":
         raise ValueError(f"unknown tta {tta!r}")
-    return y
+    return [[]] + [[-(x_dim - d)] for d in range(2, x_dim)]
+
+
+def predict(x: torch.Tensor, model: Callable, roi=None, overlap: float = 0.5, sw_batch: int = 4,
+            mode: str = "gaussian", tta: str = "none", average: str = "logits") -> torch.Tensor:
+    """average='probs' softmaxes each augmented prediction before averaging (MONAI / nnU-Net practice for
+    segmentation); 'logits' averages raw outputs (for regression / feature outputs)."""
+    run = (lambda t: sliding_window(t, roi, sw_batch, model, overlap, mode)) if roi else model
+    post = (lambda t: torch.softmax(t.float(), 1)) if average == "probs" else (lambda t: t)
+    flips = tta_flips(x.dim(), tta)
+    y = None
+    for f in flips:
+        out = post(run(torch.flip(x, f) if f else x))
+        out = torch.flip(out, f) if f else out
+        y = out if y is None else y + out
+    return y / len(flips)

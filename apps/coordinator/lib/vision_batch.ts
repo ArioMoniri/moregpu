@@ -91,7 +91,7 @@ export class VisionBatch {
     let live = [...this.workers];
     for (let idx = 0; idx < this.items.length && !this.cancelled; idx++) {
       const it = this.items[idx]!; const t = this.now(); const n = live.length;
-      const base = { id: this.model, ref: it.ref, overlap: this.o.overlap ?? 0.5, sw_batch: this.o.sw_batch ?? 8, blend: this.o.blend ?? 'gaussian', normalize: this.o.normalize };
+      const base = { id: this.model, ref: it.ref, tta: this.o.tta ?? 'none', overlap: this.o.overlap ?? 0.5, sw_batch: this.o.sw_batch ?? 8, blend: this.o.blend ?? 'gaussian', normalize: this.o.normalize };
       const parts: Array<Record<string, unknown> | undefined> = new Array(n);
       let err = '';
       await Promise.all(Array.from({ length: n }, async (_, k) => {

@@ -99,6 +99,14 @@ class Block(nn.Module):
         return x + self.mlp(self.norm2(x))
 
 
+def _rescale_blocks(blocks) -> None:
+    """I-JEPA's fix_init_weight: scale residual-branch output projections by 1/sqrt(2·layer)."""
+    with torch.no_grad():
+        for i, blk in enumerate(blocks):
+            blk.attn.proj.weight.div_(math.sqrt(2.0 * (i + 1)))
+            blk.mlp.fc2.weight.div_(math.sqrt(2.0 * (i + 1)))
+
+
 def _init(m):
     if isinstance(m, nn.Linear):
         nn.init.trunc_normal_(m.weight, std=0.02)
@@ -120,6 +128,7 @@ class VisionTransformer(nn.Module):
         self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
         self.grad_checkpointing = grad_checkpointing
         self.apply(_init)
+        _rescale_blocks(self.blocks)
 
     def forward(self, x, keep: torch.Tensor | None = None):
         x = self.patch_embed(x) + self.pos_embed
@@ -143,6 +152,7 @@ class Predictor(nn.Module):
         self.grad_checkpointing = grad_checkpointing
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.apply(_init)
+        _rescale_blocks(self.blocks)
 
     def forward(self, z, ctx_idx, tgt_idx: list[torch.Tensor]):
         """z: (B, Kc, D) context features; ctx_idx (B, Kc); tgt_idx: M tensors (B, Kt). Returns (M·B, Kt, D)."""

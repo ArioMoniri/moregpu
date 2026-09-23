@@ -74,3 +74,13 @@ def test_tile_parts_with_padding_small_volume():
         got = SW.merge_parts([SW.sliding_window_part(x, (8, 8, 8), 2, conv, 0.25, "constant", part=(k, 2)) for k in range(2)],
                              x.shape, (8, 8, 8))
     assert torch.allclose(got, ref, atol=1e-5)
+
+
+def test_tta_can_average_probabilities():
+    conv = _conv(2)
+    x = torch.randn(1, 1, 16, 16)
+    with torch.no_grad():
+        y = SW.predict(x, conv, roi=None, tta="flip", average="probs")
+        sm = lambda t: torch.softmax(t, 1)
+        ref = (sm(conv(x)) + torch.flip(sm(conv(torch.flip(x, [-1]))), [-1]) + torch.flip(sm(conv(torch.flip(x, [-2]))), [-2])) / 3
+    assert torch.allclose(y, ref, atol=1e-6) and torch.allclose(y.sum(1), torch.ones(1, 16, 16), atol=1e-5)
