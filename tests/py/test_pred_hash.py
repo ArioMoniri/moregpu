@@ -19,7 +19,7 @@ G = json.loads((Path(__file__).parents[1] / "goldens" / "pred_sha256.json").read
 
 @pytest.mark.parametrize("case", G["cases"], ids=[c["name"] for c in G["cases"]])
 def test_golden_cases(case):
-    a = np.asarray(case["labels"], dtype=np.int64).reshape(case["shape"])
+    a = np.asarray(case["labels"], dtype=np.int64).reshape(tuple(case["shape"]))
     assert P.label_dtype(a) == case["dtype"]
     assert P.preimage(a).hex() == case["preimage_hex"]
     assert P.pred_sha256(a) == case["sha256"]

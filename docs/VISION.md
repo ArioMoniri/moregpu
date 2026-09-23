@@ -35,6 +35,36 @@ Every ✅ cell has an automated test (unit, e2e or real-adapter), named in the l
 | **Data plane**: file:// under roots, https / public buckets with sha256, pushed:// blobs; NumPy, NIfTI, DICOM, PNG/JPEG/TIFF | ✅ | pushed tensors only | pushed tensors only, kept in memory | `tests/py/test_data_*.py`, `tests/e2e/data_plane_jepa.py` |
 | **Telemetry** (compute/data/serialise/network/wait, bytes, GPU util, energy, AMP) | ✅ | job-level | job-level | `tests/py/test_telemetry_*.py` |
 
+### Prediction hashes (`pred_sha256`)
+
+Every predicted label volume is reported with a `pred_sha256`. Two workers that predict the same labels report the same
+hash, so a study can check voxel agreement across workers, and across the torch and WebGPU paths, without reading the
+outputs.
+
+| Where | Labels that are hashed |
+|---|---|
+| `vision_predict`, `vision_merge_write` (worker results); `/vision/batch` job records, cases and `split: "tiles"` | the label map written to `MOREGPU_OUTPUT_DIR`, also returned as `pred_dtype` |
+| `/vision/infer`, each `/vision/infer_batch` output (segment / classify models) | argmax over the class axis of the returned `[B, C, …]` output, computed by the coordinator for torch and WebGPU replies alike (`pred_shape` = `[B, …]`) |
+
+The hash is SHA-256 over this preimage (version `moregpu.pred/1`):
+
+```
+b"moregpu.pred/1\n" + DTYPE + b"\n" + SHAPE + b"\n" + LABELS
+```
+
+- `DTYPE` is `uint8` if every label is ≤ 255 (also for an empty volume), else `uint16`. Labels above 65535, negative
+  labels and non-integer values are refused.
+- `SHAPE` is the label volume's shape as decimal integers joined by `,`, with no spaces (`""` for a 0-d scalar).
+- `LABELS` are the labels in C order (last axis fastest), little-endian, 1 or 2 bytes each.
+- Labels from logits are the argmax over axis 1: the first maximum wins a tie, and a NaN counts as the maximum (as in
+  `torch.argmax`).
+
+The dtype depends only on the label values, so the hash depends only on the labels and their shape. Label maps are
+written as `uint8`, or `uint16` once a label exceeds 255 (earlier versions wrapped such labels to `uint8`). The Python
+(`moregpu_worker/vision/pred_hash.py`) and TypeScript (`apps/coordinator/lib/pred_hash.ts`) implementations are both
+checked against `tests/goldens/pred_sha256.json`, which `tests/goldens/make_pred_golden.py` builds with `hashlib` only.
+A worker-reported `pred_sha256` that is not 64 lowercase hex characters is recorded as `null`.
+
 ### Why training is native-only
 
 Training needs autograd plus optimiser state. The WGSL executor only runs the forward pass, which is enough for inference and

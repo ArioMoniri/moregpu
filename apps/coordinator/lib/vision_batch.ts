@@ -4,6 +4,17 @@
 // idle worker duplicates ("steals") the oldest in-flight item that has been running longer than stealAfterMs — the first
 // result wins, so one slow node never sets the batch's wall time.
 
+import { cleanPredSha } from './pred_hash.ts';
+
+/** Worker-reported label hashes are untrusted: keep a 64-hex pred_sha256 and a known pred_dtype, null anything else. */
+export function sanitizePred(data: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!data) return data;
+  const out = { ...data };
+  if ('pred_sha256' in out) out.pred_sha256 = cleanPredSha(out.pred_sha256) ?? null;
+  if ('pred_dtype' in out) out.pred_dtype = out.pred_dtype === 'uint8' || out.pred_dtype === 'uint16' ? out.pred_dtype : null;
+  return out;
+}
+
 export interface RpcResult { ok: boolean; data?: Record<string, unknown>; error?: string }
 export type Rpc = (workerId: string, op: string, payload: Record<string, unknown>) => Promise<RpcResult>;
 export interface BatchItem { ref?: unknown; out?: string; mask?: unknown; [k: string]: unknown }
@@ -72,7 +83,7 @@ export class VisionBatch {
       if (r.ok) {
         this.finished.add(idx); this.inflight.delete(idx); consecutive = 0;
         this.perWorker.set(w, (this.perWorker.get(w) ?? 0) + 1);
-        this.results.push({ index: idx, worker: w, ok: true, data: r.data, attempts: this.attempts[idx]!, ms: this.now() - t });
+        this.results.push({ index: idx, worker: w, ok: true, data: sanitizePred(r.data), attempts: this.attempts[idx]!, ms: this.now() - t });
         continue;
       }
       consecutive++;
@@ -115,7 +126,7 @@ export class VisionBatch {
       const mw = live[0]!;
       const r = await this.rpc(mw, 'vision_merge_write', { id: this.model, parts, out: it.out, mask: it.mask });
       const lat = (this.now() - t) / 1000;
-      this.results.push(r.ok ? { index: idx, worker: mw, ok: true, data: { ...r.data, latency_s: lat, n_parts: n }, attempts: 1, ms: lat * 1000 }
+      this.results.push(r.ok ? { index: idx, worker: mw, ok: true, data: { ...sanitizePred(r.data), latency_s: lat, n_parts: n }, attempts: 1, ms: lat * 1000 }
         : { index: idx, worker: mw, ok: false, error: r.error, attempts: 1 });
     }
   }

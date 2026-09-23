@@ -1,6 +1,7 @@
 """Worker-side vision inference (ADR-0112): load exported MoreGPU models (segment/classify exports or JEPA encoder
 exports), run a tensor forward, or predict a whole volume from a data-plane ref with sliding window + flip TTA and write
-the label map to MOREGPU_OUTPUT_DIR. Adapter-loaded third-party models (moregpu_worker.vision.adapters) register into the
+the label map to MOREGPU_OUTPUT_DIR. Label maps are uint8, or uint16 when a label exceeds 255, and every written map is
+reported with its ``pred_sha256`` (moregpu.pred/1, see pred_hash.py). Adapter-loaded third-party models (moregpu_worker.vision.adapters) register into the
 same store via `put`."""
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from . import losses as L
+from . import pred_hash as PH
 from .sliding import predict as sw_predict, sliding_window_part, merge_parts, tta_flips
 from .. import paths
 from .models import load_exported
@@ -160,9 +162,9 @@ class InferenceStore:
                    "flips": fl_parts}
         else:
             Z = vol.shape[0]; z0, z1 = (Z * k) // n, (Z * (k + 1)) // n
-            labels = self._predict_2p5d(m, vol, range(z0, z1), p.get("tta", "none"), int(p.get("sw_batch", 8)))
+            labels = PH.canonical_labels(self._predict_2p5d(m, vol, range(z0, z1), p.get("tta", "none"), int(p.get("sw_batch", 8))))
             out = {"ok": True, "kind": "2p5d", "k": k, "n": n, "n_units": z1 - z0, "z0": z0, "vol_shape": list(vol.shape),
-                   "labels_shape": list(labels.shape), "labels": _b64(labels.astype(np.uint8))}
+                   "labels_shape": list(labels.shape), "labels_dtype": PH.label_dtype(labels), "labels": _b64(labels)}
         out["timings"] = {"data_s": t1 - t0, "compute_s": time.perf_counter() - t1}
         return out
 
@@ -184,12 +186,15 @@ class InferenceStore:
                 pr = torch.softmax(lg, 1)
                 pr = torch.flip(pr, f) if f else pr
                 probs = pr if probs is None else probs + pr
-            pred = (probs / n_fl)[0].argmax(0).numpy().astype(np.uint8)
+            pred = PH.canonical_labels((probs / n_fl)[0].argmax(0))
         else:
-            pred = np.concatenate([_unb64(q["labels"], np.uint8, q["labels_shape"]) for q in parts if q["n_units"]], axis=0)
+            dts = {"uint8": np.uint8, "uint16": "<u2"}
+            pred = PH.canonical_labels(np.concatenate([_unb64(q["labels"], dts[q.get("labels_dtype", "uint8")], q["labels_shape"])
+                                                       for q in parts if q["n_units"]], axis=0))
         out_path = self._out_path(p["out"] + (".npy" if not p["out"].endswith(".npy") else ""))
         np.save(out_path, pred)
-        res = {"ok": True, "path": out_path, "shape": list(pred.shape), "n_parts": len(parts)}
+        res = {"ok": True, "path": out_path, "shape": list(pred.shape), "n_parts": len(parts),
+               "pred_sha256": PH.pred_sha256(pred), "pred_dtype": PH.label_dtype(pred)}
         if p.get("mask"):
             gt = torch.as_tensor(np.asarray(self.plane.read(Ref.from_json(p["mask"]))).astype(np.int64))
             d = L.dice_per_class(torch.from_numpy(pred.astype(np.int64))[None, None], gt[None, None], m["meta"]["num_classes"])[0]
@@ -234,9 +239,10 @@ class InferenceStore:
         else:
             pred = torch.from_numpy(self._predict_2p5d(m, vol, range(vol.shape[0]), tta, sw_batch))
         t2 = time.perf_counter()
-        pred_np = pred.cpu().numpy().astype(np.uint8)
+        pred_np = PH.canonical_labels(pred)          # uint8, or uint16 above 255 classes (never wrapped)
         np.save(out_path, pred_np)
         res = {"ok": True, "path": out_path, "shape": list(pred_np.shape),
+               "pred_sha256": PH.pred_sha256(pred_np), "pred_dtype": PH.label_dtype(pred_np),
                "timings": {"data_s": t1 - t0, "compute_s": t2 - t1, "write_s": time.perf_counter() - t2}}
         if p.get("mask"):
             gt = torch.as_tensor(np.asarray(self.plane.read(Ref.from_json(p["mask"]))).astype(np.int64))

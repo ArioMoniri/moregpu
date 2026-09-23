@@ -18,6 +18,7 @@
  * worker pin (MOREGPU_PIN). Set MOREGPU_INSECURE=1 to opt back into plaintext ws:// for a simple local/CI run.
  */
 import { VisionBatch, type BatchItem } from './lib/vision_batch.ts';
+import { predFromLogitsB64 } from './lib/pred_hash.ts';
 import {
   fleetWants, exampleShape, inferCall, makeFleetRpc, pushVisionArtifact, bytesFromB64, parityReport,
   type Fleet, type TensorB64, type VisionIO, type WorkerKind,
@@ -1802,6 +1803,11 @@ const modelRpcById: Rpc = (id, op, payload) => {
   return modelRPC(w, op, payload);
 };
 const holderKind = (m: VisionHolder) => (w: string): WorkerKind | undefined => m.kinds[w] ?? (isTorchWorker(w) ? 'torch' : workers.has(w) ? 'webgpu' : undefined);
+// pred_sha256 (moregpu.pred/1, lib/pred_hash.ts) of a segment/classify output: argmax over the class axis, hashed with
+// its shape — the same for torch and WebGPU replies (WebGPU workers return logits, so the labels are derived here)
+const predOf = async (m: VisionHolder, o: { shape?: number[]; data?: unknown } | null | undefined) =>
+  o && (m.meta?.task === 'segment' || m.meta?.task === 'classify') && Array.isArray(o.shape) && typeof o.data === 'string'
+    ? (await predFromLogitsB64(o.data, o.shape)) ?? {} : {};
 const sameShape = (a: number[] | undefined, b: number[] | undefined) => !!a && !!b && a.length === b.length && a.every((v, i) => v === Number(b[i]));
 async function visionRoute(req: Request, url: URL): Promise<Response> {
   const parts = url.pathname.split('/').filter(Boolean);   // ['vision', action, id?]
@@ -1898,7 +1904,7 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
       const call = inferCall(k, body.id!, { shape: body.shape ?? [], data: body.data ?? '' }, m.io);
       if (k === 'torch' && body.pool) call.payload.pool = body.pool;
       const r = await makeFleetRpc(kind, tsRpc, modelRpcById, m.io)(w, call.op, call.payload);
-      return r.ok ? json({ ok: true, worker: w, ...r.data }) : json({ error: r.error }, 502);
+      return r.ok ? json({ ok: true, worker: w, ...r.data, ...(await predOf(m, r.data as { shape?: number[]; data?: unknown })) }) : json({ error: r.error }, 502);
     }
     if (action === 'infer_batch' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string; inputs?: TensorB64[]; workers?: string[]; check_parity?: boolean; reference?: string; steal_after_ms?: number; max_attempts?: number };
@@ -1921,10 +1927,10 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
       });
       const r = await job.run();
       const byIdx = new Map(job.results.map((x) => [x.index, x]));
-      const outputs = body.inputs.map((_, i) => {
+      const outputs = await Promise.all(body.inputs.map(async (_, i) => {
         const x = byIdx.get(i);
-        return x?.ok ? { ...(x.data as Record<string, unknown>), worker: x.worker, ms: x.ms } as unknown as TensorB64 & { worker?: string } : null;
-      });
+        return x?.ok ? { ...(x.data as Record<string, unknown>), ...(await predOf(m, x.data as { shape?: number[]; data?: unknown })), worker: x.worker, ms: x.ms } as unknown as TensorB64 & { worker?: string } : null;
+      }));
       const failed = job.results.filter((x) => !x.ok).map((x) => ({ index: x.index, worker: x.worker, error: x.error }));
       let parity: ReturnType<typeof parityReport> | undefined;
       if (body.check_parity) {
