@@ -25,3 +25,10 @@ def pytest_collection_modifyitems(config, items):
 def pytest_configure(config):
     for m in ("gpu: needs any accelerator", "cuda: needs CUDA", "webgpu: needs WebGPU", "slow: long-running"):
         config.addinivalue_line("markers", m)
+
+
+@pytest.fixture(autouse=True)
+def _output_dir(tmp_path, monkeypatch):
+    """Exports are confined to MOREGPU_OUTPUT_DIR (moregpu_worker.paths): unit tests write under their tmp_path."""
+    monkeypatch.setenv("MOREGPU_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.delenv("MOREGPU_MODEL_ROOTS", raising=False)

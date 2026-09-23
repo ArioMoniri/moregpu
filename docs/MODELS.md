@@ -11,7 +11,7 @@ When a model is available in several forms, use the first one in this list that 
 
 | # | `format` | Loaded with | Trainable | Notes |
 |---|----------|-------------|-----------|-------|
-| 1 | `state_dict` | `torch.load(path, map_location="cpu", weights_only=True)` | yes | `.pt` / `.pth`. You must name an architecture (`arch`). |
+| 1 | `state_dict` | `torch.load(path, map_location="cpu", weights_only=True)` | yes | `.pt` / `.pth`. You must name an architecture (`arch`). Needs `torch>=2.6`. |
 | 1 | `safetensors` | `safetensors.torch.load_file` | yes | Needs `arch`. Preferred over `state_dict` when both exist. |
 | 2 | `plugin` | an allowlisted `moregpu.models` entry point | yes | For architectures that no registry covers (see below). |
 | 3 | `torch_export` | `torch.export.load` after a pickle pre-check | no | `.pt2` from `torch.export.save`. |
@@ -71,7 +71,7 @@ The schema is [`docs/model-spec.schema.json`](model-spec.schema.json). It is gen
 | Field | Rules |
 |-------|-------|
 | `format` | One of the six formats above. |
-| `source` | One of:<br>• `hf://org/repo[@rev]/file`: downloads one file through `huggingface_hub`.<br>• `https://…`: **requires `sha256`**. The download is cached by content under `MOREGPU_MODEL_CACHE`.<br>• `pushed://<id>`: a blob the coordinator pushed into `MOREGPU_PUSHED_DIR`. **Requires `sha256`**.<br>• `file:///path`: allowed only under `MOREGPU_MODEL_ROOTS` (`os.pathsep`-separated). Symlinks are resolved first.<br>Every format except `plugin` requires a `source`. |
+| `source` | One of:<br>• `hf://org/repo[@rev]/file`: downloads one file through `huggingface_hub`. It must be immutable: **either `sha256` is set, or `rev` is a full 40-hex commit id**. A branch or tag (`@main`, `@v1.0`) or no `rev` without a `sha256` is refused.<br>• `https://…`: **requires `sha256`**. The host must be in `MOREGPU_MODEL_HOSTS` (see [Worker environment](#worker-environment)); every redirect hop is re-checked and the body is capped at `MOREGPU_MODEL_MAX_BYTES`. The download is cached by content under `MOREGPU_MODEL_CACHE`.<br>• `pushed://<id>`: a blob pushed to this worker with `/data/push` (`blob_begin/chunk/end`, docs/VISION.md). Only a fully received blob whose size and sha256 were verified at `blob_end` resolves, and its sha256 must equal the spec's. **Requires `sha256`**.<br>• `file:///path`: allowed only under `MOREGPU_MODEL_ROOTS` (`os.pathsep`-separated). Symlinks are resolved first.<br>Every format except `plugin` requires a `source`. |
 | `sha256` | The worker hashes every artefact and checks it **before opening it**. On a mismatch it refuses with `IntegrityError`. |
 | `arch` | Required for `state_dict`, `safetensors` and `plugin`. For `plugin`, `registry` must be `"plugin"`. |
 | `dtype` | `float32` (default), `float16` or `bfloat16`. Applies to native modules. |
@@ -81,6 +81,13 @@ The schema is [`docs/model-spec.schema.json`](model-spec.schema.json). It is gen
 | `licence`, `citation` | Reported by `describe()`. Keep the author's licence and citation with their model. |
 
 ## Refusal policy
+
+**The worker needs `torch>=2.6`.** On torch 2.5.1 and older, `torch.load(weights_only=True)` can be bypassed to run
+code (CVE-2025-32434), so the pickle ban below means nothing there. `apps/worker/pyproject.toml` requires `torch>=2.6`,
+and the adapters check `torch.__version__` at load time: on an older torch they refuse (`RefusedFormat`) `state_dict`
+`.pt`/`.pth` files, `torch_export` `.pt2` archives and `torchscript` archives. A pre-release of 2.6.0 (for example
+`2.6.0.dev…` or `2.6.0a0+git…`) counts as older, and so does a version string the worker cannot parse. `safetensors`
+and `onnx` still load, because they never go through `torch.load`.
 
 The worker refuses (`RefusedFormat`) any artefact that would require unpickling arbitrary objects. This includes:
 
@@ -99,7 +106,10 @@ refuses any `.pt2` that has:
 
 - pickled payloads;
 - non-tensor constants;
-- an embedded `torch.save`/pickle member that does not load with `weights_only=True`.
+- an embedded `torch.save`/pickle member that does not load with `weights_only=True`;
+- a member bigger than `MOREGPU_PT2_MEMBER_MAX_BYTES` (default 8 GiB) uncompressed, or members that add up to more than
+  `MOREGPU_PT2_TOTAL_MAX_BYTES` (default 32 GiB) uncompressed. This stops zip bombs. The declared sizes are checked
+  before anything is decompressed, and members are read as streams that stop at the cap.
 
 A repo-wide test (`tests/security/pickle_ban_test.py`) bans these patterns from the code:
 
@@ -193,4 +203,22 @@ Training stays on native workers. On WebGPU, vision is limited to inference and 
 | `vision_load` | `{id, spec}` | Loads the model under `id`, replacing any model already loaded there. |
 | `vision_describe` | `{id}` | A description of the loaded model. |
 | `vision_lower` | `{id, target, example_shape?, include_bytes?}` | The lowering report, including `io` (graph inputs/outputs). With `include_bytes`, also the graph JSON and base64 weights, or the base64 ONNX bytes. It also lowers a model loaded from a MoreGPU export through `vision_infer_load` (via `ops.register_resolver`). |
-| `vision_unload` | `{id}` | Unloads the model. |
+| `vision_unload` | `{id}` | Unloads the model and its lowered artefacts. It also drops every `vision_infer_*` model with that id or wrapping that handle, so no copy stays resident. |
+
+A coordinator `welcome` (a new or reconnected session) resets the worker's model state: every adapter handle, lowered
+artefact and `vision_infer_*` model is dropped, and the data plane's staged blobs are deleted.
+
+## Worker environment
+
+| Variable | Effect |
+|---|---|
+| `MOREGPU_MODEL_ROOTS` | Directories (`os.pathsep`-separated) that `file://` sources may read. Exports can also be *read* from them (`vision_infer_load {export}`, `encoder: {init: "export"}`), but never written there. |
+| `MOREGPU_MODEL_HOSTS` | Comma-separated hosts (or `host:port`) that `https://` sources may download from. If it is unset, `MOREGPU_DATA_HOSTS` is used. With neither set, every `https://` source is refused. Plain `http://` only works for an allowlisted loopback host. |
+| `MOREGPU_MODEL_MAX_BYTES` | Size cap for one `https://` model download. The default is 20 GiB. A larger `Content-Length` is refused before the download starts, and a stream that goes past the cap is cut off. |
+| `MOREGPU_MODEL_CACHE` | Content-addressed download cache (default `~/.cache/moregpu/models`). |
+| `MOREGPU_OUTPUT_DIR` | The only place exports are written (`task_export`, every `TrainTask.export`), and a read root for exports. The default is `./moregpu-out` in the worker's working directory. A relative export path resolves inside it. An absolute path must resolve inside it after `..` and symlinks are resolved, so `../x`, `/etc/x` and a symlink that points outside are refused (`PermissionError`). |
+| `MOREGPU_PT2_MEMBER_MAX_BYTES`, `MOREGPU_PT2_TOTAL_MAX_BYTES` | Zip-bomb caps for `.pt2` archives (defaults 8 GiB and 32 GiB). |
+| `MOREGPU_STAGE_DIR` (alias `MOREGPU_PUSHED_DIR`) | Where `pushed://` blobs are staged, for data and models alike (docs/VISION.md). `MOREGPU_PUSHED_DIR` used to be a directory the worker read `pushed://<id>` files from. Now it only sets the staging directory: a file placed there by hand does not resolve as a pushed blob. |
+
+One `BlobStore` per worker process holds `pushed://` blobs, so a model artefact sent with `/data/push` is loadable as
+`pushed://<id>` with its `sha256` in the spec.

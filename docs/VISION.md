@@ -85,6 +85,7 @@ caches manifests per `(uri, sha256)`.
 | `MOREGPU_DATA_MAX_DOWNLOAD_BYTES` | Per-download cap. The default is 20 GiB. |
 | `MOREGPU_CACHE_DIR`, `MOREGPU_CACHE_BYTES` | Download cache location (default `~/.cache/moregpu/data`) and byte cap (default 20 GiB). |
 | `MOREGPU_STAGE_DIR`, `MOREGPU_PUSH_MAX_BYTES` | Staging directory for pushed blobs and their size cap (default 20 GiB). |
+| `MOREGPU_BLOB_TOTAL_MAX_BYTES` | Cap on all staged blobs together (default 40 GiB). |
 
 ### Readers
 
@@ -129,9 +130,19 @@ The coordinator can stream data it holds straight to a worker, so the worker nee
 
 A blob that goes over its declared size, or fails the check at the end, is deleted.
 
-Staging uses RAM first: `MOREGPU_STAGE_DIR` if set, else `/dev/shm` when it has at least 2 GB free, else the OS temp
-dir. Blobs are never persisted. `blob_drop` deletes the staged file, and all remaining blobs are deleted at process
-exit.
+Staging uses RAM first: `MOREGPU_STAGE_DIR` (alias `MOREGPU_PUSHED_DIR`) if set, else `/dev/shm` when it has at least
+2 GiB free and room for the blob, else the OS temp dir. The temp dir is usually on **disk**, so a blob staged there
+does touch persistent storage while it is staged. The worker deletes staged files itself: `blob_drop` deletes one, a
+coordinator `welcome` and normal process exit delete all of them. A worker that is killed (SIGKILL, crash, power loss)
+can leave `moregpu-blob-*` files in a disk staging dir. Set `MOREGPU_STAGE_DIR` to a tmpfs if blobs must never reach
+disk.
+
+Caps: one blob is at most `MOREGPU_PUSH_MAX_BYTES` (default 20 GiB), and all staged blobs together are at most
+`MOREGPU_BLOB_TOTAL_MAX_BYTES` (default 40 GiB). `blob_begin` is also refused when the staging filesystem has less
+free space than the blob's declared size.
+
+The same store also serves `pushed://` **model** sources (docs/MODELS.md), so `/data/push` can deliver a model
+artefact as well as data.
 
 ### Security properties
 
@@ -142,7 +153,9 @@ exit.
   for local mirrors and tests. Integrity always comes from the required sha256.
 - Bucket reads are always anonymous. `s5cmd` runs with `--no-sign-request`, `gsutil` gets an empty config, and AWS
   and Google credential variables are removed from the tool's environment. Bucket names are validated, and the tool
-  is run without a shell.
+  is run without a shell. A ref names exactly one object: URIs with wildcard or glob characters (`*`, `?`, `[`, `]`,
+  `{`, `}`) are refused. The object is streamed with `s5cmd cat` / `gsutil cat`, and the tool is killed as soon as the
+  download passes `MOREGPU_DATA_MAX_DOWNLOAD_BYTES`.
 - Every refusal raises `RefDenied` (a `PermissionError`). A hash or size mismatch raises `IntegrityError`.
 - Worker replies (`data_caps`, `data_stats`, `blob_*`) contain counts, hashes and sizes, but never local paths.
 

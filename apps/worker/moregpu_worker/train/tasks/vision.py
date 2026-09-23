@@ -10,6 +10,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from ... import paths
 from ...models.vit import vit_config
 from ...vision import losses as L
 from ...vision.models import build
@@ -87,6 +88,7 @@ class _VisionBase(TrainTask):
         in_chans = 1 if self.kind == "3d" else chans
         enc = cfg.get("encoder", {"init": "random"})
         if enc.get("init") == "export":
+            enc = {**enc, "path": paths.export_source(enc["path"])}   # MOREGPU_OUTPUT_DIR ∪ MOREGPU_MODEL_ROOTS
             p = os.path.join(enc["path"], "encoder_config.json")
             if not os.path.exists(p):
                 raise FileNotFoundError(f"no JEPA encoder export at {enc['path']}")
@@ -183,7 +185,7 @@ class _VisionBase(TrainTask):
     def export(self, fmt: str, path: str) -> dict:
         from .jepa import _sha
         from ...vision.models import load_exported
-        os.makedirs(path, exist_ok=True)
+        path = paths.export_dir(path)                     # confined to MOREGPU_OUTPUT_DIR
         x = self._in(self.data.batch([0, 1]))
         if fmt == "safetensors":
             from safetensors.torch import save_file

@@ -273,14 +273,20 @@ def test_default_fetch_uses_env_roots(tmp_path, monkeypatch):
 
 
 def test_pushed_source(tmp_path):
-    (tmp_path / "blob-1").write_bytes(b"data")
-    f = FE.make_fetch(pushed_dir=tmp_path)
-    assert f("pushed://blob-1").read_bytes() == b"data"
+    """pushed:// resolves only through the data-plane BlobStore (a verified, fully ended blob), never a bare file."""
+    import hashlib
+    from moregpu_worker.data.blobs import BlobStore
+    bs = BlobStore(stage_dir=tmp_path / "stage")
+    sha = hashlib.sha256(b"data").hexdigest()
+    bs.begin("blob-1", sha, 4); bs.chunk("blob-1", 0, b"data"); bs.end("blob-1")
+    f = FE.make_fetch(blobs=bs)
+    assert f("pushed://blob-1", sha).read_bytes() == b"data"
     for bad in ("pushed://../etc/passwd", "pushed://a/b", "pushed://missing"):
         with pytest.raises(A.RefusedSource):
-            f(bad)
+            f(bad, sha)
+    (tmp_path / "blob-2").write_bytes(b"data")
     with pytest.raises(A.RefusedSource):
-        FE.make_fetch()("pushed://blob-1")
+        FE.make_fetch(blobs=BlobStore(stage_dir=tmp_path))("pushed://blob-2", sha)
 
 
 def test_https_source_is_content_addressed(tmp_path, monkeypatch):
@@ -289,31 +295,32 @@ def test_https_source_is_content_addressed(tmp_path, monkeypatch):
     sha = hashlib.sha256(body).hexdigest()
     calls = []
 
-    class Resp(io.BytesIO):
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
+    def http_get(url, dest, hosts, cap, env_name="MOREGPU_DATA_HOSTS"):
+        calls.append((url, tuple(hosts), cap))
+        with open(dest, "wb") as f:
+            f.write(body)
 
-    def urlopen(url, timeout=None):
-        calls.append(url)
-        return Resp(body)
-
-    monkeypatch.setattr(FE.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(FE.H, "http_get", http_get)
+    monkeypatch.setenv("MOREGPU_MODEL_HOSTS", "example.org")
     f = FE.make_fetch(cache_dir=tmp_path)
     p = f("https://example.org/w.pt", sha)
     assert p.read_bytes() == body and p.name == sha
     f("https://example.org/w.pt", sha)
-    assert len(calls) == 1  # cache hit, no second download
+    assert len(calls) == 1 and calls[0][1] == ("example.org",)  # cache hit, no second download
     with pytest.raises(A.RefusedSource, match="sha256"):
         f("https://example.org/w.pt")
     with pytest.raises(A.IntegrityError):
         f("https://example.org/other.pt", "1" * 64)
     assert not (tmp_path / ("1" * 64)).exists()
+    with pytest.raises(A.RefusedSource, match="host"):
+        f("https://elsewhere.org/w.pt", sha + "")
 
 
 def test_hf_source_uses_hub_download(tmp_path, monkeypatch):
     got = {}
     target = tmp_path / "model.safetensors"
     target.write_bytes(b"x")
+    rev = "a" * 40
 
     def fake(repo_id, filename, revision=None):
         got.update(repo_id=repo_id, filename=filename, revision=revision)
@@ -321,9 +328,10 @@ def test_hf_source_uses_hub_download(tmp_path, monkeypatch):
 
     monkeypatch.setattr(FE, "_hf_hub_download", fake)
     f = FE.make_fetch()
-    assert f("hf://org/repo@v1.0/sub/model.safetensors") == target
-    assert got == {"repo_id": "org/repo", "filename": "sub/model.safetensors", "revision": "v1.0"}
-    f("hf://org/repo/model.safetensors")
+    assert f(f"hf://org/repo@{rev}/sub/model.safetensors") == target
+    assert got == {"repo_id": "org/repo", "filename": "sub/model.safetensors", "revision": rev}
+    import hashlib
+    f("hf://org/repo/model.safetensors", hashlib.sha256(b"x").hexdigest())
     assert got["revision"] is None
     with pytest.raises(A.RefusedSource):
         f("hf://org")

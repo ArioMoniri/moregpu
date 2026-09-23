@@ -94,6 +94,8 @@ class TrainTask(ABC):
         self._pending_opt = None
 
     def export(self, fmt: str, path: str) -> dict:
+        """Write an export under ``path``. Implementations MUST confine it with
+        ``moregpu_worker.paths.export_dir(path)`` (MOREGPU_OUTPUT_DIR; relative paths resolve inside it)."""
         raise NotImplementedError(f"{self.name} does not export {fmt}")
 
     def evaluate(self, refs: list, kind: str) -> dict:

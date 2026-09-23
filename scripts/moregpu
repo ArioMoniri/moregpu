@@ -9,6 +9,34 @@ RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SERVER_TS="$RAW/apps/coordinator/server.ts"
 WORKER_TS="$RAW/apps/worker/worker.ts"
 VERSION="v0.6.0"
+# Release signing PUBLIC key — the same pin as scripts/install.sh (tests/security/release_verify.py checks they match).
+RELEASE_PUBKEY_B64="${MOREGPU_RELEASE_PUBKEY:-oL3CUAld59+vdmrXYlLGl3RcvMAr3ZzBT8ib+Hpx7go=}"
+
+# torch-join integrity gate (ADR-0103): before exec'ing worker_torch.py, purge bytecode caches and verify the signed
+# apps/worker/MANIFEST.sha256 (every file under apps/worker, version-bound to pyproject.toml, rollback-guarded by a
+# state file). MOREGPU_VERIFY_MANIFEST: unset = verify when MANIFEST.sha256 + .sig exist (else warn "unsigned dev
+# tree"); 1 = mandatory (refuse without a manifest); 0 = skip (loudly warned).
+torch_join_verify() {
+  local root="$1/apps/worker" mode="${MOREGPU_VERIFY_MANIFEST:-auto}"
+  local man="$root/MANIFEST.sha256"
+  local state="${MOREGPU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/moregpu}/torch-worker.version"
+  case "$mode" in
+    0|false|no|off)
+      echo "[moregpu] WARNING: MOREGPU_VERIFY_MANIFEST=0 — the torch worker tree is NOT verified" >&2; return 0 ;;
+  esac
+  if [ ! -f "$man" ] || [ ! -f "$man.sig" ]; then
+    case "$mode" in
+      1|true|yes|on)
+        echo "[moregpu] refusing to start: MOREGPU_VERIFY_MANIFEST=1 but $man(.sig) is missing (sign with scripts/release_sign.py manifest)" >&2
+        exit 1 ;;
+    esac
+    echo "[moregpu] WARNING: unsigned dev tree — no apps/worker/MANIFEST.sha256(.sig), the torch worker's code is NOT verified" >&2
+    return 0
+  fi
+  python3 "$1/scripts/release_sign.py" verify-manifest --root "$root" --pubkey "$RELEASE_PUBKEY_B64" \
+    --purge-pycache --state "$state" >&2 \
+    || { echo "[moregpu] refusing to start the torch worker: apps/worker does not match its signed MANIFEST.sha256" >&2; exit 1; }
+}
 
 # ---- colors (disabled when not a TTY, NO_COLOR is set, or the terminal has < 8 colors) ----
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then CLR=1; else CLR=0; fi
@@ -227,7 +255,9 @@ case "$cmd" in
     command -v python3 >/dev/null 2>&1 || { echo "[moregpu] torch-join needs python3 + torch" >&2; exit 1; }
     tj_dir="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
     [ -f "$tj_dir/apps/worker/worker_torch.py" ] || { echo "[moregpu] torch-join runs from a clone (apps/worker/worker_torch.py not found)" >&2; exit 1; }
-    exec python3 "$tj_dir/apps/worker/worker_torch.py" "$@" ;;
+    torch_join_verify "$tj_dir"
+    # -B: never write bytecode caches into the verified tree (the next start would have to purge them again)
+    PYTHONDONTWRITEBYTECODE=1 exec python3 -B "$tj_dir/apps/worker/worker_torch.py" "$@" ;;
   bench)   bench_run "$@" ;;
 
   isolate) need_deno

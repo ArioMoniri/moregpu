@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from . import losses as L
 from .sliding import predict as sw_predict, sliding_window_part, merge_parts, tta_flips
+from .. import paths
 from .models import load_exported
 
 OPS = frozenset({"vision_infer_load", "vision_infer", "vision_predict", "vision_infer_describe", "vision_infer_unload",
@@ -41,8 +42,18 @@ class _AdapterModule(torch.nn.Module):
 class InferenceStore:
     def __init__(self, device: str, plane=None, out_root: str | None = None):
         self.device, self.plane = device, plane
-        self.out_root = os.path.realpath(out_root or os.environ.get("MOREGPU_OUTPUT_DIR", os.path.join(os.getcwd(), "moregpu-out")))
+        self.out_root = os.path.realpath(out_root) if out_root else paths.output_root()
         self.models: dict[str, dict] = {}
+        from . import ops as model_ops
+        model_ops.register_linked_store(self)   # vision_unload / reset also drop our copies of adapter models
+
+    def drop_linked(self, mid: str | None) -> None:
+        """Drop model ``mid`` and every model wrapping adapter handle ``mid`` (``None``: drop everything)."""
+        if mid is None:
+            self.models.clear()
+            return
+        for k in [k for k, v in self.models.items() if k == mid or v["meta"].get("adapter") == mid]:
+            self.models.pop(k, None)
 
     def handle(self, op: str, p: dict) -> dict:
         if op not in OPS:
@@ -63,7 +74,9 @@ class InferenceStore:
                     "encoder": {"img_size": p.get("img_size") or [], "in_chans": p.get("in_chans", 1)}, "adapter": p["handle"], "io": io}
             wrapper = _AdapterModule(lambda x: torch.as_tensor(A.infer(h, x)))
             return self.put(p["id"], wrapper, meta)
-        path = p["export"]
+        # export reads are confined to this store's output dir ∪ MOREGPU_OUTPUT_DIR ∪ MOREGPU_MODEL_ROOTS (relative →
+        # this store's output dir)
+        path = paths.confine(p["export"], [self.out_root, *paths.export_read_roots()])
         if os.path.exists(os.path.join(path, "model_config.json")):
             meta = json.load(open(os.path.join(path, "model_config.json")))
             return self.put(p["id"], load_exported(path), {"task": meta["task"], "num_classes": meta["num_classes"],
@@ -105,9 +118,10 @@ class InferenceStore:
         return {"ok": True, "shape": list(y.shape), "data": base64.b64encode(y.tobytes()).decode()}
 
     def _out_path(self, name: str) -> str:
-        path = os.path.realpath(os.path.join(self.out_root, name))
-        if not (path == self.out_root or path.startswith(self.out_root + os.sep)):
-            raise PermissionError(f"output {name!r} escapes MOREGPU_OUTPUT_DIR")
+        try:
+            path = paths.confine(name, [self.out_root])
+        except paths.ConfinementError:
+            raise PermissionError(f"output {name!r} escapes MOREGPU_OUTPUT_DIR") from None
         os.makedirs(os.path.dirname(path) or self.out_root, exist_ok=True)
         return path
 

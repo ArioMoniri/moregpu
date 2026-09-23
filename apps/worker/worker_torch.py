@@ -1803,6 +1803,8 @@ async def run():
                                 def _reset_session():
                                     resident.clear(); MODELS.clear(); SHARDS.clear(); SHARD_TOKS.clear(); SHARD_KV.clear()
                                     MOE_BB.clear(); MOE_EXPERTS.clear(); [SESSIONS.close(_sid) for _sid in SESSIONS.ids()]
+                                    # vision/model state + data-plane blob staging (NOT the resumable weight PUSH above)
+                                    VISION.models.clear(); MODEL_OPS.reset(); DATA.blobs.close()
                                     RING.clear(); MOE_WIRE.clear(); MOE_PEER.clear()  # a fresh coordinator session re-wires the ring/mesh after (re)load
                                     _empty_cache()
                                 await loop.run_in_executor(TORCH_POOL, _reset_session)

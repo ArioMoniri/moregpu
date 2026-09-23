@@ -272,8 +272,9 @@ def test_http_redirect_within_allowlist_followed(server, root, tmp_path):
 # ---------------------------------------------------------------- buckets via fake CLI
 def _fake_tool(bindir, name, src):
     p = bindir / name
-    p.write_text(f"#!/bin/sh\n# fake {name}: copy fixed file to the last argument\n"
-                 f'for a; do last="$a"; done\necho "$@" > "{bindir}/{name}.args"\ncp "{src}" "$last"\n')
+    p.write_text(f"#!/bin/sh\n# fake {name}: `cat URI` streams the fixed file to stdout; `cp URI DST` copies it\n"
+                 f'for a; do last="$a"; done\necho "$@" > "{bindir}/{name}.args"\n'
+                 f'case " $* " in *" cat "*) cat "{src}" ;; *) cp "{src}" "$last" ;; esac\n')
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
 
 

@@ -12,16 +12,19 @@
 // The message format is kept in lockstep with scripts/release_sign.py :: release_message().
 //
 // Exit codes:  0 = trusted (run the worker)   2 = usage   3 = sha256 mismatch   4 = bad signature
-//              5 = manifest mismatch (a covered file tampered / missing / added)
+//              5 = manifest mismatch (a covered file tampered / missing / added, a __pycache__ dir, a symlinked dir)
+//              6 = manifest version header missing / != <root>/pyproject.toml version / != --expect-version
 //
 // Usage:
 //   deno run --allow-read scripts/verify_release.ts \
 //     --artifact <path> --sig <path> --sha256 <hex> --pubkey <b64> --name <basename>
 //
-// MANIFEST mode (ADR-0103, the torch worker tree): the artifact is a signed MANIFEST.sha256 (`<sha256>  <path>` lines,
-// written by `release_sign.py manifest`). After its signature verifies (a --sha256 pin is optional here: the signature
-// binds its content), every listed file under --manifest-root must hash to its line, and no unlisted file may exist
-// under the listed top-level directories (bytecode caches excepted):
+// MANIFEST mode (ADR-0103, the torch worker tree): the artifact is a signed MANIFEST.sha256 (a
+// `# moregpu-worker-version: <v>` header, then `<sha256>  <path>` lines, written by `release_sign.py manifest`). After its
+// signature verifies (a --sha256 pin is optional here: the signature binds its content), every listed file under
+// --manifest-root must hash to its line, no unlisted file may exist ANYWHERE under the root (only the manifest, its .sig
+// and other `*.sig` files are exempt), __pycache__ dirs are refused (a planted .pyc can shadow a verified .py), and the
+// header must equal <root>/pyproject.toml's version (and --expect-version when given):
 //   deno run --allow-read scripts/verify_release.ts --manifest-root apps/worker \
 //     --artifact apps/worker/MANIFEST.sha256 --sig apps/worker/MANIFEST.sha256.sig --pubkey <b64> --name MANIFEST.sha256
 
@@ -102,14 +105,19 @@ if (!ok) {
 }
 
 if (manifestRoot) {
-  // (3) every covered file matches the signed manifest; nothing unlisted hides in a covered directory
+  // (3) every covered file matches the signed manifest; nothing unlisted hides anywhere under the root
   const root = manifestRoot.replace(/\/+$/, "");
+  const PREFIX = "# moregpu-worker-version: ";
+  const excluded = (rel: string) => rel === "MANIFEST.sha256" || rel === "MANIFEST.sha256.sig" || rel.endsWith(".sig");
   const listed = new Map<string, string>();
   const bad: string[] = [];
-  for (const line of new TextDecoder().decode(data).split("\n")) {
+  let lines = new TextDecoder().decode(data).split("\n");
+  let version = "";
+  if (lines.length && lines[0].startsWith(PREFIX)) { version = lines[0].slice(PREFIX.length).trim(); lines = lines.slice(1); }
+  for (const line of lines) {
     if (!line) continue;
     const m = line.match(/^([0-9a-f]{64}) {2}(.+)$/);
-    if (!m || m[2].startsWith("/") || m[2].split("/").includes("..")) { bad.push(`malformed line: ${line.slice(0, 80)}`); continue; }
+    if (!m || m[2].startsWith("/") || m[2].split("/").includes("..") || excluded(m[2])) { bad.push(`malformed line: ${line.slice(0, 80)}`); continue; }
     listed.set(m[2], m[1]);
   }
   for (const [rel, want] of listed) {
@@ -118,23 +126,30 @@ if (manifestRoot) {
     const h = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
     if (!eq(h, want)) bad.push(`tampered ${rel}`);
   }
-  const ignored = (rel: string) => rel.split("/").includes("__pycache__") || rel.endsWith(".pyc");
   const walk = async (dir: string, rel: string): Promise<void> => {
     for await (const e of Deno.readDir(dir)) {
       const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory) await walk(`${dir}/${e.name}`, r);
-      else if (!ignored(r) && !listed.has(r)) bad.push(`unlisted ${r}`);
+      if (e.isDirectory && e.name === "__pycache__") bad.push(`bytecode cache ${r}/ (purge it)`);
+      else if (e.isDirectory) await walk(`${dir}/${e.name}`, r);
+      else if (e.isSymlink && (await Deno.stat(`${dir}/${e.name}`).catch(() => null))?.isDirectory) bad.push(`symlinked directory ${r}`);
+      else if (!excluded(r) && !listed.has(r)) bad.push(`unlisted ${r}`);
     }
   };
-  for (const top of new Set([...listed.keys()].filter((k) => k.includes("/")).map((k) => k.split("/")[0]))) {
-    try { await walk(`${root}/${top}`, top); } catch { /* reported as missing files above */ }
-  }
+  await walk(root, "");
   if (bad.length) {
     console.error(`[verify] REJECT ${name}: ${bad.length} file(s) do not match the signed manifest`);
     for (const b of bad.slice(0, 20)) console.error(`         ${b}`);
     Deno.exit(5);
   }
-  console.log(`[verify] OK ${name}: sha256=${got} · signed by pinned release key · ${listed.size} files match`);
+  let have = "";
+  try { have = (await Deno.readTextFile(`${root}/pyproject.toml`)).match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? ""; } catch { /* no pyproject */ }
+  const expect = argOf("--expect-version");
+  if (!version || version !== have || (expect && version !== expect)) {
+    console.error(`[verify] REJECT ${name}: manifest version ${version || "(missing)"} != pyproject.toml ${have || "(missing)"}` +
+      (expect ? ` / expected ${expect}` : ""));
+    Deno.exit(6);
+  }
+  console.log(`[verify] OK ${name}: sha256=${got} · signed by pinned release key · ${listed.size} files match · version ${version}`);
   Deno.exit(0);
 }
 

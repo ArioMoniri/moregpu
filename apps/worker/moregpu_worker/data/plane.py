@@ -5,16 +5,17 @@ Security properties enforced here (all failures raise :class:`RefDenied` unless 
 * ``file://`` — the *realpath* (symlinks and ``..`` resolved) must lie inside a policy root; relative URIs resolve
   against the first root. A declared sha256 is verified (:class:`IntegrityError`).
 * ``https://`` — host must be in ``policy.hosts`` (redirects are re-checked), sha256 is required and verified before
-  the content enters the cache; downloads are capped at ``policy.max_download_bytes``. Plain ``http://`` is accepted
+  the content enters the cache; downloads are capped at ``policy.max_download_bytes`` (shared helper:
+  :mod:`moregpu_worker.data.http`, also used for model ``https://`` sources). Plain ``http://`` is accepted
   only for loopback hosts that are allowlisted (local mirrors / tests); integrity still comes from the sha256.
 * ``s3://`` / ``gs://`` — only if ``policy.allow_buckets`` and ``s5cmd`` / ``gsutil`` are on PATH; always anonymous
-  (``--no-sign-request``; cloud credentials are stripped from the tool's environment); sha256 required and verified.
+  (``--no-sign-request``; cloud credentials are stripped from the tool's environment); sha256 required and verified;
+  wildcard/glob characters are refused; the object is streamed (``cat``) and cut off at ``policy.max_download_bytes``.
 * ``pushed://<id>`` — only a blob that has been fully pushed and verified by :class:`BlobStore`.
 * Any other scheme (including bare paths) is denied.
 """
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
 import shutil
@@ -22,20 +23,19 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from . import readers
-from .blobs import BlobStore
+from . import http as H, readers
+from .blobs import BlobStore, default_store
 from .cache import ContentCache, sha256_file
 from .manifest import Manifest
 from .refs import GiB, DataPolicy, IntegrityError, Ref, RefDenied
 
+_BUCKET_WILDCARD = re.compile(r"[*?\[\]{}]")   # s5cmd/gsutil glob syntax: one ref names ONE object
 _BUCKET_RE = re.compile(r"^(s3|gs)://[a-z0-9][a-z0-9._-]{1,221}/[^\x00-\x1f]*$")
 _CRED_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
              "AWS_SHARED_CREDENTIALS_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_ACCESS_TOKEN",
@@ -44,21 +44,12 @@ _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch
 _BUF = 1 << 20
 
 
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 class DataPlane:
     def __init__(self, policy: DataPolicy | None = None, cache: ContentCache | None = None,
                  blobs: BlobStore | None = None):
         self.policy = policy if policy is not None else DataPolicy.from_env()
         self._cache = cache
-        self.blobs = blobs if blobs is not None else BlobStore()
+        self.blobs = blobs if blobs is not None else default_store()   # shared with pushed:// model sources
         self._lock = threading.RLock()
         self._manifests: dict[tuple[str, str | None], Manifest] = {}
         self._verified: dict[tuple[str, int, int], str] = {}
@@ -114,16 +105,7 @@ class DataPlane:
         return Path(real)
 
     def _host_allowed(self, url: str) -> None:
-        p = urllib.parse.urlsplit(url)
-        host = (p.hostname or "").lower()
-        if p.scheme not in ("https", "http") or p.username or p.password or not host:
-            raise RefDenied(f"url not allowed: {url[:120]!r}")
-        allowed = {h.strip().lower() for h in self.policy.hosts}
-        with_port = f"{host}:{p.port}" if p.port else None
-        if host not in allowed and with_port not in allowed:
-            raise RefDenied(f"host {host!r} not in MOREGPU_DATA_HOSTS")
-        if p.scheme == "http" and not _is_loopback(host):
-            raise RefDenied("plain http is only allowed for loopback hosts; use https")
+        H.host_allowed(url, self.policy.hosts, "MOREGPU_DATA_HOSTS")
 
     def _cached(self, sha: str) -> Path | None:
         p = self.cache.get(sha)
@@ -154,43 +136,15 @@ class DataPlane:
         return self._fetch(uri, sha, lambda tmp: self._http_get(uri, tmp))
 
     def _http_get(self, uri: str, tmp: str) -> None:
-        plane = self
-
-        class _Redirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                plane._host_allowed(newurl)  # every hop must stay on the allowlist
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-        handlers: list = [_Redirect()]
-        if _is_loopback((urllib.parse.urlsplit(uri).hostname or "").lower()):
-            handlers.append(urllib.request.ProxyHandler({}))
-        opener = urllib.request.build_opener(*handlers)
-        cap = self.policy.max_download_bytes
-        try:
-            resp = opener.open(urllib.request.Request(uri, headers={"User-Agent": "moregpu-worker"}), timeout=60)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                raise FileNotFoundError(uri) from e
-            raise OSError(f"GET {uri}: HTTP {e.code}") from e  # pragma: no cover
-        with resp, open(tmp, "wb") as out:
-            declared = resp.headers.get("Content-Length")
-            if declared is not None and int(declared) > cap:
-                raise RefDenied(f"{uri}: {declared} bytes exceeds download cap {cap}")
-            n = 0
-            while True:
-                b = resp.read(_BUF)
-                if not b:
-                    break
-                n += len(b)
-                if n > cap:  # pragma: no cover - server sent more than its Content-Length
-                    raise RefDenied(f"{uri}: exceeds download cap {cap}")
-                out.write(b)
+        H.http_get(uri, tmp, self.policy.hosts, self.policy.max_download_bytes, "MOREGPU_DATA_HOSTS")
 
     def _resolve_bucket(self, uri: str, scheme: str, sha: str | None) -> Path:
         if not self.policy.allow_buckets:
             raise RefDenied("bucket refs are disabled (MOREGPU_DATA_BUCKETS=1 to allow public buckets)")
         if sha is None:
             raise RefDenied("bucket refs need a sha256")
+        if _BUCKET_WILDCARD.search(uri):
+            raise RefDenied(f"bucket uri has wildcard/glob characters (one ref names one object): {uri[:120]!r}")
         if not _BUCKET_RE.match(uri):
             raise RefDenied(f"bad bucket uri {uri[:120]!r}")
         name = "s5cmd" if scheme == "s3" else "gsutil"
@@ -198,19 +152,45 @@ class DataPlane:
         if tool is None:
             raise RefDenied(f"{name} is not on PATH")
 
+        cap = self.policy.max_download_bytes
+
         def download(tmp: str) -> None:
+            # `cat` streams the object to stdout, so the cap is enforced WHILE downloading (the tool is killed as soon
+            # as it passes the cap) instead of after a full copy has already filled the disk.
             env = {k: v for k, v in os.environ.items() if k not in _CRED_ENV}  # anonymous only
-            with tempfile.TemporaryDirectory() as empty_cfg:
+            with tempfile.TemporaryDirectory() as empty_cfg, tempfile.TemporaryFile() as err:
                 if scheme == "s3":
-                    cmd = [tool, "--no-sign-request", "cp", uri, tmp]
+                    cmd = [tool, "--no-sign-request", "cat", uri]
                 else:
                     env["BOTO_CONFIG"] = os.devnull
                     env["CLOUDSDK_CONFIG"] = empty_cfg
-                    cmd = [tool, "-q", "cp", uri, tmp]
-                r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=6 * 3600)
-            if r.returncode != 0:
-                raise FileNotFoundError(f"{uri}: {name} exited {r.returncode}: "
-                                        f"{r.stderr.decode(errors='replace')[-300:]}")
+                    cmd = [tool, "-q", "cat", uri]
+                proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err)
+                n, over = 0, False
+                deadline = time.monotonic() + 6 * 3600
+                try:
+                    with open(tmp, "wb") as out:
+                        while True:
+                            b = proc.stdout.read(_BUF)
+                            if not b:
+                                break
+                            n += len(b)
+                            if n > cap:
+                                over = True
+                                break
+                            out.write(b)
+                            if time.monotonic() > deadline:  # pragma: no cover
+                                raise TimeoutError(f"{uri}: {name} download timed out")
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.stdout.close()
+                    rc = proc.wait()
+                if over:
+                    raise RefDenied(f"{uri}: exceeds download cap {cap}")
+                if rc != 0:
+                    err.seek(0)
+                    raise FileNotFoundError(f"{uri}: {name} exited {rc}: {err.read().decode(errors='replace')[-300:]}")
 
         return self._fetch(uri, sha, download)
 
