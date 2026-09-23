@@ -48,6 +48,25 @@ describe('vision + data + net', () => {
     expect(calls[2]!.url).toBe('http://h:1/net?pings=50&sustained_mb=64');
     expect(calls[4]!.url).toBe('http://h:1/vision/jobs/j?results=1');
   });
+  it('pushSafetensors: sha256 + .safetensors suffix, returns the pushed:// ref', async () => {
+    const hdr = new TextEncoder().encode(JSON.stringify({ w: { dtype: 'F32', shape: [1], data_offsets: [0, 4] } }));
+    const st = new Uint8Array(8 + hdr.length + 4);
+    new DataView(st.buffer).setBigUint64(0, BigInt(hdr.length), true); st.set(hdr, 8); new DataView(st.buffer).setFloat32(8 + hdr.length, 1, true);
+    const { c, calls } = recorder(() => ({ ok: true, uri: 'pushed://enc', results: [] }));
+    const r = await c.pushSafetensors(st, 'enc', ['w1']);
+    const sha = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', st)), (x) => x.toString(16).padStart(2, '0')).join('');
+    expect(calls[0]!.url).toBe('http://h:1/data/push');
+    expect(calls[0]!.body).toMatchObject({ id: 'enc', sha256: sha, suffix: '.safetensors', workers: ['w1'] });
+    expect(r).toMatchObject({ ok: true, uri: 'pushed://enc', sha256: sha, size: st.length, ref: { path: 'pushed://enc', sha256: sha } });
+    expect((await c.pushSafetensors(st)).uri).toBe(`pushed://st-${sha.slice(0, 16)}`);
+  });
+  it('pushSafetensors refuses pickles and junk before sending anything', async () => {
+    const { c, calls } = recorder();
+    for (const bad of [new Uint8Array([0x50, 0x4b, 3, 4, 0, 0, 0, 0, 0]), new Uint8Array([0x80, 2, 0x7d, 0x71, 0, 0x2e, 0, 0, 0]), new Uint8Array(0)]) {
+      await expect(c.pushSafetensors(bad)).rejects.toThrow(/safetensors/);
+    }
+    expect(calls.length).toBe(0);
+  });
   it('legacy LoRA DiLoCo parity methods', async () => {
     const { c, calls } = recorder();
     await c.dilocoLoad({ model: 'gpt2' }); await c.dilocoRound({ batches: { '*': [[1, 2]] } }); await c.trainStep({ input_ids: [1] });
