@@ -408,6 +408,15 @@ RUNNER = TaskRunner(SESSIONS, DEV, data_plane=DATA)
 from moregpu_worker.vision.infer import InferenceStore, OPS as VISION_OPS  # noqa: E402
 from moregpu_worker.vision import ops as MODEL_OPS  # noqa: E402  (published-model adapters, ADR-0113)
 VISION = InferenceStore(DEV, plane=DATA)   # exported segment/classify/encoder models; outputs under MOREGPU_OUTPUT_DIR
+# vision_lower also covers models loaded from a MoreGPU export (vision_infer_load {export}) — the coordinator lowers
+# those for its WebGPU workers (mixed fleet, /vision/load fleet='webgpu'|'all')
+def _store_handle(mid):
+    m = VISION.models.get(mid)
+    if m is None or m["meta"].get("adapter"):
+        return None
+    from moregpu_worker.vision import adapters as _A
+    return _A.from_module(m["model"], name=f"export:{mid}")
+MODEL_OPS.register_resolver(_store_handle)
 
 def train_dispatch(op: str, payload: dict) -> dict:
     if op in DATA_OPS.OPS: return DATA_OPS.handle(DATA, op, payload)                # vision data plane (ADR-0110)

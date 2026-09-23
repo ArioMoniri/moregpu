@@ -43,7 +43,57 @@ jobs:
           deno-version: v2.x
 
       - name: Type-check apps
-        run: deno check apps/worker/worker.ts apps/coordinator/server.ts
+        run: deno check apps/worker/worker.ts apps/worker/vision_wgsl.ts apps/coordinator/server.ts
+
+  webgpu:
+    name: WebGPU vision (lavapipe + SwiftShader) + mixed torch/WebGPU fleet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Software Vulkan adapter (Mesa lavapipe) for Deno/wgpu
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps (npm; CPU torch + MONAI for the torch worker and the lowering)
+        run: |
+          npm ci
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install cryptography websockets numpy safetensors monai 'transformers>=4.44,<5' onnx onnxruntime onnxscript scipy
+
+      - name: Deno sees a WebGPU adapter (fails loudly if lavapipe is missing, instead of silently ignoring the GPU tests)
+        run: |
+          echo "const a = await navigator.gpu?.requestAdapter(); if (!a) { console.error('no WebGPU adapter'); Deno.exit(1); } console.log('adapter:', a.info?.description);" > /tmp/adapter.ts
+          deno run --unstable-webgpu /tmp/adapter.ts
+
+      - name: Real WGSL on lavapipe — kernel goldens, tiling, UNet/seg/ViT parity, python-lowered graphs, sliding window; worker e2e
+        run: deno test --unstable-webgpu -A tests/webgpu/deno_webgpu_test.ts tests/webgpu/deno_worker_e2e_test.ts
+
+      - name: Browser WebGPU (headless Chromium, SwiftShader)
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test -c tests/webgpu/playwright.config.ts
+
+      - name: Mixed fleet — 1 torch + 1 Deno WebGPU worker, /vision/load fleet=all, /vision/infer_batch == torch (≤1e-4)
+        run: python3 tests/e2e/mixed_fleet_vision.py
 
   native:
     name: Native torch worker (smoke)

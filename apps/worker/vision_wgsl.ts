@@ -856,6 +856,7 @@ export const SUPPORTED_OPS: readonly string[] = [
   'aten.batch_norm', 'aten._native_batch_norm_legit_no_training', 'aten.instance_norm', 'aten.group_norm', 'aten.native_group_norm',
   'aten.layer_norm', 'aten.native_layer_norm',
   'aten.max_pool2d', 'aten.max_pool3d', 'aten.max_pool2d_with_indices', 'aten.max_pool3d_with_indices', 'aten.avg_pool2d', 'aten.avg_pool3d',
+  'aten.adaptive_avg_pool2d', 'aten.adaptive_avg_pool3d',
   'aten.upsample_nearest2d', 'aten.upsample_nearest3d', 'aten.upsample_bilinear2d', 'aten.upsample_trilinear3d',
   'aten.cat', 'aten.add', 'aten.sub', 'aten.mul', 'aten.div',
   'aten.relu', 'aten.relu_', 'aten.leaky_relu', 'aten.leaky_relu_', 'aten.gelu', 'aten.sigmoid', 'aten.tanh', 'aten.silu',
@@ -1152,6 +1153,16 @@ function lowerNode(B: Builder, nd: OpNode): void {
     case 'aten.max_pool2d': case 'aten.max_pool3d': case 'aten.max_pool2d_with_indices': case 'aten.max_pool3d_with_indices':
       pool(B, X(), out, nd, 0); return;
     case 'aten.avg_pool2d': case 'aten.avg_pool3d': pool(B, X(), out, nd, 1); return;
+    case 'aten.adaptive_avg_pool2d': case 'aten.adaptive_avg_pool3d': {
+      // divisible sizes only: every window then has the same extent in/out, so this IS avg_pool with kernel = stride
+      const x = X(), ns = x.shape.length - 2, I = x.shape.slice(2), O = listN(nd.attrs?.output_size, ns, 1);
+      if (O.length !== ns) throw new Error(`${op}: output_size [${O}] does not match ${ns} spatial dims`);
+      const k = I.map((v, i) => {
+        if (O[i] <= 0 || v % O[i]) throw new Error(`${op}: input size ${v} is not divisible by output size ${O[i]} (only evenly dividing adaptive pools are supported)`);
+        return v / O[i];
+      });
+      pool(B, x, out, { op: nd.op, inputs: nd.inputs, output: nd.output, attrs: { kernel_size: k, stride: k, padding: 0, ceil_mode: false, count_include_pad: true, divisor_override: null } }, 1); return;
+    }
     case 'aten.upsample_nearest2d': case 'aten.upsample_nearest3d': upsample(B, X(), out, nd, 0); return;
     case 'aten.upsample_bilinear2d': case 'aten.upsample_trilinear3d': upsample(B, X(), out, nd, 1); return;
     // reductions

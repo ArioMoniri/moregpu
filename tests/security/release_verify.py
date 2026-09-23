@@ -31,6 +31,15 @@ any artifact that is not both (1) the exact pinned bytes and (2) signed by the p
     - the verifier EMBEDDED in scripts/install.sh (heredoc) is byte-identical to scripts/verify_release.ts
     - the committed .sig files are 64-byte Ed25519 signatures (public), not key material (no secrets)
 
+  Second artefact + torch-worker manifest (throwaway keys only):
+    - (e) the REAL install.sh against a file:// release tree: a genuine vision_wgsl.ts is fetched + verified and the
+      worker boots with it; a tampered / missing / unsigned / wrong-key vision_wgsl.ts is REMOVED (vision disabled)
+      while the install succeeds and the worker still starts; a tampered worker.ts still aborts the install
+    - (f) install.sh pins VISION_WGSL_TS_SHA256; the coordinator's built-in worker --reload refreshes vision_wgsl.ts
+    - (g) ADR-0103 MANIFEST.sha256 over moregpu_worker/** + vision_ops.json: release_sign.py manifest/verify-manifest
+      and verify_release.ts --manifest-root reject a tampered (5) / added (5) / missing (5) file, a rewritten
+      manifest (4) and a wrong key (4)
+
 Runs on CPU, no network, no live coordinator, no model download: unit-level against the imported real
 signing functions plus the real Deno verifier. Ed25519 is RFC 8032, so the Python-signed / Deno-verified
 round trip also proves the cross-runtime byte-compatibility the installer depends on.
@@ -400,7 +409,8 @@ def test_torch_worker_manifest() -> None:
         man = os.path.join(root, "MANIFEST.sha256")
         check(p.returncode == 0 and os.path.exists(man) and os.path.exists(man + ".sig"), "manifest + detached sig written")
         lines = open(man).read().splitlines()
-        check(lines == sorted(lines) and any(l.endswith("  moregpu_worker/vision/lowering.py") for l in lines)
+        paths = [l.split("  ", 1)[1] for l in lines]
+        check(paths == sorted(paths) and any(l.endswith("  moregpu_worker/vision/lowering.py") for l in lines)
               and any(l.endswith("  vision_ops.json") for l in lines) and not any("__pycache__" in l for l in lines),
               f"manifest is sorted `sha256  path` lines over moregpu_worker/** + vision_ops.json ({len(lines)} files)")
         check(run_manifest_verify_py(root, pub) == 0 and run_manifest_verify_ts(root, pub) == 0, "control: genuine tree VERIFIES (py + ts, exit 0)")

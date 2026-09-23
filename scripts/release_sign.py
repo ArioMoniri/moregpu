@@ -32,9 +32,15 @@ Usage:
     # one-time: mint a release keypair (PRIVATE key stays OUT of the repo)
     python3 scripts/release_sign.py keygen --out /secure/moregpu_release_key.b64
 
-    # each release: sign the artifacts the installer pins
+    # each release: sign the artifacts the installer pins (worker.ts AND the lazily imported vision_wgsl.ts — the
+    # installer verifies both; a vision module that fails verification is dropped, the worker still runs)
     python3 scripts/release_sign.py sign --key /secure/moregpu_release_key.b64 \\
-        apps/worker/worker.ts apps/worker/worker_torch.py
+        apps/worker/worker.ts apps/worker/vision_wgsl.ts apps/worker/worker_torch.py
+
+    # each release (ADR-0103): a signed MANIFEST.sha256 of the torch worker tree (moregpu_worker/** + vision_ops.json)
+    python3 scripts/release_sign.py manifest --key /secure/moregpu_release_key.b64 --root apps/worker
+    # ...and its verify step (also: deno run --allow-read scripts/verify_release.ts --manifest-root apps/worker ...)
+    python3 scripts/release_sign.py verify-manifest --root apps/worker --pubkey <RELEASE_PUBKEY_B64>
 """
 from __future__ import annotations
 
@@ -97,6 +103,73 @@ def sign_artifact(sk: Ed25519PrivateKey, path: str, name: str | None = None) -> 
     return sha, sig
 
 
+# ---------------------------------------------------------------- ADR-0103: signed MANIFEST.sha256 (torch worker tree)
+MANIFEST_NAME = "MANIFEST.sha256"
+MANIFEST_DIRS = ("moregpu_worker",)       # covered recursively
+MANIFEST_FILES = ("vision_ops.json",)     # covered top-level files (the WGSL executor contract the lowering reads)
+
+
+def _ignored(rel: str) -> bool:
+    return "__pycache__" in rel.split("/") or rel.endswith(".pyc")
+
+
+def manifest_files(root: str) -> list[str]:
+    out = []
+    for d in MANIFEST_DIRS:
+        for dp, dns, fns in os.walk(os.path.join(root, d)):
+            dns[:] = sorted(x for x in dns if x != "__pycache__")
+            for fn in fns:
+                rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
+                if not _ignored(rel):
+                    out.append(rel)
+    out += [f for f in MANIFEST_FILES if os.path.isfile(os.path.join(root, f))]
+    return sorted(out)
+
+
+def build_manifest(root: str) -> str:
+    """`<sha256>  <path>` lines (sha256sum format), sorted by path, relative to root."""
+    lines = []
+    for rel in manifest_files(root):
+        with open(os.path.join(root, rel), "rb") as f:
+            lines.append(f"{sha256_hex(f.read())}  {rel}")
+    return "\n".join(lines) + "\n"
+
+
+def verify_manifest(root: str, manifest: bytes, sig_b64: str, pubkey: str) -> tuple[int, list[str]]:
+    """(0, []) when the manifest's signature verifies AND every covered file matches; (4, why) bad signature;
+    (5, problems) tampered / missing / unlisted files."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(b64d(pubkey)).verify(b64d(sig_b64), release_message(MANIFEST_NAME, sha256_hex(manifest)))
+    except (InvalidSignature, ValueError) as e:
+        return 4, [f"signature does not verify against the release key ({type(e).__name__})"]
+    listed, bad = {}, []
+    for line in manifest.decode().splitlines():
+        if not line:
+            continue
+        h, sep, rel = line.partition("  ")
+        if not sep or len(h) != 64 or rel.startswith("/") or ".." in rel.split("/"):
+            bad.append(f"malformed line: {line[:80]}")
+            continue
+        listed[rel] = h
+    for rel, want in listed.items():
+        p = os.path.join(root, rel)
+        if not os.path.isfile(p):
+            bad.append(f"missing {rel}")
+            continue
+        with open(p, "rb") as f:
+            if sha256_hex(f.read()) != want:
+                bad.append(f"tampered {rel}")
+    for top in sorted({r.split("/", 1)[0] for r in listed if "/" in r}):
+        for dp, _dns, fns in os.walk(os.path.join(root, top)):
+            for fn in fns:
+                rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
+                if not _ignored(rel) and rel not in listed:
+                    bad.append(f"unlisted {rel}")
+    return (5, bad) if bad else (0, [])
+
+
 def load_private_key(path: str) -> Ed25519PrivateKey:
     """Load a raw (base64) 32-byte Ed25519 seed written by `keygen`."""
     with open(path) as f:
@@ -139,6 +212,40 @@ def _cmd_sign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_manifest(args: argparse.Namespace) -> int:
+    sk = load_private_key(args.key)
+    text = build_manifest(args.root).encode()
+    out = args.out or os.path.join(args.root, MANIFEST_NAME)
+    with open(out, "wb") as f:
+        f.write(text)
+    sig = b64e(sk.sign(release_message(MANIFEST_NAME, sha256_hex(text))))
+    with open(out + ".sig", "w") as f:
+        f.write(sig + "\n")
+    print(f'RELEASE_PUBKEY_B64="{pubkey_b64(sk)}"')
+    n = len(text.splitlines())
+    print(f"# {MANIFEST_NAME}: {n} files, sha256={sha256_hex(text)}  sig-> {out}.sig")
+    return 0
+
+
+def _cmd_verify_manifest(args: argparse.Namespace) -> int:
+    man = args.manifest or os.path.join(args.root, MANIFEST_NAME)
+    sig = args.sig or man + ".sig"
+    try:
+        with open(man, "rb") as f:
+            data = f.read()
+        with open(sig) as f:
+            sig_b64 = f.read().strip()
+    except OSError as e:
+        print(f"[verify] REJECT {MANIFEST_NAME}: {e}", file=sys.stderr)
+        return 4
+    code, problems = verify_manifest(args.root, data, sig_b64, args.pubkey)
+    if code:
+        print(f"[verify] REJECT {MANIFEST_NAME}: " + "; ".join(problems[:20]), file=sys.stderr)
+        return code
+    print(f"[verify] OK {MANIFEST_NAME}: signed by the release key · every covered file matches")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Sign MoreGPU worker artifacts for a pinned release.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -152,6 +259,19 @@ def main(argv: list[str] | None = None) -> int:
     sg.add_argument("--key", required=True, help="path to the release PRIVATE key from `keygen`")
     sg.add_argument("artifacts", nargs="+", help="artifact files to sign (e.g. apps/worker/worker.ts)")
     sg.set_defaults(fn=_cmd_sign)
+
+    mf = sub.add_parser("manifest", help="write + sign MANIFEST.sha256 of the torch worker tree (ADR-0103)")
+    mf.add_argument("--key", required=True, help="path to the release PRIVATE key from `keygen`")
+    mf.add_argument("--root", default="apps/worker", help="worker root holding moregpu_worker/ (default apps/worker)")
+    mf.add_argument("--out", help="manifest path (default <root>/MANIFEST.sha256; the .sig goes next to it)")
+    mf.set_defaults(fn=_cmd_manifest)
+
+    vm = sub.add_parser("verify-manifest", help="verify MANIFEST.sha256's signature + every covered file (exit 0/4/5)")
+    vm.add_argument("--root", default="apps/worker")
+    vm.add_argument("--pubkey", required=True, help="release PUBLIC key (raw, base64)")
+    vm.add_argument("--manifest")
+    vm.add_argument("--sig")
+    vm.set_defaults(fn=_cmd_verify_manifest)
 
     args = ap.parse_args(argv)
     return args.fn(args)

@@ -145,10 +145,23 @@ published weights are loaded strictly into the plugin's architecture.
 
 `moregpu_worker.vision.lowering.lower(handle, target)` prepares a native model for workers that do not run torch:
 
-1. `torch.export` traces the model with an example input. The input comes from `spec.io.inputs[0].shape` or from an
-   explicit `example`.
-2. For target `wgsl`: if **every** op is in `WGSL_OPS`, the result is an op-graph JSON plus safetensors weights
-   (`kind: "opgraph"`). `opgraph_ref.py` defines what each op does and serves as the reference interpreter.
+1. `torch.export.export` traces the model with an example input, in its **default dialect**. The core-ATen
+   decomposition is **not** run (it would turn trilinear upsampling, replicate pad, instance norm and SDPA into
+   `index`/`where` graphs). The input comes from `spec.io.inputs[0].shape` or from an explicit `example`.
+2. For target `wgsl`: if every op maps onto the WGSL executor's table (`WGSL_OPS`, read from
+   `apps/worker/vision_ops.json`), the result is an op-graph JSON plus safetensors weights (`kind: "opgraph"`) in
+   **exactly the executor's schema** (docs/WEBGPU_VISION.md): `{version, inputs:[{name,shape}], nodes:[{op, inputs,
+   attrs, output}], outputs, weights: "model.safetensors"}`, with tensor arguments in ATen-schema order and every other
+   argument in `attrs` under its ATen schema name. The lowering also:
+   - maps `getitem(node, 0)` of a multi-output op (`native_layer_norm`, …) onto the node's output, and refuses a use of
+     any other output;
+   - rewrites `unbind`/`split`/`chunk` + `getitem` into `select`/`slice` nodes;
+   - renames an in-place op the executor lacks to its functional twin (`add_` → `add`), but only when nothing that
+     shares the mutated tensor's storage is read afterwards;
+   - spells non-finite attrs `"Infinity"`, `"-Infinity"`, `"NaN"` (strict JSON).
+   `opgraph_ref.py` executes the same schema by calling each ATen overload. It is the parity oracle.
+   `tests/webgpu/lowering_parity.test.ts` runs python-lowered graphs (a 3D BasicUNet, a ViT+conv segmenter, a
+   ViT-Tiny-width encoder) through the TS executor and requires ≤ 1e-5 rel against PyTorch.
 3. Otherwise, or for target `onnx-web`: the model is exported to ONNX in memory for onnxruntime-web's WebGPU execution
    provider (`kind: "onnx"`). With target `wgsl`, `unsupported_ops` lists the ops that forced this fallback.
 4. If ONNX export fails as well, the result is `kind: "native"` and `servable: false`, and `unsupported_ops` lists the
@@ -165,7 +178,7 @@ probes a cached artefact again when it loads it from disk, so a tampered cache i
 | Worker type | What it can run today |
 |-------------|-----------------------|
 | Native torch worker (`worker_torch.py`, CUDA/MPS/CPU) | **Everything above**: all six formats, sliding-window/TTA inference, training on native handles, and lowering. |
-| Deno WebGPU worker / browser tab | **Only lowered artefacts, and only after the M6 WGSL kernels land.** Today the WGSL executor has the LLM kernels; the vision op table (`WGSL_OPS`) is declared and has reference semantics, but no vision kernels yet. |
+| Deno WebGPU worker / browser tab | **Lowered op-graphs** (inference and JEPA features), via the WGSL vision executor (`vision_wgsl.ts`, M6). The coordinator lowers on a torch worker and pushes the artefact (`/vision/load {fleet: 'webgpu'\|'all'}`, docs/WEBGPU_VISION.md). |
 | Browser via onnxruntime-web (WebGPU EP) | Designed, not yet wired. It would run `kind: "onnx"` artefacts (lowered, or ONNX as published) and use the same parity-probed bytes. |
 
 Training stays on native workers. On WebGPU, vision is limited to inference and JEPA feature extraction (ADR-0114).
@@ -179,5 +192,5 @@ Training stays on native workers. On WebGPU, vision is limited to inference and 
 | `vision_models_describe` | none | The worker's formats, registries, plugins, lowering targets, WGSL op table and loaded models. |
 | `vision_load` | `{id, spec}` | Loads the model under `id`, replacing any model already loaded there. |
 | `vision_describe` | `{id}` | A description of the loaded model. |
-| `vision_lower` | `{id, target, example_shape?, include_bytes?}` | The lowering report. With `include_bytes`, also the graph JSON and base64 weights, or the base64 ONNX bytes. |
+| `vision_lower` | `{id, target, example_shape?, include_bytes?}` | The lowering report, including `io` (graph inputs/outputs). With `include_bytes`, also the graph JSON and base64 weights, or the base64 ONNX bytes. It also lowers a model loaded from a MoreGPU export through `vision_infer_load` (via `ops.register_resolver`). |
 | `vision_unload` | `{id}` | Unloads the model. |

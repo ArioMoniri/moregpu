@@ -74,7 +74,7 @@ Measured in this container:
 ## Op-graph contract
 
 The machine-readable source of truth is **`apps/worker/vision_ops.json`**. A test pins its op list to the
-executor's `SUPPORTED_OPS`, and the Python lowering (`apps/worker/moregpu_worker/vision/lowering.py`) should read it
+executor's `SUPPORTED_OPS`, and the Python lowering (`apps/worker/moregpu_worker/vision/lowering.py`) reads it
 to decide whether a model can be lowered.
 
 ```json
@@ -103,11 +103,15 @@ The executor accepts both forms of each op: the high-level training-IR ops that 
 (`convolution`, `_softmax`, `native_group_norm`, `native_layer_norm`, `addmm`/`permute`/`view`,
 `max_pool*_with_indices`, …).
 
-**Recommendation for the lowering:** export with `torch.export.export()` and do **not** run the default core-ATen
-decomposition. That decomposition rewrites trilinear/nearest-3d upsampling, replicate padding, instance norm and SDPA
-into `index`/`arange`/`where`/`repeat` graphs, which this executor does not take.
-
-`tests/goldens/make_wgsl_goldens.py` contains a ~70-line reference exporter that emits exactly this schema.
+**The lowering** (`apps/worker/moregpu_worker/vision/lowering.py`, target `wgsl`) exports with `torch.export.export()`
+and does **not** run the default core-ATen decomposition. That decomposition rewrites trilinear/nearest-3d upsampling,
+replicate padding, instance norm and SDPA into `index`/`arange`/`where`/`repeat` graphs, which this executor does not
+take. The lowering reads its op table from `vision_ops.json` and emits exactly this schema. It also rewrites
+`unbind`/`split` + `getitem` into `select`/`slice` and functionalises safe in-place ops (`add_` → `add`). Non-finite
+attrs are written as `"Infinity"`, `"-Infinity"` or `"NaN"`. `tests/webgpu/lowering_parity.test.ts` (CPU reference) and
+`deno_webgpu_test.ts` (real WGSL) run python-lowered graphs against PyTorch; they are regenerated with
+`python3 tests/goldens/make_lowering_goldens.py`. `tests/goldens/make_wgsl_goldens.py` keeps a ~70-line reference
+exporter for the kernel goldens, and a pytest pins the lowering's nodes to it.
 
 ### Supported ops (summary; see `vision_ops.json` for attrs and notes)
 
@@ -116,7 +120,7 @@ into `index`/`arange`/`where`/`repeat` graphs, which this executor does not take
 | Convolution | `convolution` (incl. transposed), `conv2d`, `conv3d`, `conv_transpose2d`, `conv_transpose3d` |
 | Linear algebra | `linear`, `addmm`, `mm`, `bmm`, `matmul`, `scaled_dot_product_attention` |
 | Normalisation | `batch_norm` (eval), `_native_batch_norm_legit_no_training`, `instance_norm`, `group_norm`, `native_group_norm`, `layer_norm`, `native_layer_norm` |
-| Pooling | `max_pool2d/3d`, `max_pool2d/3d_with_indices`, `avg_pool2d/3d` |
+| Pooling | `max_pool2d/3d`, `max_pool2d/3d_with_indices`, `avg_pool2d/3d`, `adaptive_avg_pool2d/3d` (sizes divisible by the output: run as avg_pool with kernel = stride = in/out; anything else is refused) |
 | Upsampling | `upsample_nearest2d/3d`, `upsample_bilinear2d`, `upsample_trilinear3d` |
 | Elementwise | `add`, `sub`, `mul`, `div`, `relu(_)`, `leaky_relu(_)`, `gelu`, `sigmoid`, `tanh`, `silu`, `abs`, `neg`, `exp`, `sqrt`, `rsqrt`, `prelu` |
 | Reductions | `_softmax`, `softmax`, `argmax`, `mean` |
@@ -186,12 +190,15 @@ model id.
   so the coordinator should not route production vision work to such workers.
 - **Model limit.** A worker keeps at most 4 loaded models (LRU).
 - **Lazy import (distribution).** `worker.ts` imports `vision_wgsl.ts` **lazily** (`import()` with `.catch`).
-  - `scripts/install.sh` fetches and signature-verifies **only** `worker.ts`. A static import would make every
-    install.sh-provisioned worker fail at startup.
-  - With the lazy import, such a worker starts normally and just lacks `vision`.
-  - `moregpu join` (raw URL), the repo layout and the browser bundle (`deno bundle`) all include the module.
-  - To ship vision through the signed installer, sign `vision_wgsl.ts` as a second artifact and have `install.sh`
-    fetch and verify it. **`worker.ts.sig` must be re-signed at release**, because `worker.ts` changed.
+  - `scripts/install.sh` fetches `vision_wgsl.ts` as a **second signed artefact**. It is hash-pinned
+    (`VISION_WGSL_TS_SHA256`) and Ed25519-verified exactly like `worker.ts`, but it fails **soft**: a missing,
+    unsigned, wrong-key or tampered module is deleted, and the worker starts without the `vision` capability.
+    `tests/security/release_verify.py` (e) runs the real installer against a `file://` release tree and boots the
+    worker in each case.
+  - `moregpu join` (raw URL), the repo layout and the browser bundle all include the module. The coordinator's
+    built-in worker `--reload`s it together with `worker.ts`.
+  - **At release:** `python3 scripts/release_sign.py sign --key … apps/worker/worker.ts apps/worker/vision_wgsl.ts`,
+    then paste both pins into `install.sh`.
 
 ## Running the tests
 
@@ -235,5 +242,20 @@ npx playwright test -c tests/webgpu/playwright.config.ts                        
 - The WGSL is correct first and not tuned. There is no subgroup or cooperative-matrix use, and the conv tile is
   16×16. The CPU reference is a test oracle and is not meant for production throughput.
 - Blending in the sliding-window driver runs on the host (JS). Only the predictor runs on the GPU.
-- The coordinator side (`/vision/*` routes and mixed-fleet dispatch of `vision_*` to workers with the `vision`
-  capability) is **not** part of this change.
+
+## Mixed fleet: torch + WebGPU workers serving one model (coordinator)
+
+`apps/coordinator/server.ts` (`/vision/*`) with `apps/coordinator/lib/vision_fleet.ts`:
+
+| route | body | what happens |
+|---|---|---|
+| `POST /vision/load` | `{id, export \| spec, fleet?: 'native'\|'webgpu'\|'all', example_shape?, workers?, f16?}` | The model is loaded natively on the torch workers. For `webgpu`/`all`, one torch worker then runs `vision_lower {target:'wgsl', include_bytes}`, which is parity-probed there (fp32 ≤ 1e-4). The coordinator streams `graph.json` + `model.safetensors` to every worker advertising `vision` (`push_begin`/`push_chunk`/`push_end`, `MOREGPU_PUSH_CHUNK` chunks) and calls `vision_load` there. The reply lists `workers`, `torch`, `webgpu`, `failed`, `io` and the lowering report. `example_shape` defaults to `[1, in_chans, ...img_size]` from a MoreGPU export, or to `spec.io`. |
+| `POST /vision/infer` | `{id, shape, data, worker?}` | Routed to any holder. Torch: `vision_infer` over the train relay. WebGPU: `vision_infer` over the sealed model RPC. Both replies are normalised to `{shape, data, kind, worker}`. A WebGPU holder only gets inputs of the lowered static shape. |
+| `POST /vision/infer_batch` | `{id, inputs:[{shape, data}], workers?, check_parity?, reference?}` | The inputs are spread over **all** holders by the work-stealing `VisionBatch` queue. A per-worker-kind `task` callback builds each kind's payload. Returns `outputs` in input order (each with `worker`/`kind`), `per_worker` counts, `failed`, and with `check_parity` the `parity: {reference, max_abs, per_worker}` against a torch reference worker. |
+| `POST /vision/batch` | as before | Volume batches (`vision_predict`: sliding window, TTA, label maps) stay on the torch holders. |
+| `POST /vision/unload` | `{id}` | `vision_infer_unload` on the torch holders, `vision_unload` on the WebGPU holders. |
+
+`tests/e2e/mixed_fleet_vision.py` starts 1 torch worker and 1 Deno WebGPU worker (lavapipe). It loads a ViT-micro + conv
+decoder segmenter with `fleet: 'all'` and runs `/vision/infer_batch` on 8 inputs. It asserts that both workers served
+items and that every output equals local PyTorch within 1e-4 (measured: 1.1e-6). It exits 0 with a `SKIP` line when
+Deno sees no adapter. CI runs it in the `webgpu` job.

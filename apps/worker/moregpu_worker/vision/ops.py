@@ -28,10 +28,24 @@ LOWERED: dict[tuple[str, str], L.LoweredArtifact] = {}
 _REGISTRY_MODULES = {"torchvision": "torchvision", "timm": "timm", "monai": "monai", "hf": "transformers"}
 
 
+# Extra lookups for models held elsewhere on this worker (e.g. the InferenceStore's MoreGPU exports, so a model loaded
+# with vision_infer_load {export} can be lowered for WebGPU workers too). Each returns a Handle or None.
+RESOLVERS: list = []
+
+
+def register_resolver(fn) -> None:
+    if fn not in RESOLVERS:
+        RESOLVERS.append(fn)
+
+
 def _get(mid: str) -> A.Handle:
-    if mid not in HANDLES:
-        raise KeyError(f"model {mid!r} is not loaded")
-    return HANDLES[mid]
+    if mid in HANDLES:
+        return HANDLES[mid]
+    for r in RESOLVERS:
+        h = r(mid)
+        if h is not None:
+            return h
+    raise KeyError(f"model {mid!r} is not loaded")
 
 
 def _id(p: dict) -> str:

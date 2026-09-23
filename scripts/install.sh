@@ -17,8 +17,14 @@ SERVER="${MOREGPU_SERVER:-ws://localhost:8787/ws}"; TOKEN="${MOREGPU_TOKEN:-}"
 # Coordinator TLS cert pin (from the join banner). Normalize: strip a leading sha256:/colons, lowercase.
 PIN="${MOREGPU_PIN:-}"; PIN="${PIN#sha256:}"; PIN="${PIN#SHA256:}"
 PIN="$(printf '%s' "$PIN" | tr 'A-Z' 'a-z' | tr -d ':')"
-WORKER_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/apps/worker/worker.ts"
+# MOREGPU_RAW_BASE: where release files are fetched from (default: the repo's raw GitHub tree). Anything fetched is
+# still hash-pinned + signature-verified below, so this only moves WHERE bytes come from, never what is trusted.
+RAW_BASE="${MOREGPU_RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
+WORKER_URL="${RAW_BASE}/apps/worker/worker.ts"
 SIG_URL="${WORKER_URL}.sig"
+# The WebGPU vision executor (ADR-0114) is a SECOND signed artefact: worker.ts imports it lazily, so a worker without
+# it (fetch failed, or it FAILED verification and was removed) starts normally, just without the 'vision' capability.
+VISION_URL="${RAW_BASE}/apps/worker/vision_wgsl.ts"
 
 # --- PINNED RELEASE TRUST ROOT ------------------------------------------------------------
 # This installer is the ROOT OF TRUST. Instead of running whatever `main` serves at fetch
@@ -28,6 +34,7 @@ SIG_URL="${WORKER_URL}.sig"
 #     python3 scripts/release_sign.py sign --key <priv> apps/worker/worker.ts
 RELEASE_PUBKEY_B64="${MOREGPU_RELEASE_PUBKEY:-oL3CUAld59+vdmrXYlLGl3RcvMAr3ZzBT8ib+Hpx7go=}"
 WORKER_TS_SHA256="${MOREGPU_WORKER_SHA256:-5a02ba4dd9bd8f86a338f75cc8e427b396f0ad030b90033a6dc627697eafe51a}"
+VISION_WGSL_TS_SHA256="${MOREGPU_VISION_WGSL_SHA256:-67033d979fc14112ddf9b14d849b14328cad87803edcc9a89a0a0b813e363a30}"
 # DEV / UNPINNED escape hatch — LOCAL RUNS ONLY. Set MOREGPU_DEV_UNPINNED=1 to skip the gate
 # when hacking on your own checkout. NEVER set it to join a real pool.
 DEV_UNPINNED="${MOREGPU_DEV_UNPINNED:-0}"
@@ -57,6 +64,9 @@ echo "[moregpu] fetching worker…"
 curl -fsSL "$WORKER_URL" -o "$MG_DIR/worker.ts.new" 2>/dev/null && mv "$MG_DIR/worker.ts.new" "$MG_DIR/worker.ts" || true
 curl -fsSL "$SIG_URL"    -o "$MG_DIR/worker.ts.sig.new" 2>/dev/null && mv "$MG_DIR/worker.ts.sig.new" "$MG_DIR/worker.ts.sig" || true
 [ -f "$MG_DIR/worker.ts" ] || { echo "[moregpu] ERROR: could not fetch worker and no cached copy exists"; exit 1; }
+# optional second artefact: a failed fetch keeps any cached copy (re-verified below); a stale partial is discarded
+curl -fsSL "$VISION_URL"       -o "$MG_DIR/vision_wgsl.ts.new" 2>/dev/null && mv "$MG_DIR/vision_wgsl.ts.new" "$MG_DIR/vision_wgsl.ts" || rm -f "$MG_DIR/vision_wgsl.ts.new"
+curl -fsSL "${VISION_URL}.sig" -o "$MG_DIR/vision_wgsl.ts.sig.new" 2>/dev/null && mv "$MG_DIR/vision_wgsl.ts.sig.new" "$MG_DIR/vision_wgsl.ts.sig" || rm -f "$MG_DIR/vision_wgsl.ts.sig.new"
 
 # --- SUPPLY-CHAIN GATE: verify the LOCAL worker.ts (fresh OR cached) before it is ever run ---
 # Runs on BOTH the MOREGPU_SERVICE install path and the foreground path, because both execute
@@ -81,10 +91,18 @@ else
 // The message format is kept in lockstep with scripts/release_sign.py :: release_message().
 //
 // Exit codes:  0 = trusted (run the worker)   2 = usage   3 = sha256 mismatch   4 = bad signature
+//              5 = manifest mismatch (a covered file tampered / missing / added)
 //
 // Usage:
 //   deno run --allow-read scripts/verify_release.ts \
 //     --artifact <path> --sig <path> --sha256 <hex> --pubkey <b64> --name <basename>
+//
+// MANIFEST mode (ADR-0103, the torch worker tree): the artifact is a signed MANIFEST.sha256 (`<sha256>  <path>` lines,
+// written by `release_sign.py manifest`). After its signature verifies (a --sha256 pin is optional here: the signature
+// binds its content), every listed file under --manifest-root must hash to its line, and no unlisted file may exist
+// under the listed top-level directories (bytecode caches excepted):
+//   deno run --allow-read scripts/verify_release.ts --manifest-root apps/worker \
+//     --artifact apps/worker/MANIFEST.sha256 --sig apps/worker/MANIFEST.sha256.sig --pubkey <b64> --name MANIFEST.sha256
 
 // server.ts:35 — base64 decode (native fromBase64 when present, else atob fallback).
 function b64d(s: string): Uint8Array {
@@ -120,10 +138,11 @@ const sigPath = argOf("--sig");
 const pinnedSha = (argOf("--sha256") ?? "").toLowerCase();
 const pubkeyB64 = argOf("--pubkey") ?? "";
 const name = argOf("--name") ?? (artifactPath ? artifactPath.split("/").pop()! : "");
+const manifestRoot = argOf("--manifest-root");
 
-if (!artifactPath || !sigPath || !pinnedSha || !pubkeyB64 || !name) {
+if (!artifactPath || !sigPath || (!pinnedSha && !manifestRoot) || !pubkeyB64 || !name) {
   console.error(
-    "[verify] usage: verify_release.ts --artifact P --sig P --sha256 HEX --pubkey B64 --name NAME",
+    "[verify] usage: verify_release.ts --artifact P --sig P --sha256 HEX --pubkey B64 --name NAME [--manifest-root DIR]",
   );
   Deno.exit(2);
 }
@@ -132,7 +151,7 @@ if (!artifactPath || !sigPath || !pinnedSha || !pubkeyB64 || !name) {
 const data = await Deno.readFile(artifactPath);
 const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
 const got = hex(digest);
-if (!eq(got, pinnedSha)) {
+if (pinnedSha && !eq(got, pinnedSha)) {
   console.error(`[verify] REJECT ${name}: sha256 mismatch`);
   console.error(`         pinned=${pinnedSha}`);
   console.error(`         actual=${got}`);
@@ -161,6 +180,43 @@ if (!ok) {
   Deno.exit(4);
 }
 
+if (manifestRoot) {
+  // (3) every covered file matches the signed manifest; nothing unlisted hides in a covered directory
+  const root = manifestRoot.replace(/\/+$/, "");
+  const listed = new Map<string, string>();
+  const bad: string[] = [];
+  for (const line of new TextDecoder().decode(data).split("\n")) {
+    if (!line) continue;
+    const m = line.match(/^([0-9a-f]{64}) {2}(.+)$/);
+    if (!m || m[2].startsWith("/") || m[2].split("/").includes("..")) { bad.push(`malformed line: ${line.slice(0, 80)}`); continue; }
+    listed.set(m[2], m[1]);
+  }
+  for (const [rel, want] of listed) {
+    let bytes: Uint8Array;
+    try { bytes = await Deno.readFile(`${root}/${rel}`); } catch { bad.push(`missing ${rel}`); continue; }
+    const h = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
+    if (!eq(h, want)) bad.push(`tampered ${rel}`);
+  }
+  const ignored = (rel: string) => rel.split("/").includes("__pycache__") || rel.endsWith(".pyc");
+  const walk = async (dir: string, rel: string): Promise<void> => {
+    for await (const e of Deno.readDir(dir)) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory) await walk(`${dir}/${e.name}`, r);
+      else if (!ignored(r) && !listed.has(r)) bad.push(`unlisted ${r}`);
+    }
+  };
+  for (const top of new Set([...listed.keys()].filter((k) => k.includes("/")).map((k) => k.split("/")[0]))) {
+    try { await walk(`${root}/${top}`, top); } catch { /* reported as missing files above */ }
+  }
+  if (bad.length) {
+    console.error(`[verify] REJECT ${name}: ${bad.length} file(s) do not match the signed manifest`);
+    for (const b of bad.slice(0, 20)) console.error(`         ${b}`);
+    Deno.exit(5);
+  }
+  console.log(`[verify] OK ${name}: sha256=${got} · signed by pinned release key · ${listed.size} files match`);
+  Deno.exit(0);
+}
+
 console.log(`[verify] OK ${name}: sha256=${got} · signed by pinned release key`);
 Deno.exit(0);
 MOREGPU_VERIFY_EOF
@@ -172,6 +228,21 @@ MOREGPU_VERIFY_EOF
     echo "[moregpu] ERROR: worker.ts FAILED release verification — REFUSING to run (possible tampering, or a stale/unsigned cache)."
     exit 1
   fi
+  # vision_wgsl.ts: same gate (pin + signature), but it fails SOFT — an unverified vision module is deleted so the lazy
+  # import finds nothing, and the worker runs without WebGPU vision instead of not at all.
+  if [ -f "$MG_DIR/vision_wgsl.ts" ] && [ -f "$MG_DIR/vision_wgsl.ts.sig" ] && "$DENO_BIN" run --allow-read "$MG_DIR/verify_release.ts" \
+      --artifact "$MG_DIR/vision_wgsl.ts" --sig "$MG_DIR/vision_wgsl.ts.sig" \
+      --sha256 "$VISION_WGSL_TS_SHA256" --pubkey "$RELEASE_PUBKEY_B64" --name vision_wgsl.ts; then
+    echo "[moregpu] vision_wgsl.ts verified — WebGPU vision executor enabled"
+  else
+    rm -f "$MG_DIR/vision_wgsl.ts" "$MG_DIR/vision_wgsl.ts.sig"
+    echo "[moregpu] WARNING: vision_wgsl.ts missing, unsigned or FAILED release verification — removed; vision disabled (the worker still runs, without the 'vision' capability)."
+  fi
+fi
+
+if [ "${MOREGPU_INSTALL_ONLY:-0}" = "1" ]; then
+  echo "[moregpu] staged + verified in $MG_DIR (MOREGPU_INSTALL_ONLY=1) — not starting the worker"
+  exit 0
 fi
 
 # --- TLS: pin + trust the coordinator's self-signed cert (default transport is wss://) ---------------

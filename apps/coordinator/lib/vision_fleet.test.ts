@@ -67,7 +67,7 @@ describe('streaming the lowered artefact to a WebGPU worker', () => {
     const st = new Uint8Array(9).fill(7);
     const r = await pushVisionArtifact(rpc, 'g', 'seg', [{ name: 'graph.json', bytes: graph }, { name: 'model.safetensors', bytes: st }], 4);
     expect(r).toMatchObject({ ok: true, data: { id: 'seg', backend: 'webgpu', bytes: graph.length + st.length } });
-    expect(calls.map((c) => c[0])).toEqual(['push_begin', 'push_chunk', 'push_chunk', 'push_chunk', 'push_chunk', 'push_chunk', 'push_chunk', 'push_end', 'vision_load']);
+    expect(calls.map((c) => c[0])).toEqual(['push_begin', ...new Array(4 + 3).fill('push_chunk'), 'push_end', 'vision_load']); // 13 B graph → 4 chunks, 9 B weights → 3
     const chunks = calls.filter((c) => c[0] === 'push_chunk').map((c) => c[1]);
     expect(chunks.filter((c) => c.name === 'model.safetensors').map((c) => [c.seq, c.last])).toEqual([[0, false], [1, false], [2, true]]);
     expect(chunks.every((c) => c.id === 'seg')).toBe(true);

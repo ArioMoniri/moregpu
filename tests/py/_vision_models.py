@@ -57,7 +57,8 @@ class CumsumNet(nn.Module):
 
 
 class InplaceReuseNet(nn.Module):
-    """h.add_() mutates a tensor that is read again afterwards — not safely functionalisable by renaming."""
+    """h.add_() mutates a tensor whose VIEW (taken before the mutation) is read afterwards — renaming add_ → add would
+    change what the view sees, so this is not safely functionalisable."""
 
     def __init__(self):
         super().__init__()
@@ -65,9 +66,9 @@ class InplaceReuseNet(nn.Module):
 
     def forward(self, x):
         h = self.fc(x)
-        g = h * 2.0
+        v = h.view(-1)
         h.add_(1.0)
-        return g + h
+        return v * 2.0
 
 
 def tiny_monai_unet():

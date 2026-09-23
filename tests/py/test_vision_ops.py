@@ -82,6 +82,21 @@ def test_reload_same_id_replaces(tmp_path):
     assert ops.HANDLES["a"] is not first and first.model is None
 
 
+def test_lower_resolves_models_held_elsewhere(monkeypatch):
+    """A model loaded from a MoreGPU export (InferenceStore) is lowered through a registered resolver, and the reply
+    carries the executor graph + safetensors bytes and its io (input/output names) for the coordinator."""
+    from moregpu_worker.vision import adapters as A
+    m = tiny_monai_unet()
+    monkeypatch.setattr(ops, "RESOLVERS", [])
+    ops.register_resolver(lambda mid: A.from_module(m) if mid == "exp" else None)
+    r = ops.handle("vision_lower", {"id": "exp", "target": "wgsl", "example_shape": [1, 1, 16, 16, 16], "include_bytes": True})
+    g = json.loads(r["graph_json"])
+    assert r["kind"] == "opgraph" and r["servable"] and g["weights"] == "model.safetensors"
+    assert r["io"] == {"inputs": g["inputs"], "outputs": g["outputs"]} and g["outputs"] == ["output"]
+    with pytest.raises(KeyError, match="not loaded"):
+        ops.handle("vision_lower", {"id": "other"})
+
+
 def test_ops_are_listed():
     assert set(ops.OPS) == {"vision_models_describe", "vision_load", "vision_describe", "vision_lower",
                             "vision_unload"}

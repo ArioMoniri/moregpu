@@ -6,7 +6,7 @@ two components agree on the schema end to end.
 
 Writes tests/goldens/wgsl/lowered/<name>.{graph.json,safetensors,io.json}:
 
-* unet3d   — tiny MONAI BasicUNet (3D, instance norm, transposed conv, pad, leaky_relu_) at 16³
+* unet3d   — tiny MONAI BasicUNet (3D, instance norm, transposed conv, pad, leaky_relu_) at 32³
 * segvit   — moregpu_worker.vision.models.build('segment', vit_config('micro', (32, 32), 8, 3), 3)
              (ViT encoder: patch-embed, SDPA, unbind → select; conv decoder: GroupNorm, bilinear upsample, skip cat)
 * vit_tiny — ViT-Tiny-width encoder (dim 192, 3 heads, MLP 768), depth 1, 32×32 / 16×16 patches → tokens
@@ -55,7 +55,7 @@ def models():
     seg = VM.build("segment", vit_config("micro", (32, 32), 8, 3), 3).eval()
     torch.manual_seed(6)
     vit = VisionTransformer(img_size=(32, 32), patch=16, in_chans=3, embed_dim=192, depth=1, heads=3).eval()
-    return [("unet3d", unet, (1, 1, 16, 16, 16)), ("segvit", seg, (1, 3, 32, 32)), ("vit_tiny", vit, (1, 3, 32, 32))]
+    return [("unet3d", unet, (1, 1, 32, 32, 32)), ("segvit", seg, (1, 3, 32, 32)), ("vit_tiny", vit, (1, 3, 32, 32))]
 
 
 def main() -> int:
