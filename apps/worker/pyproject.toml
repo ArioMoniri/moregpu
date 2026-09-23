@@ -14,12 +14,17 @@ dependencies = ["torch>=2.2", "numpy", "cryptography", "websockets", "safetensor
 llm = ["transformers>=4.44"]
 vision = ["nibabel", "pydicom", "SimpleITK", "pillow", "tifffile", "scipy"]
 onnx = ["onnx", "onnxruntime", "onnxscript"]
-monai = ["monai"]
+monai = ["monai"]                      # monai.networks.nets architectures + sliding-window inference
 timm = ["timm"]
+torchvision = ["torchvision"]          # install from the same index as torch so the versions match
+hub = ["huggingface_hub"]              # hf:// model sources (single-file download; never from_pretrained)
 telemetry = ["nvidia-ml-py"]
 dev = ["pytest", "pytest-cov"]
 
 [project.entry-points."moregpu.train_tasks"]
+
+# Vision model plugins (ADR-0113) register under "moregpu.models" in THEIR OWN wheel and must be pinned in
+# MOREGPU_MODEL_PLUGIN_ALLOWLIST (dist + version + wheel sha256) — see docs/MODELS.md.
 
 [tool.hatch.build.targets.wheel]
 packages = ["moregpu_worker"]

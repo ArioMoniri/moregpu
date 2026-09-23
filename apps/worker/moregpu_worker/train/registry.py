@@ -27,8 +27,11 @@ def _load(path: str):
     return getattr(importlib.import_module(mod), attr)
 
 
-def _allowlist(path: str | os.PathLike | None) -> list[dict]:
-    p = path or os.environ.get("MOREGPU_PLUGIN_ALLOWLIST")
+ENV = "MOREGPU_PLUGIN_ALLOWLIST"
+
+
+def _allowlist(path: str | os.PathLike | None, env: str = ENV) -> list[dict]:
+    p = path or os.environ.get(env)
     if not p or not Path(p).exists():
         return []
     return json.loads(Path(p).read_text())
@@ -45,11 +48,12 @@ def _wheel_sha(dist) -> str | None:
         return None
 
 
-def discover_plugins(eps=None, allowlist_path=None) -> tuple[dict, dict]:
-    """Returns ({name: loader}, {name: refusal reason})."""
-    allow = _allowlist(allowlist_path)
+def discover_plugins(eps=None, allowlist_path=None, group: str = GROUP, env: str = ENV) -> tuple[dict, dict]:
+    """Returns ({name: loader}, {name: refusal reason}). `group`/`env` let other plugin kinds (e.g. vision models,
+    group `moregpu.models`, env MOREGPU_MODEL_PLUGIN_ALLOWLIST) reuse the same pinning rule with their own allowlist."""
+    allow = _allowlist(allowlist_path, env)
     if eps is None:
-        eps = metadata.entry_points(group=GROUP)
+        eps = metadata.entry_points(group=group)
     found, refused = {}, {}
     for ep in eps:
         d = ep.dist

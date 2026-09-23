@@ -72,9 +72,10 @@ class LlmLoraTask(TrainTask):
             model = cfg["model_obj"].to(ctx.device)
         elif cfg.get("model_dir"):
             model = AutoModelForCausalLM.from_pretrained(cfg["model_dir"], dtype=torch.float32,
-                                                         local_files_only=True).to(ctx.device)
+                                                         local_files_only=True, use_safetensors=True).to(ctx.device)
         else:
-            model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32).to(ctx.device)
+            model = AutoModelForCausalLM.from_pretrained(cfg["model"], dtype=torch.float32,
+                                                         use_safetensors=True).to(ctx.device)
         if cfg.get("no_dropout"):
             for mod in model.modules():
                 if isinstance(mod, nn.Dropout):
