@@ -6,6 +6,7 @@
 
 import { OuterState, weightedAverage, outerStep, dropNonFinite, type Tensors } from './diloco.ts';
 import { SampleStream, allocate, split, type StreamState } from './sharding.ts';
+import { lrAt, progress } from './schedule.ts';
 import { decodeTensors, encodeTensors, b64ToBytes, bytesToB64, chunkBytes, concatBytes, type WireHeader, type WireDtype } from './tensorwire.ts';
 
 export interface RpcResult { ok: boolean; data?: Record<string, unknown>; error?: string }
@@ -32,6 +33,7 @@ export interface SessionConfig {
   checkpoint_every?: number;         // rounds; 0 = off
   keep_checkpoints?: number;
   eval?: { refs: unknown[]; kind: string; every: number };
+  lr_schedule?: { kind: 'constant' | 'cosine'; warmup_frac?: number; min_lr?: number };
 }
 
 export interface CheckpointStore {
@@ -51,7 +53,7 @@ export interface SessionDeps {
 
 export interface RoundSummary {
   round: number; workers: string[]; dropped: string[]; dropped_nonfinite: string[]; samples: number; samples_seen: number;
-  avg_last_loss: number; wall_s: number; reduce_s: number; bytes_up: number; bytes_down: number; alarms: string[];
+  avg_last_loss: number; lr: number; wall_s: number; reduce_s: number; bytes_up: number; bytes_down: number; alarms: string[];
   eval?: Record<string, unknown>; monitors?: Record<string, unknown>; done: boolean;
 }
 
@@ -196,7 +198,9 @@ export class TrainSession {
     const remaining = this.cfg.target_samples !== undefined ? this.cfg.target_samples - this.samplesSeen : undefined;
     const sizes = allocate(per, ws.length, ws.map((w) => this.speeds.get(w) ?? 1), this.cfg.alloc ?? 'fixed', remaining);
     const streamBefore = this.stream.state();
-    const shards = split(this.stream.take(sizes.reduce((a, b) => a + b, 0)), sizes);
+    const roundTotal = sizes.reduce((a, b) => a + b, 0);
+    const lr = lrAt(this.cfg, progress(this.cfg, this.samplesSeen, roundTotal, this.round));
+    const shards = split(this.stream.take(roundTotal), sizes);
     type R = { w: string; tensors: Tensors; samples: number; report: Record<string, any>; t_inner: number; t_pull: number; bytes_up: number; wire_err?: unknown };
     const results = await Promise.all(ws.map(async (w, i): Promise<R | { w: string; error: string }> => {
       const refs = shards[i]!;
@@ -204,7 +208,7 @@ export class TrainSession {
       const steps = Math.max(1, Math.min(refs.length, Math.round(refs.length / this.cfg.batch)));
       const t0 = this.now();
       try {
-        const first = await this.call(w, 'task_inner', { refs, steps, lr: this.cfg.lr, sync_dtype: this.cfg.sync_dtype ?? 'f32', chunk_bytes: this.chunk });
+        const first = await this.call(w, 'task_inner', { refs, steps, lr, sync_dtype: this.cfg.sync_dtype ?? 'f32', chunk_bytes: this.chunk });
         const t1 = this.now();
         const { tensors, bytes, header } = await this.pull(w, first);
         const t2 = this.now();
@@ -253,7 +257,7 @@ export class TrainSession {
     const losses = kept.map((r) => { const l = r.report.losses as number[]; return l[l.length - 1] ?? NaN; });
     const summary: RoundSummary = {
       round: this.round, workers: kept.map((r) => r.w), dropped, dropped_nonfinite: nonFinite, samples: roundSamples, samples_seen: this.samplesSeen,
-      avg_last_loss: losses.reduce((a, b) => a + b, 0) / losses.length, wall_s: wall, reduce_s,
+      avg_last_loss: losses.reduce((a, b) => a + b, 0) / losses.length, lr, wall_s: wall, reduce_s,
       bytes_up: okR.reduce((s, r) => s + r.bytes_up, 0), bytes_down: [...b.bytes.values()].reduce((s, x) => s + x, 0),
       alarms, eval: evalOut, monitors, done: this.isDone(),
     };
@@ -282,7 +286,7 @@ export class TrainSession {
         git_sha: this.deps.gitSha ?? null, config_hash: this.hash });
     }
     tel({ schema: SCHEMA, kind: 'round', ts, session: this.id, task: this.cfg.task, round: s.round, wall_s: wall, reduce_s: s.reduce_s,
-      workers: s.workers, dropped: s.dropped, samples: s.samples, samples_seen: s.samples_seen, avg_last_loss: s.avg_last_loss,
+      workers: s.workers, dropped: s.dropped, samples: s.samples, samples_seen: s.samples_seen, avg_last_loss: s.avg_last_loss, lr: s.lr,
       bytes_up: s.bytes_up, bytes_down: s.bytes_down, alarms: s.alarms, eval: s.eval ?? null, monitors: s.monitors ?? null,
       git_sha: this.deps.gitSha ?? null, config_hash: this.hash });
   }

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from . import registry
 from .diloco import OuterState, outer_step, weighted_average
+from .schedule import lr_at, progress
 from .sharding import SampleStream, allocate, split
 from .task import TaskContext
 
@@ -16,12 +17,15 @@ def _make(task: str, cfg: dict, seed: int, device: str, amp: str, keep: bool = F
 
 
 def run_plain(task: str, cfg: dict, steps: int, batch: int, lr: float, seed: int, manifest_len: int,
-              device: str = "cpu", amp: str = "fp32") -> dict:
+              device: str = "cpu", amp: str = "fp32", lr_schedule: dict | None = None,
+              target_samples: int | None = None) -> dict:
     t = _make(task, cfg, seed, device, amp, keep=True)
     stream = SampleStream(manifest_len, seed)
     losses = []
+    sch = {"lr": lr, "lr_schedule": lr_schedule, "target_samples": target_samples, "max_rounds": steps}
     for s in range(steps):
-        losses += t.inner_steps(stream.take(batch), 1, lr).losses
+        lr_s = lr_at(sch, progress(sch, s * batch, batch, s))
+        losses += t.inner_steps(stream.take(batch), 1, lr_s).losses
         t.after_outer_step(s + 1)          # per-step hook (e.g. I-JEPA EMA every step) — DiLoCo N=1,H=1 equivalence
     return {"state": t.state_for_sync(), "losses": losses, "samples_seen": steps * batch, "task": t}
 
@@ -29,7 +33,8 @@ def run_plain(task: str, cfg: dict, steps: int, batch: int, lr: float, seed: int
 def run_diloco(task: str, cfg: dict, n_workers: int, rounds: int, inner_steps: int, batch: int, lr: float,
                outer_lr: float, outer_momentum: float, seed: int, manifest_len: int, device: str = "cpu",
                amp: str = "fp32", keep_inner_state: bool = False, alloc_mode: str = "fixed",
-               speeds: list[float] | None = None, target_samples: int | None = None) -> dict:
+               speeds: list[float] | None = None, target_samples: int | None = None,
+               lr_schedule: dict | None = None) -> dict:
     workers = [_make(task, cfg, seed, device, amp, keep_inner_state, i) for i in range(n_workers)]
     st = OuterState.init(workers[0].state_for_sync())
     for w in workers[1:]:
@@ -41,13 +46,15 @@ def run_diloco(task: str, cfg: dict, n_workers: int, rounds: int, inner_steps: i
         if remaining is not None and remaining <= 0:
             break
         sizes = allocate(inner_steps * batch, n_workers, speeds or [1.0] * n_workers, alloc_mode, remaining)
+        sch = {"lr": lr, "lr_schedule": lr_schedule, "target_samples": target_samples, "max_rounds": rounds}
+        lr_r = lr_at(sch, progress(sch, seen, sum(sizes), st.round))
         shards = split(stream.take(sum(sizes)), sizes)
         results = []
         for w, idx in zip(workers, shards):
             if not idx:
                 continue
             steps = max(1, round(len(idx) / batch))
-            rep = w.inner_steps(idx, min(steps, len(idx)), lr)
+            rep = w.inner_steps(idx, min(steps, len(idx)), lr_r)
             results.append((w.state_for_sync(), rep.samples))
             losses.append(rep.losses[-1])
         seen += sum(s for _, s in results)
