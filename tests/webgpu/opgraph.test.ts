@@ -51,6 +51,11 @@ describe('op table (vision_ops.json) agrees with the executor', () => {
       { op: 'aten.cumsum.default', inputs: ['a'], attrs: { dim: 0 }, output: 'b' }], outputs: ['b'] };
     expect(() => VisionModel.compile(g, new Map())).toThrow(/unsupported op.*aten\.fft_fft.*aten\.cumsum/s);
   });
+  it('adaptive_avg_pool with an output size that does not divide the input is refused clearly', () => {
+    const g: OpGraph = { version: 1, inputs: [{ name: 'x', shape: [1, 2, 7, 6] }], nodes: [
+      { op: 'aten.adaptive_avg_pool2d.default', inputs: ['x'], attrs: { output_size: [3, 2] }, output: 'y' }], outputs: ['y'] };
+    expect(() => VisionModel.compile(g, new Map())).toThrow(/adaptive_avg_pool2d.*divid/);
+  });
   it('rejects a bad graph version and unknown value names', () => {
     expect(() => VisionModel.compile({ version: 2, inputs: [], nodes: [], outputs: [] } as unknown as OpGraph, new Map())).toThrow(/version/);
     const g: OpGraph = { version: 1, inputs: [{ name: 'x', shape: [2] }], nodes: [{ op: 'aten.relu.default', inputs: ['nope'], attrs: {}, output: 'y' }], outputs: ['y'] };

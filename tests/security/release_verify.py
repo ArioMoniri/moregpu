@@ -232,11 +232,203 @@ def test_no_drift() -> None:
 
 def test_no_secrets() -> None:
     print("\n(d) no secrets  [committed .sig files are 64-byte Ed25519 signatures, not keys]")
-    for sig in (WORKER_TS_SIG, os.path.join(REPO, "apps", "worker", "worker_torch.py.sig")):
+    for sig in (WORKER_TS_SIG, os.path.join(REPO, "apps", "worker", "worker_torch.py.sig"),
+                os.path.join(REPO, "apps", "worker", "vision_wgsl.ts.sig"), os.path.join(REPO, "apps", "worker", "MANIFEST.sha256.sig")):
         if not os.path.exists(sig):
             continue
         raw = base64.b64decode(open(sig).read().strip())
         check(len(raw) == 64, f"{os.path.basename(sig)} is a 64-byte Ed25519 signature (public), not key material")
+
+
+# ============================================================================================
+# (e) vision_wgsl.ts — a SECOND signed artefact. The installer fetches + verifies it; a tampered / missing /
+#     unsigned vision module is DROPPED (vision disabled) while the worker itself still installs and starts.
+# ============================================================================================
+VISION_TS = os.path.join(REPO, "apps", "worker", "vision_wgsl.ts")
+VISION_TS_SIG = VISION_TS + ".sig"
+
+
+def _raw_tree(d: str, sk, *, vision: str = "good", worker: str = "good") -> tuple[str, str, str]:
+    """A fake raw.githubusercontent tree (file://) holding the REAL worker.ts + vision_wgsl.ts, signed by `sk`.
+    Returns (raw_base_url, worker_sha, vision_sha)."""
+    raw = os.path.join(d, "raw")
+    wdir = os.path.join(raw, "apps", "worker")
+    os.makedirs(wdir, exist_ok=True)
+    shutil.copy(WORKER_TS, os.path.join(wdir, "worker.ts"))
+    shutil.copy(VISION_TS, os.path.join(wdir, "vision_wgsl.ts"))
+    wsha, wsig = S.sign_artifact(sk, os.path.join(wdir, "worker.ts"), "worker.ts")
+    vsha, vsig = S.sign_artifact(sk, os.path.join(wdir, "vision_wgsl.ts"), "vision_wgsl.ts")
+    _write(os.path.join(wdir, "worker.ts.sig"), (wsig + "\n").encode())
+    _write(os.path.join(wdir, "vision_wgsl.ts.sig"), (vsig + "\n").encode())
+    if worker == "tampered":
+        with open(os.path.join(wdir, "worker.ts"), "ab") as f:
+            f.write(b"\n// injected\n")
+    if vision == "tampered":
+        with open(os.path.join(wdir, "vision_wgsl.ts"), "ab") as f:
+            f.write(b"\nexport const PWNED = 1;\n")
+    elif vision == "missing":
+        os.remove(os.path.join(wdir, "vision_wgsl.ts"))
+        os.remove(os.path.join(wdir, "vision_wgsl.ts.sig"))
+    elif vision == "nosig":
+        os.remove(os.path.join(wdir, "vision_wgsl.ts.sig"))
+    elif vision == "wrongkey":
+        _, bad = S.sign_artifact(Ed25519PrivateKey.generate(), os.path.join(wdir, "vision_wgsl.ts"), "vision_wgsl.ts")
+        _write(os.path.join(wdir, "vision_wgsl.ts.sig"), (bad + "\n").encode())
+    return "file://" + raw, wsha, vsha
+
+
+def run_install(d: str, raw_base: str, pub: str, wsha: str, vsha: str) -> tuple[int, str, str]:
+    """Run the REAL scripts/install.sh against the file:// tree, stage + verify only (MOREGPU_INSTALL_ONLY=1)."""
+    home = os.path.join(d, "home")
+    os.makedirs(home, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MOREGPU_")}
+    env.update(HOME=home, MOREGPU_RAW_BASE=raw_base, MOREGPU_RELEASE_PUBKEY=pub, MOREGPU_WORKER_SHA256=wsha,
+               MOREGPU_VISION_WGSL_SHA256=vsha, MOREGPU_INSTALL_ONLY="1", MOREGPU_SERVER="ws://127.0.0.1:9/ws")
+    p = subprocess.run(["sh", INSTALL_SH], env=env, capture_output=True, text=True, timeout=180)
+    return p.returncode, p.stdout + p.stderr, os.path.join(home, ".moregpu")
+
+
+def boot_worker(mg: str, timeout: float = 90.0) -> str:
+    """Start the installed worker exactly as install.sh's RUN_ARGS do (no --allow-read), until it logs its backend
+    line, then stop it. Returns its output. A worker that cannot start never prints that line."""
+    env = dict(os.environ, MOREGPU_FORCE_CPU="1")
+    p = subprocess.Popen([_deno(), "run", "--unstable-webgpu", "--allow-net", "--allow-env", "--allow-sys",
+                          os.path.join(mg, "worker.ts"), "--server", "ws://127.0.0.1:9/ws", "--token", "t", "--name", "rv"],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    out = []
+    import time
+    t0 = time.time()
+    try:
+        while time.time() - t0 < timeout:
+            line = p.stdout.readline()
+            if not line:
+                break
+            out.append(line)
+            if "backend=" in line:
+                break
+    finally:
+        p.kill()
+        p.wait()
+    return "".join(out)
+
+
+def test_vision_second_artifact() -> None:
+    print("\n(e) vision_wgsl.ts second signed artefact  [install.sh fetch+verify; tampered/missing → vision off, worker starts]")
+    sk = Ed25519PrivateKey.generate()   # throwaway key: NEVER the release key
+    pub = S.pubkey_b64(sk)
+    for case in ("good", "tampered", "missing", "nosig", "wrongkey"):
+        d = tempfile.mkdtemp(prefix=f"mg-inst-{case}-")
+        try:
+            raw, wsha, vsha = _raw_tree(d, sk, vision=case)
+            rc, log, mg = run_install(d, raw, pub, wsha, vsha)
+            staged = os.path.exists(os.path.join(mg, "vision_wgsl.ts"))
+            if case == "good":
+                check(rc == 0 and staged and "vision_wgsl.ts" in log and "verified" in log,
+                      "genuine vision_wgsl.ts + sig → installed and VERIFIED next to worker.ts")
+            else:
+                check(rc == 0 and not staged and "vision disabled" in log,
+                      f"{case} vision_wgsl.ts → dropped (vision disabled), install still succeeds (exit {rc})")
+            boot = boot_worker(mg) if rc == 0 else ""
+            started = "backend=" in boot
+            off = "vision module unavailable" in boot
+            if case == "good":
+                check(started and not off, "  worker starts WITH the verified vision module")
+            else:
+                check(started and off, f"  worker still STARTS with vision disabled ({case})")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    # the worker itself stays fail-CLOSED
+    d = tempfile.mkdtemp(prefix="mg-inst-wbad-")
+    try:
+        raw, wsha, vsha = _raw_tree(d, sk, worker="tampered")
+        rc, log, _ = run_install(d, raw, pub, wsha, vsha)
+        check(rc != 0 and "REFUSING" in log, "tampered worker.ts → install REFUSED (fail closed, unchanged)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_vision_shipped_and_reload() -> None:
+    strict = _release_strict()
+    print("\n(f) vision_wgsl.ts shipped pin + coordinator built-in worker reload")
+    src = open(INSTALL_SH).read()
+    check('VISION_WGSL_TS_SHA256="${MOREGPU_VISION_WGSL_SHA256:-' in src, "install.sh pins VISION_WGSL_TS_SHA256 (env-overridable)")
+    if os.path.exists(VISION_TS_SIG):
+        rc = run_verify(VISION_TS, VISION_TS_SIG, _install_pin("VISION_WGSL_TS_SHA256"), _install_pin("RELEASE_PUBKEY_B64"), "vision_wgsl.ts")
+        _gate(strict, rc == 0, "committed vision_wgsl.ts verifies against install.sh pins + committed .sig")
+    else:
+        _gate(strict, False, "committed vision_wgsl.ts.sig present — run scripts/release_sign.py sign apps/worker/vision_wgsl.ts at release")
+    server = open(os.path.join(REPO, "apps", "coordinator", "server.ts")).read()
+    check(re.search(r"--reload=\$\{[^}]*\}.*vision_wgsl\.ts|visionUrl", server) is not None and "vision_wgsl.ts" in server,
+          "coordinator's built-in worker --reload also refreshes vision_wgsl.ts")
+
+
+# ============================================================================================
+# (g) ADR-0103 — signed MANIFEST.sha256 of the torch worker tree (apps/worker/moregpu_worker/** + vision_ops.json)
+# ============================================================================================
+def run_manifest_verify_py(root: str, pub: str) -> int:
+    p = subprocess.run([sys.executable, SIGN_PY, "verify-manifest", "--root", root, "--pubkey", pub],
+                       capture_output=True, text=True, timeout=120)
+    line = (p.stdout or p.stderr).strip().splitlines()
+    if line:
+        print(f"        py gate: {line[-1]}")
+    return p.returncode
+
+
+def run_manifest_verify_ts(root: str, pub: str) -> int:
+    p = subprocess.run([_deno(), "run", "--allow-read", VERIFY_TS, "--manifest-root", root,
+                        "--artifact", os.path.join(root, "MANIFEST.sha256"), "--sig", os.path.join(root, "MANIFEST.sha256.sig"),
+                        "--pubkey", pub, "--name", "MANIFEST.sha256"], capture_output=True, text=True, timeout=120)
+    line = (p.stdout or p.stderr).strip().splitlines()
+    if line:
+        print(f"        ts gate: {line[-1]}")
+    return p.returncode
+
+
+def test_torch_worker_manifest() -> None:
+    print("\n(g) torch worker MANIFEST.sha256  [release_sign.py manifest → verify-manifest (py) + verify_release.ts --manifest-root]")
+    sk = Ed25519PrivateKey.generate()   # throwaway key
+    pub = S.pubkey_b64(sk)
+    d = tempfile.mkdtemp(prefix="mg-manifest-")
+    try:
+        root = os.path.join(d, "worker")
+        shutil.copytree(os.path.join(REPO, "apps", "worker", "moregpu_worker"), os.path.join(root, "moregpu_worker"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy(os.path.join(REPO, "apps", "worker", "vision_ops.json"), root)
+        key = os.path.join(d, "k.b64")
+        _write(key, (base64.b64encode(sk.private_bytes_raw()).decode() + "\n").encode())
+        p = subprocess.run([sys.executable, SIGN_PY, "manifest", "--key", key, "--root", root], capture_output=True, text=True, timeout=120)
+        man = os.path.join(root, "MANIFEST.sha256")
+        check(p.returncode == 0 and os.path.exists(man) and os.path.exists(man + ".sig"), "manifest + detached sig written")
+        lines = open(man).read().splitlines()
+        check(lines == sorted(lines) and any(l.endswith("  moregpu_worker/vision/lowering.py") for l in lines)
+              and any(l.endswith("  vision_ops.json") for l in lines) and not any("__pycache__" in l for l in lines),
+              f"manifest is sorted `sha256  path` lines over moregpu_worker/** + vision_ops.json ({len(lines)} files)")
+        check(run_manifest_verify_py(root, pub) == 0 and run_manifest_verify_ts(root, pub) == 0, "control: genuine tree VERIFIES (py + ts, exit 0)")
+        # __pycache__ appearing after an import must not break verification
+        os.makedirs(os.path.join(root, "moregpu_worker", "__pycache__"), exist_ok=True)
+        _write(os.path.join(root, "moregpu_worker", "__pycache__", "x.cpython-311.pyc"), b"\0")
+        check(run_manifest_verify_py(root, pub) == 0 and run_manifest_verify_ts(root, pub) == 0, "  bytecode caches are ignored")
+        victim = os.path.join(root, "moregpu_worker", "vision", "lowering.py")
+        orig = open(victim, "rb").read()
+        _write(victim, orig + b"\nimport os; os.system('id')\n")
+        check(run_manifest_verify_py(root, pub) == 5 and run_manifest_verify_ts(root, pub) == 5, "tampered package file → REJECTED (exit 5)")
+        _write(victim, orig)
+        added = os.path.join(root, "moregpu_worker", "vision", "evil.py")
+        _write(added, b"print('x')\n")
+        check(run_manifest_verify_py(root, pub) == 5 and run_manifest_verify_ts(root, pub) == 5, "ADDED package file → REJECTED (exit 5)")
+        os.remove(added)
+        os.remove(victim)
+        check(run_manifest_verify_py(root, pub) == 5 and run_manifest_verify_ts(root, pub) == 5, "MISSING package file → REJECTED (exit 5)")
+        _write(victim, orig)
+        # attacker rewrites the manifest to match a tampered file → the manifest signature breaks
+        _write(victim, orig + b"\n# evil\n")
+        import hashlib
+        new = hashlib.sha256(open(victim, "rb").read()).hexdigest()
+        _write(man, "\n".join(f"{new}  {l.split('  ', 1)[1]}" if l.endswith("  moregpu_worker/vision/lowering.py") else l for l in lines).encode() + b"\n")
+        check(run_manifest_verify_py(root, pub) == 4 and run_manifest_verify_ts(root, pub) == 4, "rewritten manifest → REJECTED (exit 4, signature)")
+        check(run_manifest_verify_py(root, S.pubkey_b64(Ed25519PrivateKey.generate())) == 4, "wrong release key → REJECTED (exit 4)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def main() -> int:
@@ -251,6 +443,9 @@ def main() -> int:
     test_shipped_bundle()
     test_no_drift()
     test_no_secrets()
+    test_vision_second_artifact()
+    test_vision_shipped_and_reload()
+    test_torch_worker_manifest()
 
     passed = sum(1 for ok, _ in _RESULTS if ok)
     total = len(_RESULTS)

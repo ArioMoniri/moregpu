@@ -45,6 +45,31 @@ class FftNet(nn.Module):
         return torch.fft.rfft2(self.conv(x)).abs()
 
 
+class CumsumNet(nn.Module):
+    """aten.cumsum is outside the WGSL executor's table but ONNX-exportable → the ONNX fallback."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 2, 3, padding=1)
+
+    def forward(self, x):
+        return torch.cumsum(self.conv(x), dim=-1)
+
+
+class InplaceReuseNet(nn.Module):
+    """h.add_() mutates a tensor that is read again afterwards — not safely functionalisable by renaming."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 4)
+
+    def forward(self, x):
+        h = self.fc(x)
+        g = h * 2.0
+        h.add_(1.0)
+        return g + h
+
+
 def tiny_monai_unet():
     from monai.networks.nets import UNet
     torch.manual_seed(0)

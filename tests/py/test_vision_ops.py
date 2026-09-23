@@ -29,7 +29,7 @@ def test_models_describe_lists_capabilities():
     json.dumps(d)
     assert set(d["formats"]) == {"state_dict", "safetensors", "plugin", "torch_export", "torchscript", "onnx"}
     assert d["registries"]["monai"] is True and "torchvision" in d["registries"]
-    assert d["lowering"]["targets"] == ["wgsl", "onnx-web"] and "aten.conv2d.default" in d["lowering"]["wgsl_ops"]
+    assert d["lowering"]["targets"] == ["wgsl", "onnx-web"] and "aten.conv2d" in d["lowering"]["wgsl_ops"]
     assert d["plugins"] == {"available": [], "refused": {}}
     assert d["loaded"] == []
     assert "CPUExecutionProvider" in d["onnx_providers"]
