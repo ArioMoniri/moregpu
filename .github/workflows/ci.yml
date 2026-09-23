@@ -86,6 +86,9 @@ jobs:
       - name: Generic training sessions — coordinator DiLoCo == in-process reference, resume, isolation, churn
         run: python3 tests/e2e/train_sessions.py
 
+      - name: JEPA pretraining — 2 workers via coordinator == in-process reference, identical EMA targets, export
+        run: python3 tests/e2e/jepa_sessions.py
+
       - name: Torch worker smoke (coordinator + CPU torch worker + verified kernels)
         run: bash scripts/smoke_torch.sh
 

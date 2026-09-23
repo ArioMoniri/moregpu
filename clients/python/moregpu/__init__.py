@@ -236,6 +236,114 @@ class MoreGPU:
         """Pull the coordinator's current GLOBAL averaged adapter."""
         return self._req("/train/diloco/adapter", "POST", {})
 
+    # ---- generic training-task sessions (any TrainTask: jepa_2p5d, ijepa_2d, jepa_3d, segment, classify, llm_lora,
+    #      toy_linear, pinned plugins) with weighted DiLoCo across N torch workers — see docs/TRAINING.md ----
+    def train_session_create(self, task: str, cfg: dict, *, manifest_len: int, batch: int, inner_steps: int, lr: float,
+                             workers: Sequence[str] | None = None, id: str | None = None, **opts: Any) -> dict:
+        """Create + initialise a session. opts: amp, seed, deterministic, outer_lr, outer_momentum, alloc
+        ('fixed'|'proportional'), sync_dtype ('f32'|'bf16'|'fp16'|'int8delta'), broadcast_dtype, chunk_bytes,
+        target_samples, max_rounds, checkpoint_every, keep_checkpoints, eval {refs, kind, every}, lr_schedule."""
+        body: dict[str, Any] = {"task": task, "cfg": cfg, "manifest_len": manifest_len, "batch": batch,
+                                "inner_steps": inner_steps, "lr": lr, **opts}
+        if workers:
+            body["workers"] = list(workers)
+        if id:
+            body["id"] = id
+        return self._req("/train/sessions", "POST", body)
+
+    def train_sessions(self) -> list[dict]:
+        return self._req("/train/sessions").get("sessions", [])
+
+    def train_session(self, sid: str) -> dict:
+        return self._req(f"/train/sessions/{sid}")
+
+    def train_session_round(self, sid: str, rounds: int = 1) -> dict:
+        return self._req(f"/train/sessions/{sid}/round", "POST", {"rounds": rounds})
+
+    def train_session_run(self, sid: str, max_rounds: int | None = None) -> dict:
+        """Run in the background on the coordinator until the stopping rule; poll with train_session()."""
+        return self._req(f"/train/sessions/{sid}/run", "POST", {} if max_rounds is None else {"max_rounds": max_rounds})
+
+    def train_session_wait(self, sid: str, poll_s: float = 2.0, timeout_s: float | None = None) -> dict:
+        import time
+        t0 = time.time()
+        while True:
+            d = self.train_session(sid)
+            if d.get("status") in ("done", "failed", "closed") or (d.get("status") == "ready" and not d.get("busy")
+                                                                    and d.get("last", {}) and d["last"].get("done")):
+                return d
+            if timeout_s is not None and time.time() - t0 > timeout_s:
+                return d
+            time.sleep(poll_s)
+
+    def train_session_stop(self, sid: str) -> dict:
+        return self._req(f"/train/sessions/{sid}/stop", "POST", {})
+
+    def train_session_eval(self, sid: str, refs: Sequence[Any], kind: str = "loss", worker: str | None = None) -> dict:
+        body: dict[str, Any] = {"refs": list(refs), "kind": kind}
+        if worker:
+            body["worker"] = worker
+        return self._req(f"/train/sessions/{sid}/eval", "POST", body).get("metrics", {})
+
+    def train_session_export(self, sid: str, fmt: str, path: str, worker: str | None = None) -> dict:
+        """Export on a worker (fmt: safetensors | torch_export | onnx). `path` is a directory ON THE WORKER."""
+        body: dict[str, Any] = {"fmt": fmt, "path": path}
+        if worker:
+            body["worker"] = worker
+        return self._req(f"/train/sessions/{sid}/export", "POST", body)
+
+    def train_session_state(self, sid: str, dtype: str = "f32") -> dict:
+        """The coordinator's current global state → {name: (flat list[float], shape)} (f32 decode)."""
+        import struct
+        r = self._req(f"/train/sessions/{sid}/state?dtype={dtype}")
+        blob = base64.b64decode(r["blob_b64"])
+        out = {}
+        for e in r["header"]["tensors"]:
+            raw = blob[e["offset"]: e["offset"] + e["nbytes"]]
+            if r["header"]["dtype"] == "f32":
+                vals = list(struct.unpack(f"<{len(raw) // 4}f", raw))
+            elif r["header"]["dtype"] == "fp16":
+                vals = list(struct.unpack(f"<{len(raw) // 2}e", raw))
+            else:  # bf16: upper 16 bits of an f32
+                vals = [struct.unpack("<f", b"\x00\x00" + raw[i:i + 2])[0] for i in range(0, len(raw), 2)]
+            out[e["name"]] = (vals, e["shape"])
+        return out
+
+    def train_session_checkpoint(self, sid: str) -> dict:
+        return self._req(f"/train/sessions/{sid}/checkpoint", "POST", {})
+
+    def train_session_resume(self, sid: str, workers: Sequence[str] | None = None) -> dict:
+        body: dict[str, Any] = {"id": sid}
+        if workers:
+            body["workers"] = list(workers)
+        return self._req("/train/sessions/resume", "POST", body)
+
+    def train_session_add_worker(self, sid: str, worker: str) -> dict:
+        return self._req(f"/train/sessions/{sid}/workers", "POST", {"add": worker})
+
+    def train_session_telemetry(self, sid: str, n: int = 500) -> list[dict]:
+        return self._req(f"/train/sessions/{sid}/telemetry?n={n}").get("records", [])
+
+    def train_session_delete(self, sid: str) -> dict:
+        return self._req(f"/train/sessions/{sid}", "DELETE")
+
+    def train_jepa(self, task: str = "jepa_2p5d", *, data: dict | None = None, synthetic: dict | None = None,
+                   model: str = "tiny", patch: Any = 16, manifest_len: int, batch: int = 32, inner_steps: int = 50,
+                   lr: float = 1e-3, target_samples: int | None = None, workers: Sequence[str] | None = None,
+                   jepa: dict | None = None, **opts: Any) -> dict:
+        """Convenience: create a JEPA pretraining session (data = {manifest, sha256, spec} on the workers' data plane,
+        or synthetic = {...} for a smoke run). jepa: extra task cfg (pred_dim, pred_depth, ema, n_targets, ...)."""
+        cfg: dict[str, Any] = {"model": model, "patch": patch, **(jepa or {})}
+        if data:
+            cfg["data"] = data
+        if synthetic:
+            cfg["synthetic"] = synthetic
+        if target_samples:
+            opts["target_samples"] = target_samples
+            cfg.setdefault("total_steps", max(1, target_samples // batch))
+        return self.train_session_create(task, cfg, manifest_len=manifest_len, batch=batch, inner_steps=inner_steps,
+                                         lr=lr, workers=workers, **opts)
+
     # ---- resident-model serving (fast: the WHOLE forward runs on the worker, one round-trip per token) ----
     def model_load(self, model: str, id: str | None = None, fp16: bool = False, worker: str | None = None,
                    push: bool = False) -> dict:

@@ -69,3 +69,4 @@ clients/python/build/
 *.tgz
 
 *.tar.gz
+.claude/worktrees/
