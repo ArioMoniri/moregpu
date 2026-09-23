@@ -68,8 +68,10 @@ def fetch_verified(spec: dict, fetch: Fetch) -> tuple[Path, str]:
 
 
 def module_sha256(module: torch.nn.Module) -> str:
-    """Content hash of a module's weights (key, dtype, shape, bytes) — used as the lowering cache identity."""
+    """Content hash of a module's class + weights (key, dtype, shape, bytes) — used as the lowering cache identity. The
+    class is included so two weight-less modules (or two architectures with identical tensors) never collide."""
     h = hashlib.sha256()
+    h.update(f"{type(module).__module__}.{type(module).__qualname__}|".encode())
     for k, v in sorted(module.state_dict().items()):
         t = v.detach().cpu().contiguous()
         h.update(f"{k}|{t.dtype}|{tuple(t.shape)}|".encode())

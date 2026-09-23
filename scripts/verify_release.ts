@@ -12,10 +12,18 @@
 // The message format is kept in lockstep with scripts/release_sign.py :: release_message().
 //
 // Exit codes:  0 = trusted (run the worker)   2 = usage   3 = sha256 mismatch   4 = bad signature
+//              5 = manifest mismatch (a covered file tampered / missing / added)
 //
 // Usage:
 //   deno run --allow-read scripts/verify_release.ts \
 //     --artifact <path> --sig <path> --sha256 <hex> --pubkey <b64> --name <basename>
+//
+// MANIFEST mode (ADR-0103, the torch worker tree): the artifact is a signed MANIFEST.sha256 (`<sha256>  <path>` lines,
+// written by `release_sign.py manifest`). After its signature verifies (a --sha256 pin is optional here: the signature
+// binds its content), every listed file under --manifest-root must hash to its line, and no unlisted file may exist
+// under the listed top-level directories (bytecode caches excepted):
+//   deno run --allow-read scripts/verify_release.ts --manifest-root apps/worker \
+//     --artifact apps/worker/MANIFEST.sha256 --sig apps/worker/MANIFEST.sha256.sig --pubkey <b64> --name MANIFEST.sha256
 
 // server.ts:35 — base64 decode (native fromBase64 when present, else atob fallback).
 function b64d(s: string): Uint8Array {
@@ -51,10 +59,11 @@ const sigPath = argOf("--sig");
 const pinnedSha = (argOf("--sha256") ?? "").toLowerCase();
 const pubkeyB64 = argOf("--pubkey") ?? "";
 const name = argOf("--name") ?? (artifactPath ? artifactPath.split("/").pop()! : "");
+const manifestRoot = argOf("--manifest-root");
 
-if (!artifactPath || !sigPath || !pinnedSha || !pubkeyB64 || !name) {
+if (!artifactPath || !sigPath || (!pinnedSha && !manifestRoot) || !pubkeyB64 || !name) {
   console.error(
-    "[verify] usage: verify_release.ts --artifact P --sig P --sha256 HEX --pubkey B64 --name NAME",
+    "[verify] usage: verify_release.ts --artifact P --sig P --sha256 HEX --pubkey B64 --name NAME [--manifest-root DIR]",
   );
   Deno.exit(2);
 }
@@ -63,7 +72,7 @@ if (!artifactPath || !sigPath || !pinnedSha || !pubkeyB64 || !name) {
 const data = await Deno.readFile(artifactPath);
 const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
 const got = hex(digest);
-if (!eq(got, pinnedSha)) {
+if (pinnedSha && !eq(got, pinnedSha)) {
   console.error(`[verify] REJECT ${name}: sha256 mismatch`);
   console.error(`         pinned=${pinnedSha}`);
   console.error(`         actual=${got}`);
@@ -90,6 +99,43 @@ try {
 if (!ok) {
   console.error(`[verify] REJECT ${name}: signature does not verify against the pinned release key`);
   Deno.exit(4);
+}
+
+if (manifestRoot) {
+  // (3) every covered file matches the signed manifest; nothing unlisted hides in a covered directory
+  const root = manifestRoot.replace(/\/+$/, "");
+  const listed = new Map<string, string>();
+  const bad: string[] = [];
+  for (const line of new TextDecoder().decode(data).split("\n")) {
+    if (!line) continue;
+    const m = line.match(/^([0-9a-f]{64}) {2}(.+)$/);
+    if (!m || m[2].startsWith("/") || m[2].split("/").includes("..")) { bad.push(`malformed line: ${line.slice(0, 80)}`); continue; }
+    listed.set(m[2], m[1]);
+  }
+  for (const [rel, want] of listed) {
+    let bytes: Uint8Array;
+    try { bytes = await Deno.readFile(`${root}/${rel}`); } catch { bad.push(`missing ${rel}`); continue; }
+    const h = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
+    if (!eq(h, want)) bad.push(`tampered ${rel}`);
+  }
+  const ignored = (rel: string) => rel.split("/").includes("__pycache__") || rel.endsWith(".pyc");
+  const walk = async (dir: string, rel: string): Promise<void> => {
+    for await (const e of Deno.readDir(dir)) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory) await walk(`${dir}/${e.name}`, r);
+      else if (!ignored(r) && !listed.has(r)) bad.push(`unlisted ${r}`);
+    }
+  };
+  for (const top of new Set([...listed.keys()].filter((k) => k.includes("/")).map((k) => k.split("/")[0]))) {
+    try { await walk(`${root}/${top}`, top); } catch { /* reported as missing files above */ }
+  }
+  if (bad.length) {
+    console.error(`[verify] REJECT ${name}: ${bad.length} file(s) do not match the signed manifest`);
+    for (const b of bad.slice(0, 20)) console.error(`         ${b}`);
+    Deno.exit(5);
+  }
+  console.log(`[verify] OK ${name}: sha256=${got} · signed by pinned release key · ${listed.size} files match`);
+  Deno.exit(0);
 }
 
 console.log(`[verify] OK ${name}: sha256=${got} · signed by pinned release key`);

@@ -1,12 +1,20 @@
-"""Automatic lowering hooks (ADR-0114, M4): native model → artefact a non-torch worker can run.
+"""Automatic lowering hooks (ADR-0114, M4/M6): native model → artefact a non-torch worker can run.
 
     lower(handle, target) -> LoweredArtifact
-      1. torch.export the model with an example input (decompositions: none — keep aten-level ops).
-      2. target "wgsl": if EVERY op is in WGSL_OPS → op-graph JSON + safetensors weights (kind "opgraph").
+      1. torch.export.export the model with an example input, in the DEFAULT (training-IR) dialect — no core-ATen
+         decomposition (it would rewrite trilinear/nearest-3d upsampling, replicate pad, instance norm and SDPA into
+         index/where graphs the executor does not take; docs/WEBGPU_VISION.md).
+      2. target "wgsl": if every op maps onto the WGSL executor's table (apps/worker/vision_ops.json) → an op-graph in
+         EXACTLY the executor's schema + safetensors weights (kind "opgraph"):
+           {version:1, inputs:[{name,shape}], nodes:[{op, inputs, attrs, output}], outputs:[name], weights}
+         with tensor args in ATen-schema order, attrs keyed by ATen schema argument names (defaults filled),
+         getitem(multi-output op, 0) mapped onto the node's output, unbind/split/chunk rewritten into select/slice
+         nodes, and in-place ops functionalised (add_ → add) when the mutated value is never read again.
       3. otherwise (or target "onnx-web"): in-memory ONNX for onnxruntime-web's WebGPU EP (kind "onnx").
       4. otherwise: kind "native" — not servable off-torch; `unsupported_ops` says why.
     Every op-graph/ONNX artefact must pass a parity probe against the native forward (fp32 max|Δ| ≤ 1e-4) or it is
-    refused (`servable=False`, `run()` raises ParityRefused). Results are cached by
+    refused (`servable=False`, `run()` raises ParityRefused). The op-graph probe runs opgraph_ref, which executes the
+    same schema by calling each ATen overload. Results are cached by
     sha256(model sha256 | LOWERING_VERSION | target | example shape), in memory and optionally on disk (re-probed on
     load, so a tampered cache cannot be served).
 """
@@ -22,44 +30,38 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 
 from . import opgraph_ref
 from .adapters import ADAPTERS, Handle, as_tensor
+from .contract import aten_schema, base_op, executor_ops, is_tensor_list_type, is_tensor_type, to_json
 from .errors import brief
 
-LOWERING_VERSION = "1"
+__all__ = ["lower", "probe", "LoweredArtifact", "ParityRefused", "WGSL_OPS", "TARGETS", "base_op", "aten_schema"]
+
+LOWERING_VERSION = "2"   # 2: the executor's schema (vision_ops.json), default export dialect
 TARGETS = ("wgsl", "onnx-web")
 PARITY_TOL = {torch.float32: 1e-4, torch.float16: 1e-2, torch.bfloat16: 5e-2}
 ONNX_OPSET = 17
+WEIGHTS_FILE = "model.safetensors"
 
-# The WGSL executor's op table (what M6 kernels must implement; opgraph_ref defines the semantics).
-WGSL_OPS = frozenset({
-    "aten.convolution.default", "aten.conv1d.default", "aten.conv2d.default", "aten.conv3d.default",
-    "aten.conv2d.padding", "aten.conv3d.padding", "aten.conv_transpose2d.input", "aten.conv_transpose3d.input",
-    "aten.relu.default", "aten.leaky_relu.default", "aten.prelu.default", "aten.hardtanh.default", "aten.silu.default",
-    "aten.sigmoid.default", "aten.tanh.default", "aten.gelu.default", "aten.abs.default",
-    "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor",
-    "aten.linear.default", "aten.addmm.default", "aten.mm.default",
-    "aten.layer_norm.default", "aten.group_norm.default", "aten.native_group_norm.default",
-    "aten.instance_norm.default", "aten.batch_norm.default", "aten._native_batch_norm_legit_no_training.default",
-    "aten.max_pool2d.default", "aten.max_pool3d.default", "aten.avg_pool2d.default", "aten.avg_pool3d.default",
-    "aten.adaptive_avg_pool2d.default", "aten.adaptive_avg_pool3d.default", "aten.mean.dim",
-    "aten.upsample_nearest2d.vec", "aten.upsample_nearest3d.vec", "aten.upsample_nearest2d.default",
-    "aten.upsample_bilinear2d.vec", "aten.upsample_trilinear3d.vec", "aten.pad.default",
-    "aten.constant_pad_nd.default",
-    "aten._softmax.default", "aten.softmax.int", "aten.argmax.default",
-    "aten.cat.default", "aten.permute.default", "aten.view.default", "aten.reshape.default", "aten.flatten.using_ints",
-    "aten.transpose.int", "aten.unsqueeze.default", "aten.squeeze.dim", "aten.clone.default",
-    "aten.contiguous.default", "aten.dropout.default", "getitem",
-})
+# The WGSL executor's op table, read from its machine-readable contract apps/worker/vision_ops.json (base names, e.g.
+# "aten.conv2d"; overloads match on the base). opgraph_ref executes exactly these ops.
+WGSL_OPS = executor_ops()
+# tuple-of-views ops the lowering rewrites into select/slice nodes instead of emitting
+_SPLIT_OPS = frozenset({"aten.unbind", "aten.split", "aten.split_with_sizes", "aten.chunk"})
 
 
 class ParityRefused(RuntimeError):
     """The lowered artefact is not servable (parity probe failed, or nothing could be lowered)."""
+
+
+class Unlowerable(Exception):
+    def __init__(self, ops: list[str]):
+        super().__init__(", ".join(ops))
+        self.ops = ops
 
 
 _CACHE: dict[str, "LoweredArtifact"] = {}
@@ -96,7 +98,7 @@ class LoweredArtifact:
         return save({k: v.detach().cpu().contiguous() for k, v in (self.weights or {}).items()})
 
     def graph_json(self) -> str:
-        return json.dumps(self.graph, sort_keys=True)
+        return json.dumps(self.graph, sort_keys=True, allow_nan=False)
 
     def payload(self) -> list[bytes]:
         if self.kind == "opgraph":
@@ -127,79 +129,206 @@ class LoweredArtifact:
         h = hashlib.sha256()
         for b in blobs:
             h.update(hashlib.sha256(b).digest())
+        io_ = None
+        if self.kind == "opgraph" and self.graph:
+            io_ = {"inputs": self.graph["inputs"], "outputs": self.graph["outputs"]}
         return {"target": self.target, "kind": self.kind, "servable": self.servable, "reason": self.reason,
                 "unsupported_ops": self.unsupported_ops, "ops": self.ops, "parity": self.parity,
                 "cache_key": self.cache_key, "model_sha256": self.model_sha256, "lowering_version": LOWERING_VERSION,
-                "example_shape": self.example_shape, "artifact_sha256": h.hexdigest(),
+                "example_shape": self.example_shape, "artifact_sha256": h.hexdigest(), "io": io_,
                 "bytes": sum(len(b) for b in blobs), "cached": self.cached}
 
 
-# ------------------------------------------------------------------ arg encoding (shared with opgraph_ref.decode_arg)
-def encode_arg(v: Any) -> Any:
-    if isinstance(v, torch.fx.Node):
-        return {"ref": v.name}
-    if v is None or isinstance(v, bool | int | str):
-        return v
-    if isinstance(v, float):
-        return v if math.isfinite(v) else {"float": str(v)}
-    if isinstance(v, list | tuple):
-        return [encode_arg(a) for a in v]
-    if isinstance(v, torch.dtype):
-        return {"dtype": str(v).removeprefix("torch.")}
-    if isinstance(v, torch.device):
-        return {"device": str(v)}
-    if isinstance(v, torch.memory_format):
-        return {"memory_format": str(v).removeprefix("torch.")}
-    if isinstance(v, torch.layout):
-        return {"layout": str(v).removeprefix("torch.")}
-    raise TypeError(f"cannot encode op-graph argument of type {type(v).__name__}")
-
-
+# ------------------------------------------------------------------ torch.export → executor op-graph
 def _op_name(target) -> str:
     return "getitem" if target is operator.getitem else str(target)
 
 
-def _full_args(node: torch.fx.Node) -> list:
-    schema = getattr(node.target, "_schema", None)
-    args = list(node.args)
-    if schema is None:
-        return args
-    for a in schema.arguments[len(args):]:
-        if a.name in node.kwargs:
-            args.append(node.kwargs[a.name])
-        elif a.has_default_value():
-            args.append(a.default_value)
-        else:  # pragma: no cover - aten schemas always provide defaults for omitted args
-            raise TypeError(f"{node.target}: no value for argument {a.name}")
-    return args
-
-
 def _export(module, x):
+    """torch.export.export in its default dialect — NO run_decompositions (see the module docstring)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return torch.export.export(module, (x,)).run_decompositions({})
+        return torch.export.export(module, (x,))
 
 
 def _graph_ops(ep) -> list[str]:
     return sorted({_op_name(n.target) for n in ep.graph.nodes if n.op == "call_function"})
 
 
+def _is_inplace(schema) -> bool:
+    a = schema.arguments[0] if schema.arguments else None
+    return bool(a is not None and a.alias_info is not None and a.alias_info.is_write)
+
+
+_VIEW_OPS = frozenset({"aten.view", "aten.reshape", "aten._unsafe_view", "aten.flatten", "aten.unsqueeze", "aten.squeeze",
+                       "aten.alias", "aten.detach", "aten.permute", "aten.transpose", "aten.t", "aten.expand",
+                       "aten.select", "aten.slice", "aten.narrow", "aten.as_strided", "aten.contiguous",
+                       "aten.view_as", "aten.dropout", "aten.unbind", "aten.split", "aten.split_with_sizes", "aten.chunk"})
+
+
+def _is_view(n) -> bool:
+    return n.op == "call_function" and (n.target is operator.getitem or base_op(_op_name(n.target)) in _VIEW_OPS)
+
+
+def _read_after_mutation(n, order) -> bool:
+    """In-place node n mutates args[0]. Renaming it to its functional twin is only exact when nothing that shares
+    args[0]'s storage (its view base, sibling views, views of it) is read after n; later reads of the mutated value
+    itself already go through n's output in torch.export's graph."""
+    root = n.args[0]
+    while _is_view(root) and isinstance(root.args[0], torch.fx.Node):
+        root = root.args[0]
+    if root.op == "placeholder":
+        return True                        # mutates a graph input / weight: the effect escapes the graph
+    seen, stack = set(), [root]
+    while stack:
+        a = stack.pop()
+        if a in seen:
+            continue
+        seen.add(a)
+        for u in a.users:
+            if u is n:
+                continue
+            if _is_view(u):
+                stack.append(u)
+            if order[u] > order[n]:
+                return True
+    return False
+
+
+def _functional(op: str) -> str:
+    parts = op.split(".")
+    return ".".join([parts[0], parts[1][:-1], *parts[2:]])
+
+
 def _emit_opgraph(ep) -> tuple[dict, dict]:
+    """ExportedProgram → (graph in the executor's schema, weights). Raises Unlowerable(ops) when anything is outside
+    the executor's table (after the select/slice and in-place rewrites)."""
     from torch.export.graph_signature import InputKind, OutputKind
-    params, inputs, weights = {}, [], {}
-    for spec in ep.graph_signature.input_specs:
-        if spec.kind == InputKind.USER_INPUT:
-            inputs.append(spec.arg.name)
-        else:  # PARAMETER / BUFFER / CONSTANT_TENSOR (custom objects never reach here: export would need them)
-            t = ep.state_dict[spec.target] if spec.target in ep.state_dict else ep.constants[spec.target]
-            params[spec.arg.name] = spec.target
-            weights[spec.target] = t.detach().clone().contiguous()
-    nodes = [{"name": n.name, "op": _op_name(n.target), "args": encode_arg(_full_args(n))}
-             for n in ep.graph.nodes if n.op == "call_function"]
+    sig = ep.graph_signature
+    p2w = {s.arg.name: s.target for s in sig.input_specs if s.kind != InputKind.USER_INPUT}
+    order = {n: i for i, n in enumerate(ep.graph.nodes)}
+    names: dict[str, str] = {}             # fx node name → op-graph value name
+    weights: dict[str, torch.Tensor] = {}
+    inputs, nodes, bad = [], [], []
+    for n in ep.graph.nodes:
+        if n.op != "placeholder":
+            continue
+        if n.name in p2w:
+            t = p2w[n.name]
+            names[n.name] = t
+        else:
+            names[n.name] = n.name
+            inputs.append({"name": n.name, "shape": [int(d) for d in n.meta["val"].shape]})
+
+    def ref(v) -> str:
+        nm = names[v.name]
+        if v.op == "placeholder" and v.name in p2w and nm not in weights:
+            t = ep.state_dict[nm] if nm in ep.state_dict else ep.constants[nm]
+            t = t.detach()
+            if t.is_floating_point() and t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                t = t.float()
+            weights[nm] = t.clone().contiguous()
+        return nm
+
+    split_src: set[str] = set()
+    for n in ep.graph.nodes:
+        if n.op != "call_function":
+            continue
+        if n.target is operator.getitem:
+            src, idx = n.args
+            if src.name in split_src:
+                continue                   # emitted as select/slice by the split rewrite below
+            if idx == 0:
+                names[n.name] = names[src.name]
+                continue
+            if n.users:
+                bad.append(f"getitem[{idx}] of {_op_name(src.target)} (only output 0 of multi-output ops is supported)")
+            names[n.name] = n.name
+            continue
+        op = _op_name(n.target)
+        base = base_op(op)
+        names[n.name] = n.name             # (also for a refused node, so the scan continues and reports everything)
+        schema = getattr(n.target, "_schema", None)
+        if schema is None:
+            bad.append(op)
+            continue
+        full = list(n.args) + [n.kwargs.get(a.name, a.default_value if a.has_default_value() else None)
+                               for a in schema.arguments[len(n.args):]]
+        if base in _SPLIT_OPS:            # tuple of views → one select/slice node per used getitem
+            split_src.add(n.name)
+            x = full[0]
+            shape = list(n.args[0].meta["val"].shape)
+            outs = n.meta["val"]
+            if base == "aten.unbind":
+                dim = int(full[1] if len(full) > 1 else 0) % len(shape)
+            else:
+                dim = int(full[2] if len(full) > 2 and full[2] is not None else 0) % len(shape)
+            starts, s0 = [], 0
+            for o in outs:
+                starts.append(s0)
+                s0 += int(o.shape[dim]) if base != "aten.unbind" else 1
+            for u in sorted(n.users, key=lambda u: order[u]):
+                if u.target is not operator.getitem:
+                    bad.append(f"{op} used other than by getitem")
+                    continue
+                i = int(u.args[1])
+                if base == "aten.unbind":
+                    nodes.append({"op": "aten.select.int", "inputs": [ref(x)], "attrs": {"dim": dim, "index": i}, "output": u.name})
+                else:
+                    nodes.append({"op": "aten.slice.Tensor", "inputs": [ref(x)], "output": u.name,
+                                  "attrs": {"dim": dim, "start": starts[i], "end": starts[i] + int(outs[i].shape[dim]), "step": 1}})
+                names[u.name] = u.name
+            continue
+        if _is_inplace(schema):
+            if _read_after_mutation(n, order):
+                bad.append(f"{op} (in-place mutation of a value that is read again)")
+                continue
+            if base not in WGSL_OPS:
+                op, base = _functional(op), base[:-1]
+                schema = aten_schema(op)
+        if base not in WGSL_OPS:
+            bad.append(op)
+            continue
+        ins: list = []
+        attrs: dict = {}
+        for a, v in zip(schema.arguments, full):
+            if is_tensor_list_type(a.type):
+                ins.extend(ref(t) for t in v)
+            elif is_tensor_type(a.type):
+                if isinstance(v, torch.fx.Node):
+                    ins.append(ref(v))
+                elif v is None:
+                    ins.append(None)
+                else:                      # a Python number in a Tensor slot (x * 0.5)
+                    attrs[a.name] = to_json(v)
+            elif isinstance(v, torch.fx.Node):
+                bad.append(f"{op} (dynamic non-tensor argument {a.name})")
+                break
+            else:
+                attrs[a.name] = to_json(v)
+        while ins and ins[-1] is None:
+            ins.pop()
+        names[n.name] = n.name
+        nodes.append({"op": op, "inputs": ins, "attrs": attrs, "output": n.name})
+    if bad:
+        raise Unlowerable(sorted(set(bad)))
     out_node = next(n for n in ep.graph.nodes if n.op == "output")
-    user = [o for o, s in zip(out_node.args[0], ep.graph_signature.output_specs) if s.kind == OutputKind.USER_OUTPUT]
-    graph = {"version": 1, "lowering_version": LOWERING_VERSION, "inputs": inputs, "params": params, "nodes": nodes,
-             "outputs": encode_arg(user)}
+    user = [o for o, s in zip(out_node.args[0], sig.output_specs) if s.kind == OutputKind.USER_OUTPUT]
+    outs = [ref(o) if o.op == "placeholder" else names[o.name] for o in user]
+    # friendly output names: "output" (single) or "output_<i>"; only for node outputs that appear once
+    produced = {nd["output"] for nd in nodes}
+    ren = {}
+    for i, o in enumerate(outs):
+        if o in produced and outs.count(o) == 1:
+            ren[o] = "output" if len(outs) == 1 else f"output_{i}"
+    taken = produced | {i["name"] for i in inputs} | set(weights)
+    ren = {k: v for k, v in ren.items() if v not in taken or v == k}
+    for nd in nodes:
+        nd["inputs"] = [ren.get(v, v) if v is not None else None for v in nd["inputs"]]
+        nd["output"] = ren.get(nd["output"], nd["output"])
+    outs = [ren.get(o, o) for o in outs]
+    graph = {"version": 1, "lowering_version": LOWERING_VERSION, "inputs": inputs, "nodes": nodes, "outputs": outs,
+             "weights": WEIGHTS_FILE}
     return graph, weights
 
 
@@ -261,13 +390,18 @@ def _lower(handle: Handle, target: str, x: torch.Tensor, key: str) -> LoweredArt
     try:
         ep = _export(module, x)
         art.ops = _graph_ops(ep)
-        art.unsupported_ops = [op for op in art.ops if op not in WGSL_OPS]
     except Exception as e:
         art.reason = f"torch.export failed ({type(e).__name__}: {brief(e)}); "
-    if target == "wgsl" and ep is not None and not art.unsupported_ops:
-        art.kind = "opgraph"
-        art.graph, art.weights = _emit_opgraph(ep)
-        return art
+    if ep is not None:
+        try:
+            graph, weights = _emit_opgraph(ep)
+            art.ops = sorted({n["op"] for n in graph["nodes"]})
+        except Unlowerable as u:
+            art.unsupported_ops = u.ops
+            graph = weights = None
+        if target == "wgsl" and graph is not None:
+            art.kind, art.graph, art.weights = "opgraph", graph, weights
+            return art
     try:
         art.onnx_bytes, art.kind = _export_onnx(module, x), "onnx"
         if target == "wgsl":

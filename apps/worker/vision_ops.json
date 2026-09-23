@@ -6,7 +6,7 @@
     "graph": "{version:1, inputs:[{name,shape}], nodes:[{op,inputs,attrs,output}], outputs:[name...], weights:'<file>.safetensors'}",
     "op": "ATen name 'aten.<name>' optionally followed by '.<overload>' (e.g. 'aten.add.Tensor', 'aten.conv3d.default'). The executor matches on 'aten.<name>'.",
     "inputs": "Tensor arguments in ATen-schema order, as value names (graph inputs, earlier node outputs or safetensors weight names). An absent optional tensor is null. Trailing nulls may be dropped. A Tensor[] argument (aten.cat) is flattened in place.",
-    "attrs": "Every non-tensor argument keyed by its ATen schema argument name, defaults filled. A Python number passed in a Tensor slot (x * 0.5) is given in attrs under that argument's name (e.g. 'other').",
+    "attrs": "Every non-tensor argument keyed by its ATen schema argument name, defaults filled. A Python number passed in a Tensor slot (x * 0.5) is given in attrs under that argument's name (e.g. 'other'). Non-finite floats are the strings 'Infinity', '-Infinity', 'NaN' (strict JSON; parsed by Python float() and JS Number()).",
     "multi_output": "Ops that return tuples (native_layer_norm, native_group_norm, _native_batch_norm_legit_no_training, max_pool*_with_indices) produce ONLY output 0 under 'output'; the lowering maps getitem(node, 0) to that name and must not reference other outputs.",
     "dtypes": "All values are float32 at the interface (weights may be F32/F16/BF16 in safetensors; they are widened). argmax yields float32 indices.",
     "shapes": "Static. Graph input shapes are fixed at load time; every node output is contiguous row-major."
@@ -36,6 +36,8 @@
     "aten.max_pool3d_with_indices": { "kind": "pool", "inputs": ["self"], "attrs": ["kernel_size", "stride", "padding", "dilation", "ceil_mode"], "notes": "output 0 (values) only" },
     "aten.avg_pool2d": { "kind": "pool", "inputs": ["self"], "attrs": ["kernel_size", "stride", "padding", "ceil_mode", "count_include_pad", "divisor_override"], "notes": "ceil_mode=false; divisor_override null or int" },
     "aten.avg_pool3d": { "kind": "pool", "inputs": ["self"], "attrs": ["kernel_size", "stride", "padding", "ceil_mode", "count_include_pad", "divisor_override"] },
+    "aten.adaptive_avg_pool2d": { "kind": "pool", "inputs": ["self"], "attrs": ["output_size"], "notes": "each spatial size must be divisible by its output size (lowered to avg_pool with kernel = stride = in/out)" },
+    "aten.adaptive_avg_pool3d": { "kind": "pool", "inputs": ["self"], "attrs": ["output_size"], "notes": "divisible sizes only (as adaptive_avg_pool2d)" },
     "aten.upsample_nearest2d": { "kind": "upsample", "inputs": ["input"], "attrs": ["output_size", "scale_factors"], "notes": ".vec overload attrs; the .default overload's scales_h/scales_w are also accepted" },
     "aten.upsample_nearest3d": { "kind": "upsample", "inputs": ["input"], "attrs": ["output_size", "scale_factors"] },
     "aten.upsample_bilinear2d": { "kind": "upsample", "inputs": ["input"], "attrs": ["output_size", "align_corners", "scale_factors"] },

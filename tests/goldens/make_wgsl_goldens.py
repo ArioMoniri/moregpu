@@ -56,7 +56,7 @@ def tjson(t: torch.Tensor) -> dict:
 def _jsonable(v):
     if isinstance(v, (bool, int, float, str)) or v is None:
         if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
-            return str(v)
+            return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")  # parsed by both float() and Number()
         return v
     if isinstance(v, (list, tuple)):
         return [_jsonable(x) for x in v]
@@ -280,6 +280,11 @@ def kernel_cases():
     add("bmm", Fn(lambda s, a, b: torch.bmm(a, b)), [R(3, 17, 18), R(3, 18, 19)])
     add("sdpa_vit", Fn(lambda s, q, k, v: F.scaled_dot_product_attention(q, k, v)), [R(1, 3, 5, 64), R(1, 3, 5, 64), R(1, 3, 5, 64)])
     add("sdpa_scale_long", Fn(lambda s, q, k, v: F.scaled_dot_product_attention(q, k, v, scale=0.3)), [R(2, 2, 37, 16), R(2, 2, 41, 16), R(2, 2, 41, 8)])
+    # ── adaptive average pooling (appended last so the RNG stream of every earlier case is unchanged) ──
+    add("adaptive_avg_pool2d_1", nn.AdaptiveAvgPool2d(1), [R(2, 5, 7, 6)])
+    add("adaptive_avg_pool2d_div", nn.AdaptiveAvgPool2d((3, 2)), [R(1, 3, 9, 8)])
+    add("adaptive_avg_pool3d_1", nn.AdaptiveAvgPool3d(1), [R(1, 4, 4, 5, 6)])
+    add("adaptive_avg_pool3d_div", nn.AdaptiveAvgPool3d((2, 1, 3)), [R(1, 2, 4, 5, 6)])
     return C
 
 

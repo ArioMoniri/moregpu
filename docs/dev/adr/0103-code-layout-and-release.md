@@ -19,5 +19,12 @@
   the verifier checks the manifest signature then every file hash. Single-file `.sig` kept for backward compatibility for
   one minor version. `release_verify.py` gets negative tests for a tampered/added/missing package file.
 
+**Implemented (manifest):** `release_sign.py manifest --key K --root apps/worker` writes `MANIFEST.sha256`
+(`<sha256>  <path>`, sorted, over `moregpu_worker/**` + `vision_ops.json`, bytecode caches excluded) and its detached
+signature over `moregpu-release/v1\nMANIFEST.sha256\n<sha256>`. Verify with `release_sign.py verify-manifest` or
+`verify_release.ts --manifest-root` (exit 4 = bad signature, 5 = a tampered/missing/unlisted file); negatives in
+`tests/security/release_verify.py` (g). `vision_wgsl.ts` is a second signed single-file artefact of the Deno worker
+(fail-soft in `install.sh`).
+
 ## Consequences
 One-file curl-install of the torch worker becomes "fetch tarball + verify manifest". Needs security-engineer sign-off.

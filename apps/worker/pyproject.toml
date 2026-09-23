@@ -29,6 +29,10 @@ dev = ["pytest", "pytest-cov"]
 [tool.hatch.build.targets.wheel]
 packages = ["moregpu_worker"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# the WGSL executor's op contract, read by moregpu_worker/vision/contract.py (repo layout: apps/worker/vision_ops.json)
+"vision_ops.json" = "moregpu_worker/vision/vision_ops.json"
+
 [tool.pytest.ini_options]
 markers = [
   "gpu: needs any accelerator (skipped in CI)",

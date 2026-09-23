@@ -1,5 +1,7 @@
 """Automatic lowering hooks (ADR-0114): op-graph for WGSL, ONNX for onnxruntime-web, native-only fallback, parity probe."""
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,7 +12,10 @@ from moregpu_worker.vision import adapters as A
 from moregpu_worker.vision import lowering as L
 from moregpu_worker.vision import opgraph_ref as OG
 
-from _vision_models import FftNet, TinyNet, tiny_basic_unet, tiny_monai_unet, tiny_vit
+from _vision_models import CumsumNet, FftNet, InplaceReuseNet, TinyNet, tiny_basic_unet, tiny_monai_unet, tiny_vit
+
+VISION_OPS_JSON = Path(__file__).resolve().parents[2] / "apps" / "worker" / "vision_ops.json"
+CONTRACT = json.loads(VISION_OPS_JSON.read_text())["ops"]
 
 
 @pytest.fixture(autouse=True)
@@ -25,16 +30,16 @@ def _x2d(b=1, c=3, n=8):
     return torch.randn(b, c, n, n)
 
 
-def test_op_table_covers_the_adr_list():
-    for op in ("aten.convolution.default", "aten.conv2d.default", "aten.conv3d.default", "aten.relu.default",
-               "aten.add.Tensor", "aten.mul.Tensor", "aten.linear.default", "aten.addmm.default", "aten.mm.default",
-               "aten.layer_norm.default", "aten.native_group_norm.default", "aten.instance_norm.default",
-               "aten.batch_norm.default", "aten.max_pool2d.default", "aten.avg_pool2d.default",
-               "aten.upsample_nearest2d.vec", "aten.upsample_trilinear3d.vec", "aten.cat.default",
-               "aten._softmax.default", "aten.sigmoid.default", "aten.gelu.default", "aten.permute.default",
-               "aten.view.default", "aten.reshape.default", "aten.argmax.default"):
+def test_op_table_is_the_executors_contract():
+    """WGSL_OPS is read from apps/worker/vision_ops.json (the executor's machine-readable contract), by base name."""
+    contract = json.loads(VISION_OPS_JSON.read_text())
+    assert L.WGSL_OPS == frozenset(contract["ops"])
+    for op in ("aten.convolution", "aten.conv2d", "aten.conv3d", "aten.relu", "aten.add", "aten.mul", "aten.linear",
+               "aten.addmm", "aten.layer_norm", "aten.instance_norm", "aten.batch_norm", "aten.max_pool2d",
+               "aten.upsample_trilinear3d", "aten.cat", "aten._softmax", "aten.gelu", "aten.permute", "aten.view",
+               "aten.argmax", "aten.scaled_dot_product_attention", "aten.adaptive_avg_pool2d"):
         assert op in L.WGSL_OPS, op
-    assert set(L.WGSL_OPS) <= set(OG.OPS), "the reference interpreter must implement every declared op"
+    assert L.base_op("aten.add.Tensor") == "aten.add" and L.base_op("aten.relu") == "aten.relu"
     assert L.LOWERING_VERSION
 
 
@@ -54,7 +59,8 @@ def test_tiny_cnn_lowers_to_opgraph_with_parity():
     d = art.describe()
     json.dumps(d)
     assert d["kind"] == "opgraph" and d["target"] == "wgsl" and len(d["artifact_sha256"]) == 64
-    assert set(d["ops"]) <= set(L.WGSL_OPS)
+    assert {L.base_op(o) for o in d["ops"]} <= set(L.WGSL_OPS)
+    assert_executor_schema(art.graph, w)
 
 
 def test_opgraph_handles_other_batch_sizes_via_numpy():
@@ -86,13 +92,23 @@ def test_resnet18_lowers_to_opgraph():
     assert art.kind == "opgraph" and art.servable, art.unsupported_ops
 
 
-def test_vit_falls_back_to_onnx_and_reports_unsupported_ops():
+def test_timm_vit_now_lowers_to_opgraph():
+    """SDPA / unbind (→ select) / layer_norm are in the executor's table, so a timm ViT no longer needs ONNX."""
     pytest.importorskip("timm")
     m = tiny_vit()
     x = torch.randn(1, 3, 32, 32)
     art = L.lower(A.from_module(m), "wgsl", example=x)
+    assert art.kind == "opgraph" and art.servable, (art.unsupported_ops, art.reason)
+    assert art.parity["max_abs"] <= 1e-4
+    assert_executor_schema(art.graph, art.weights)
+
+
+def test_op_outside_the_table_falls_back_to_onnx_and_reports_it():
+    m = CumsumNet().eval()
+    x = torch.randn(1, 2, 6, 6)
+    art = L.lower(A.from_module(m), "wgsl", example=x)
     assert art.kind == "onnx" and art.servable
-    assert "aten.scaled_dot_product_attention.default" in art.unsupported_ops
+    assert "aten.cumsum.default" in art.unsupported_ops
     assert art.parity["max_abs"] <= 1e-4
     import onnxruntime as ort
     s = ort.InferenceSession(art.onnx_bytes, providers=["CPUExecutionProvider"])
@@ -214,72 +230,172 @@ def test_lowering_non_native_handles(tmp_path):
     assert art2.kind == "opgraph" and art2.servable
 
 
-def test_opgraph_reference_rejects_unknown_ops():
-    g = {"version": 1, "inputs": ["x"], "params": {}, "nodes": [{"name": "y", "op": "aten.fft_rfft2.default",
-                                                                   "args": [{"ref": "x"}]}], "outputs": [{"ref": "y"}]}
+# ───────────────────────── executor schema (apps/worker/vision_ops.json, docs/WEBGPU_VISION.md) ─────────────────────────
+def assert_executor_schema(graph: dict, weights: dict) -> None:
+    """The lowered graph is EXACTLY the WGSL executor's schema: {version, inputs:[{name,shape}], nodes:[{op, inputs,
+    attrs, output}], outputs:[name], weights}, ops in the table, attrs keyed by ATen schema argument names, no getitem."""
+    g = json.loads(json.dumps(graph, allow_nan=False))  # JSON round-trip: plain, strict-JSON data only
+    assert g["version"] == 1 and g["weights"] == "model.safetensors"
+    assert all(set(i) == {"name", "shape"} and all(isinstance(d, int) for d in i["shape"]) for i in g["inputs"])
+    assert all(isinstance(o, str) for o in g["outputs"])
+    defined = {i["name"] for i in g["inputs"]} | set(weights)
+    for n in g["nodes"]:
+        assert set(n) == {"op", "inputs", "attrs", "output"}, n
+        assert n["op"].startswith("aten.") and L.base_op(n["op"]) in CONTRACT, n["op"]
+        for v in n["inputs"]:
+            assert v is None or v in defined, (n, v)
+        names = {a.name for a in L.aten_schema(n["op"]).arguments}
+        assert set(n["attrs"]) <= names, (n["op"], set(n["attrs"]) - names)
+        assert n["output"] not in defined, f"{n['output']} defined twice"
+        defined.add(n["output"])
+    for o in g["outputs"]:
+        assert o in defined
+
+
+def _segvit_micro():
+    from moregpu_worker.models.vit import vit_config
+    from moregpu_worker.vision import models as VM
+    torch.manual_seed(5)
+    return VM.build("segment", vit_config("micro", (32, 32), 8, 3), 3).eval()
+
+
+def _vit_tiny_width():
+    from moregpu_worker.models.vit import VisionTransformer
+    torch.manual_seed(6)
+    return VisionTransformer(img_size=(32, 32), patch=16, in_chans=3, embed_dim=192, depth=2, heads=3).eval()
+
+
+@pytest.mark.parametrize("name,make,shape", [
+    ("basic_unet3d", tiny_basic_unet, (1, 1, 32, 32, 32)),
+    ("segvit_micro", _segvit_micro, (1, 3, 32, 32)),
+    ("vit_tiny_width", _vit_tiny_width, (1, 3, 32, 32)),
+])
+def test_models_lower_to_the_executor_schema(name, make, shape):
+    m = make()
+    torch.manual_seed(1)
+    x = torch.randn(*shape)
+    art = L.lower(A.from_module(m), "wgsl", example=x)
+    assert art.kind == "opgraph" and art.servable, (art.unsupported_ops, art.reason)
+    assert art.parity["max_abs"] <= 1e-4 and art.parity["tol"] == 1e-4
+    w = st_load(art.weights_bytes())
+    assert_executor_schema(art.graph, w)
+    # the reference interpreter runs the SAME schema (from JSON + safetensors bytes only)
+    with torch.no_grad():
+        ref = m(x)
+    out = OG.run(json.loads(art.graph_json()), w, x)
+    assert (out - ref).abs().max().item() <= 1e-5 * max(1.0, ref.abs().max().item())
+
+
+def test_default_dialect_no_core_aten_decomposition(monkeypatch):
+    """torch.export.export default (training-IR) dialect: high-level ops survive (instance_norm, conv3d, SDPA,
+    upsample_bilinear2d) and run_decompositions is never called."""
+    from torch.export import ExportedProgram
+    monkeypatch.setattr(ExportedProgram, "run_decompositions", lambda *a, **k: pytest.fail("decomposition ran"))
+    art = L.lower(A.from_module(tiny_basic_unet()), "wgsl", example=torch.randn(1, 1, 32, 32, 32))
+    ops = {n["op"] for n in art.graph["nodes"]}
+    assert "aten.instance_norm.default" in ops and "aten.conv3d.default" in ops
+    art2 = L.lower(A.from_module(_segvit_micro()), "wgsl", example=torch.randn(1, 3, 32, 32))
+    ops2 = {n["op"] for n in art2.graph["nodes"]}
+    assert "aten.scaled_dot_product_attention.default" in ops2 and "aten.upsample_bilinear2d.vec" in ops2
+
+
+def test_unbind_getitem_becomes_select_nodes():
+    art = L.lower(A.from_module(_segvit_micro()), "wgsl", example=torch.randn(1, 3, 32, 32))
+    ops = [n["op"] for n in art.graph["nodes"]]
+    assert not any("unbind" in o or "getitem" in o for o in ops)
+    sel = [n for n in art.graph["nodes"] if n["op"] == "aten.select.int"]
+    assert len(sel) >= 3 and {n["attrs"]["index"] for n in sel} == {0, 1, 2} and all(n["attrs"]["dim"] == 0 for n in sel)
+
+
+def test_multi_output_getitem0_maps_to_the_node_output():
+    class LN(torch.nn.Module):
+        def forward(self, x):
+            return torch.ops.aten.native_layer_norm.default(x, [6], None, None, 1e-5)[0] * 2.0
+    art = L.lower(A.from_module(LN().eval()), "wgsl", example=torch.randn(2, 6))
+    assert art.kind == "opgraph" and art.servable, art.reason
+    n0, n1 = art.graph["nodes"]
+    assert n0["op"] == "aten.native_layer_norm.default" and n1["inputs"] == [n0["output"]] and n1["attrs"]["other"] == 2.0
+
+    class Bad(torch.nn.Module):
+        def forward(self, x):
+            y, mean, rstd = torch.ops.aten.native_layer_norm.default(x, [6], None, None, 1e-5)
+            return y + mean
+    art2 = L.lower(A.from_module(Bad().eval()), "wgsl", example=torch.randn(2, 6))
+    assert art2.kind != "opgraph" and any("getitem" in u for u in art2.unsupported_ops), art2.unsupported_ops
+
+
+def test_attrs_match_the_reference_exporter_on_the_golden_vit():
+    """The lowering emits the same nodes (op, attrs, input structure) as the executor goldens' reference exporter."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "goldens"))
+    import make_wgsl_goldens as MG
+    torch.manual_seed(44)
+    m = MG.ViTTiny().eval()
+    x = torch.randn(1, 3, 32, 32)
+    ref_graph, _ = MG.export_opgraph(m, (x,), ["x"])
+    art = L.lower(A.from_module(m), "wgsl", example=x)
+    assert art.servable
+    got = art.graph["nodes"]
+    assert [n["op"] for n in got] == [n["op"] for n in ref_graph["nodes"]]
+    assert [n["attrs"] for n in got] == [n["attrs"] for n in ref_graph["nodes"]]
+    assert [[v is None for v in n["inputs"]] for n in got] == [[v is None for v in n["inputs"]] for n in ref_graph["nodes"]]
+
+
+def test_inplace_ops_are_functionalised_or_refused():
+    tv = pytest.importorskip("torchvision")
+    torch.manual_seed(0)
+    m = tv.models.resnet18(weights=None, num_classes=10).eval()
+    art = L.lower(A.from_module(m), "wgsl", example=torch.randn(1, 3, 32, 32))
+    assert art.kind == "opgraph" and art.servable
+    ops = {n["op"] for n in art.graph["nodes"]}
+    assert "aten.add.Tensor" in ops and "aten.add_.Tensor" not in ops           # add_ → add (not in the table)
+    assert "aten.adaptive_avg_pool2d.default" in ops
+    # a value that is mutated in place and READ AGAIN afterwards cannot be functionalised safely
+    art2 = L.lower(A.from_module(InplaceReuseNet().eval()), "wgsl", example=torch.randn(1, 4))
+    assert art2.kind != "opgraph" and any("in-place" in u for u in art2.unsupported_ops), art2.unsupported_ops
+
+
+def test_non_finite_attrs_use_json_safe_spellings():
+    class P(torch.nn.Module):
+        def forward(self, x):  # -inf padding then a max pool: the output is finite
+            return torch.nn.functional.max_pool2d(torch.nn.functional.pad(x, (1, 1), value=float("-inf")), (1, 3), 1)
+    art = L.lower(A.from_module(P().eval()), "wgsl", example=torch.randn(1, 2, 2, 3))
+    assert art.servable, art.reason
+    pad = next(n for n in art.graph["nodes"] if L.base_op(n["op"]) in ("aten.pad", "aten.constant_pad_nd"))
+    assert pad["attrs"]["value"] == "-Infinity"
+    json.loads(json.dumps(art.graph, allow_nan=False))
+    padded = OG.run({**art.graph, "outputs": [pad["output"]]}, {}, torch.zeros(1, 2, 2, 3))
+    assert torch.isneginf(padded[..., 0]).all() and torch.isneginf(padded[..., -1]).all()
+
+
+def test_opgraph_reference_executes_a_hand_written_executor_graph():
+    torch.manual_seed(0)
+    x = torch.randn(1, 2, 6, 6)
+    w = {"c.weight": torch.randn(4, 2, 3, 3), "c.bias": torch.randn(4)}
+    w0 = {k: v.clone() for k, v in w.items()}
+    g = {"version": 1, "inputs": [{"name": "x", "shape": [1, 2, 6, 6]}], "weights": "model.safetensors", "nodes": [
+        {"op": "aten.conv2d.default", "inputs": ["x", "c.weight", "c.bias"],
+         "attrs": {"stride": [1, 1], "padding": [1, 1], "dilation": [1, 1], "groups": 1}, "output": "c"},
+        {"op": "aten.mul.Tensor", "inputs": ["c"], "attrs": {"other": 0.5}, "output": "m"},
+        {"op": "aten.cat", "inputs": ["c", "m"], "attrs": {"dim": 1}, "output": "cat"},
+        {"op": "aten.scaled_dot_product_attention.default", "inputs": ["cat", "cat", "cat"],
+         "attrs": {"dropout_p": 0.0, "is_causal": False, "scale": 0.25, "enable_gqa": False}, "output": "a"},
+        {"op": "aten.relu_.default", "inputs": ["a"], "attrs": {}, "output": "y"},
+        {"op": "aten.adaptive_avg_pool2d.default", "inputs": ["y"], "attrs": {"output_size": [3, 2]}, "output": "p"},
+    ], "outputs": ["p"]}
+    F = torch.nn.functional
+    c = F.conv2d(x, w["c.weight"], w["c.bias"], padding=1)
+    cat = torch.cat([c, c * 0.5], 1)
+    ref = F.adaptive_avg_pool2d(F.relu(F.scaled_dot_product_attention(cat, cat, cat, scale=0.25)), (3, 2))
+    assert torch.allclose(OG.run(g, w, x), ref, atol=1e-6)
+    assert all(torch.equal(w[k], w0[k]) for k in w)
+
+
+def test_opgraph_reference_rejects_ops_outside_the_table():
+    g = {"version": 1, "inputs": [{"name": "x", "shape": [1]}], "nodes": [
+        {"op": "aten.fft_rfft2.default", "inputs": ["x"], "attrs": {}, "output": "y"}], "outputs": ["y"]}
     with pytest.raises(KeyError, match="fft"):
         OG.run(g, {}, torch.zeros(1))
+    with pytest.raises(ValueError, match="version"):
+        OG.run({**g, "version": 2}, {}, torch.zeros(1))
 
 
-def test_opgraph_reference_ops_match_torch():
-    """Spot-check reference semantics for ops not exercised by the model tests."""
-    t = torch.randn(2, 4, 6, 6)
-    R = OG.OPS
-    assert torch.allclose(R["aten.avg_pool2d.default"](t, [2, 2]), torch.nn.functional.avg_pool2d(t, 2))
-    assert torch.equal(R["aten.argmax.default"](t, 1), t.argmax(1))
-    assert torch.allclose(R["aten.addmm.default"](torch.ones(3), torch.eye(3), torch.eye(3)), torch.eye(3) + 1)
-    assert torch.allclose(R["aten.mm.default"](torch.eye(2), torch.ones(2, 2)), torch.ones(2, 2))
-    assert torch.allclose(R["aten.upsample_bilinear2d.vec"](t, None, False, [2.0, 2.0]),
-                          torch.nn.functional.interpolate(t, scale_factor=2.0, mode="bilinear"))
-    t3 = torch.randn(1, 2, 4, 4, 4)
-    assert torch.allclose(R["aten.upsample_trilinear3d.vec"](t3, [8, 8, 8], False, None),
-                          torch.nn.functional.interpolate(t3, size=(8, 8, 8), mode="trilinear"))
-    w = torch.randn(4, 2, 3, 3)
-    assert torch.allclose(R["aten.convolution.default"](t, w, None, [1, 1], [1, 1], [1, 1], False, [0, 0], 2),
-                          torch.nn.functional.conv2d(t, w, None, 1, 1, 1, 2))
-    wt = torch.randn(4, 3, 2, 2)
-    assert torch.allclose(R["aten.convolution.default"](t, wt, None, [2, 2], [0, 0], [1, 1], True, [0, 0], 1),
-                          torch.nn.functional.conv_transpose2d(t, wt, stride=2))
-    out, mean, rstd = R["aten.native_group_norm.default"](t, None, None, 2, 4, 36, 2, 1e-5)
-    assert torch.allclose(out, torch.nn.functional.group_norm(t, 2), atol=1e-5)
-    assert torch.allclose(R["aten.batch_norm.default"](t, None, None, torch.zeros(4), torch.ones(4), False, 0.1,
-                                                       1e-5, True), t / (1 + 1e-5) ** 0.5, atol=1e-5)
-    assert torch.allclose(R["aten._softmax.default"](t, 1, False), t.softmax(1))
-    assert torch.allclose(R["aten.softmax.int"](t, 1), t.softmax(1))
-    assert R["aten.reshape.default"](t, [2, -1]).shape == (2, 144)
-    assert R["aten.flatten.using_ints"](t, 1, -1).shape == (2, 144)
-    assert R["aten.transpose.int"](t, 1, 2).shape == (2, 6, 4, 6)
-    assert torch.equal(R["aten.sub.Tensor"](t, t, 1), torch.zeros_like(t))
-    assert torch.allclose(R["aten.div.Tensor"](t, 2.0), t / 2)
-    assert torch.equal(R["aten.dropout.default"](t, 0.5, False), t)
-    assert torch.allclose(R["aten.mean.dim"](t, [2, 3], True), t.mean((2, 3), keepdim=True))
-    assert torch.allclose(R["aten.tanh.default"](t), t.tanh())
-    assert R["aten.constant_pad_nd.default"](t, [1, 1], 0.0).shape == (2, 4, 6, 8)
-    assert R["aten.upsample_nearest2d.default"](t, [12, 12]).shape == (2, 4, 12, 12)
-    assert R["aten.avg_pool3d.default"](t3, [2, 2, 2]).shape == (1, 2, 2, 2, 2)
-    assert R["aten.adaptive_avg_pool3d.default"](t3, [1, 1, 1]).shape == (1, 2, 1, 1, 1)
-    assert R["aten.upsample_nearest3d.vec"](t3, None, [2.0, 2.0, 2.0]).shape == (1, 2, 8, 8, 8)
-    assert R["aten.conv1d.default"](torch.randn(1, 2, 5), torch.randn(3, 2, 1)).shape == (1, 3, 5)
-    assert R["aten.conv_transpose2d.input"](t, wt, None, [2, 2]).shape == (2, 3, 12, 12)
-    assert R["aten.hardtanh.default"](t, 0.0, 6.0).max() <= 6
-    assert R["aten.silu.default"](t).shape == t.shape
-    assert R["aten.clone.default"](t) is not t
-    assert R["aten.contiguous.default"](t).is_contiguous()
-    assert R["aten.unsqueeze.default"](t, 0).shape == (1, 2, 4, 6, 6)
-    assert R["aten.squeeze.dim"](t[:1], 0).shape == (4, 6, 6)
-
-
-def test_decode_encode_special_values():
-    for v in (float("inf"), float("-inf"), torch.float16, torch.device("cpu"), [1, (2, 3)], None, "s",
-              torch.contiguous_format, torch.strided):
-        enc = L.encode_arg(v)
-        json.dumps(enc)
-        dec = OG.decode_arg(enc, {})
-        if isinstance(v, tuple | list):
-            assert dec == [1, [2, 3]]
-        else:
-            assert dec == v
-    nan = OG.decode_arg(L.encode_arg(float("nan")), {})
-    assert nan != nan
-    with pytest.raises(TypeError):
-        L.encode_arg(object())

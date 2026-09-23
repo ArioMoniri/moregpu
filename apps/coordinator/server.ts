@@ -18,6 +18,10 @@
  * worker pin (MOREGPU_PIN). Set MOREGPU_INSECURE=1 to opt back into plaintext ws:// for a simple local/CI run.
  */
 import { VisionBatch, type BatchItem } from './lib/vision_batch.ts';
+import {
+  fleetWants, exampleShape, inferCall, makeFleetRpc, pushVisionArtifact, bytesFromB64, parityReport,
+  type Fleet, type TensorB64, type VisionIO, type WorkerKind,
+} from './lib/vision_fleet.ts';
 import { TrainSession, type Rpc, type RoundSummary, type SessionConfig, type CheckpointStore } from './lib/train_session.ts';
 if (Deno.args.includes('--help') || Deno.args.includes('-h')) { printHelp(); Deno.exit(0); }
 
@@ -1769,18 +1773,35 @@ async function trainSessionRoute(req: Request, url: URL): Promise<Response> {
   }
 }
 
-// ---------- distributed vision inference (apps/coordinator/lib/vision_batch.ts) ----------
-const visionModels = new Map<string, { workers: string[]; meta: Record<string, unknown>; rr: number }>();
+// ---------- distributed vision inference (apps/coordinator/lib/vision_batch.ts, lib/vision_fleet.ts) ----------
+// A model's holders can be native torch workers (vision_infer_load / vision_predict over the train relay) and WebGPU
+// workers (a lowered op-graph over the sealed model RPC) — a MIXED fleet (/vision/load {fleet: 'webgpu'|'all'}).
+interface VisionHolder { workers: string[]; kinds: Record<string, WorkerKind>; meta: Record<string, unknown>; rr: number; io?: VisionIO; lowerer?: string; lowered?: Record<string, unknown> }
+const visionModels = new Map<string, VisionHolder>();
 const visionJobs = new Map<string, VisionBatch>();
+const isTorchWorker = (id: string) => !!workers.get(id)?.label.includes('torch');
+// WebGPU workers that can run the WGSL vision executor: they advertise the `vision` cap only with a real device
+const visionGpuWorkers = () => activeFleet().filter((w) => w.caps.has('vision') && !w.label.includes('torch'));
+const modelRpcById: Rpc = (id, op, payload) => {
+  const w = workers.get(id);
+  if (!w) return Promise.resolve({ ok: false, error: `worker ${id} disconnected` });
+  return modelRPC(w, op, payload);
+};
+const holderKind = (m: VisionHolder) => (w: string): WorkerKind | undefined => m.kinds[w] ?? (isTorchWorker(w) ? 'torch' : workers.has(w) ? 'webgpu' : undefined);
+const sameShape = (a: number[] | undefined, b: number[] | undefined) => !!a && !!b && a.length === b.length && a.every((v, i) => v === Number(b[i]));
 async function visionRoute(req: Request, url: URL): Promise<Response> {
   const parts = url.pathname.split('/').filter(Boolean);   // ['vision', action, id?]
   const action = parts[1], jid = parts[2];
   try {
-    if (action === 'models' && req.method === 'GET') return json({ ok: true, models: Object.fromEntries([...visionModels].map(([k, v]) => [k, { workers: v.workers, ...v.meta }])) });
+    if (action === 'models' && req.method === 'GET') return json({ ok: true, models: Object.fromEntries([...visionModels].map(([k, v]) => [k, { workers: v.workers, kinds: v.kinds, io: v.io, ...v.meta }])) });
     if (action === 'load' && req.method === 'POST') {
-      const body = await req.json().catch(() => ({})) as { id?: string; export?: string; spec?: Record<string, unknown>; workers?: string[]; task?: string; num_classes?: number; kind?: string };
+      const body = await req.json().catch(() => ({})) as { id?: string; export?: string; spec?: Record<string, unknown>; workers?: string[]; task?: string; num_classes?: number; kind?: string; fleet?: Fleet; example_shape?: number[]; f16?: boolean };
       if (!body.id || (!body.export && !body.spec)) return json({ error: 'id and one of export (a MoreGPU export dir on the workers) or spec (a published-model spec, docs/MODELS.md) are required' }, 400);
-      const targets = body.workers?.length ? body.workers : torchWorkers().map((w) => w.id);
+      let want: { torch: boolean; webgpu: boolean };
+      try { want = fleetWants(body.fleet); } catch (e) { return json({ error: (e as Error).message }, 400); }
+      const chosen = body.workers?.length ? body.workers : null;
+      const targets = chosen ? chosen.filter(isTorchWorker) : torchWorkers().map((w) => w.id);
+      if (!targets.length) return json({ error: want.webgpu ? 'no native (torch) worker connected — the lowering for WebGPU workers runs on one' : 'no native (torch) worker connected' }, 503);
       const res = await Promise.all(targets.map(async (id) => {
         if (!body.spec) return tsRpc(id, 'vision_infer_load', { id: body.id, export: body.export });
         // published model: adapters load + verify it (sha256, allowlisted plugins, no pickles), then the inference store wraps it
@@ -1789,41 +1810,129 @@ async function visionRoute(req: Request, url: URL): Promise<Response> {
         return tsRpc(id, 'vision_infer_load', { id: body.id, handle: body.id, task: body.task ?? 'segment', num_classes: body.num_classes, kind: body.kind ?? '3d' });
       }));
       const ok = targets.filter((_, i) => res[i]!.ok);
-      if (!ok.length) return json({ error: `load failed everywhere: ${res[0]?.error}` }, 502);
-      visionModels.set(body.id, { workers: ok, meta: res[targets.indexOf(ok[0]!)]!.data ?? {}, rr: 0 });
-      return json({ ok: true, id: body.id, workers: ok, failed: targets.filter((_, i) => !res[i]!.ok), meta: visionModels.get(body.id)!.meta });
+      const failed: Record<string, string> = {};
+      targets.forEach((w, i) => { if (!res[i]!.ok) failed[w] = res[i]!.error ?? 'failed'; });
+      if (!ok.length) return json({ error: `load failed everywhere: ${res[0]?.error}`, failed }, 502);
+      const meta = res[targets.indexOf(ok[0]!)]!.data ?? {};
+      const kinds: Record<string, WorkerKind> = {};
+      const holders = want.torch ? [...ok] : [];
+      for (const w of holders) kinds[w] = 'torch';
+      let io: VisionIO | undefined, lowered: Record<string, unknown> | undefined, lowerer: string | undefined;
+      const gpu: string[] = [];
+      if (want.webgpu) {
+        const gpuTargets = chosen ? chosen.filter((w) => visionGpuWorkers().some((x) => x.id === w)) : visionGpuWorkers().map((w) => w.id);
+        if (!gpuTargets.length) failed['webgpu'] = 'no WebGPU worker advertises the vision capability';
+        else {
+          // lower ONCE on a torch worker: the executor's op-graph + safetensors, parity-probed there (fp32 ≤ 1e-4)
+          lowerer = ok[0]!;
+          const lo = await tsRpc(lowerer, 'vision_lower', { id: body.id, target: 'wgsl', example_shape: exampleShape(meta, body.example_shape), include_bytes: true });
+          const d = lo.data ?? {};
+          if (!lo.ok || d.kind !== 'opgraph' || !d.servable) {
+            const why = !lo.ok ? lo.error : d.kind !== 'opgraph' ? `not lowerable to the WGSL executor (${d.kind}; unsupported: ${(d.unsupported_ops as string[] | undefined)?.join(', ') || d.reason})` : String(d.reason);
+            for (const w of gpuTargets) failed[w] = `lowering: ${why}`;
+          } else {
+            const { graph_json, weights_b64, ...summary } = d as Record<string, unknown> & { graph_json: string; weights_b64: string };
+            lowered = summary;
+            const g = JSON.parse(graph_json) as { inputs: { name: string; shape: number[] }[]; outputs: string[] };
+            io = { input: g.inputs[0]!.name, output: g.outputs[0]!, shape: g.inputs[0]!.shape };
+            const files = [{ name: 'graph.json', bytes: new TextEncoder().encode(graph_json) }, { name: 'model.safetensors', bytes: bytesFromB64(weights_b64) }];
+            const pushed = await Promise.all(gpuTargets.map((w) => pushVisionArtifact(modelRpcById, w, body.id!, files, PUSH_CHUNK, { f16: !!body.f16 })));
+            gpuTargets.forEach((w, i) => { if (pushed[i]!.ok) { gpu.push(w); holders.push(w); kinds[w] = 'webgpu'; } else failed[w] = pushed[i]!.error ?? 'push failed'; });
+            log('info', `vision ${body.id}: lowered on ${lowerer} (${summary.bytes} B, parity max|Δ| ${(summary.parity as Record<string, unknown> | undefined)?.max_abs}) → WebGPU ${gpu.join(', ') || 'none'}`);
+          }
+        }
+      }
+      if (!holders.length) return json({ error: `no worker holds ${body.id} for fleet '${body.fleet}'`, failed }, 502);
+      visionModels.set(body.id, { workers: holders, kinds, meta, rr: 0, io, lowerer, lowered });
+      return json({ ok: true, id: body.id, fleet: body.fleet ?? 'native', workers: holders, torch: holders.filter((w) => kinds[w] === 'torch'), webgpu: gpu,
+        failed: Object.keys(failed).length ? failed : [], meta, io, lowered });
     }
     if (action === 'lower' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string; target?: string; example_shape?: number[]; worker?: string };
       const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model' }, 404);
-      const r = await tsRpc(body.worker ?? m.workers[0]!, 'vision_lower', { id: body.id, target: body.target ?? 'wgsl', example_shape: body.example_shape });
+      const tw = body.worker ?? m.workers.find((w) => holderKind(m)(w) === 'torch') ?? m.lowerer;
+      if (!tw) return json({ error: 'no native (torch) holder to lower on' }, 503);
+      const r = await tsRpc(tw, 'vision_lower', { id: body.id, target: body.target ?? 'wgsl', example_shape: body.example_shape });
       return r.ok ? json({ ok: true, ...r.data }) : json({ error: r.error }, 502);
     }
     if (action === 'capabilities' && req.method === 'GET') {
-      const ws = torchWorkers();
-      const r = await Promise.all(ws.map((w) => tsRpc(w.id, 'vision_models_describe', {})));
-      return json({ ok: true, workers: Object.fromEntries(ws.map((w, i) => [w.id, r[i]!.ok ? r[i]!.data : { error: r[i]!.error }])) });
+      const ws = torchWorkers(), gs = visionGpuWorkers();
+      const [r, g] = await Promise.all([Promise.all(ws.map((w) => tsRpc(w.id, 'vision_models_describe', {}))), Promise.all(gs.map((w) => modelRPC(w, 'vision_caps', {})))]);
+      return json({ ok: true, workers: Object.fromEntries([...ws.map((w, i) => [w.id, r[i]!.ok ? r[i]!.data : { error: r[i]!.error }]),
+        ...gs.map((w, i) => [w.id, g[i]!.ok ? { kind: 'webgpu', ...g[i]!.data } : { error: g[i]!.error }])]) });
     }
     if (action === 'unload' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string };
       const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model' }, 404);
-      await Promise.all(m.workers.map((w) => tsRpc(w, 'vision_infer_unload', { id: body.id })));
+      const all = [...new Set([...m.workers, ...(m.lowerer ? [m.lowerer] : [])])];
+      await Promise.all(all.map((w) => holderKind(m)(w) === 'webgpu' ? modelRpcById(w, 'vision_unload', { id: body.id }) : tsRpc(w, 'vision_infer_unload', { id: body.id })));
       visionModels.delete(body.id!); return json({ ok: true });
     }
     if (action === 'infer' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string; shape?: number[]; data?: string; pool?: string; worker?: string };
       const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model — POST /vision/load first' }, 404);
-      const live = m.workers.filter((w) => workers.has(w)); if (!live.length) return json({ error: 'no live worker holds this model' }, 503);
+      const kind = holderKind(m);
+      // a WebGPU holder runs a static-shape graph: only inputs of the lowered shape (and no torch-side pooling) go there
+      const fits = (w: string) => kind(w) === 'torch' || (sameShape(m.io?.shape, body.shape) && !body.pool);
+      const live = m.workers.filter((w) => workers.has(w) && fits(w)); if (!live.length) return json({ error: 'no live worker holds this model (for this input shape)' }, 503);
       const w = body.worker && live.includes(body.worker) ? body.worker : live[m.rr++ % live.length]!;
-      const r = await tsRpc(w, 'vision_infer', { id: body.id, shape: body.shape, data: body.data, pool: body.pool });
+      const k = kind(w)!;
+      const call = inferCall(k, body.id!, { shape: body.shape ?? [], data: body.data ?? '' }, m.io);
+      if (k === 'torch' && body.pool) call.payload.pool = body.pool;
+      const r = await makeFleetRpc(kind, tsRpc, modelRpcById, m.io)(w, call.op, call.payload);
       return r.ok ? json({ ok: true, worker: w, ...r.data }) : json({ error: r.error }, 502);
+    }
+    if (action === 'infer_batch' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({})) as { id?: string; inputs?: TensorB64[]; workers?: string[]; check_parity?: boolean; reference?: string; steal_after_ms?: number; max_attempts?: number };
+      const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model — POST /vision/load first' }, 404);
+      if (!Array.isArray(body.inputs) || !body.inputs.length || body.inputs.some((x) => !x || !Array.isArray(x.shape) || typeof x.data !== 'string')) return json({ error: 'inputs must be a non-empty array of {shape, data (base64 little-endian f32)}' }, 400);
+      const kind = holderKind(m);
+      const excluded: Record<string, string> = {};
+      const allFit = body.inputs.every((x) => sameShape(m.io?.shape, x.shape));
+      const ws = (body.workers?.length ? body.workers.filter((w) => m.workers.includes(w)) : m.workers).filter((w) => workers.has(w)).filter((w) => {
+        if (kind(w) === 'webgpu' && !allFit) { excluded[w] = `input shape ≠ the lowered static shape [${m.io?.shape}]`; return false; }
+        return true;
+      });
+      if (!ws.length) return json({ error: 'no live worker holds this model', excluded }, 503);
+      const rpc = makeFleetRpc(kind, tsRpc, modelRpcById, m.io);
+      const jobId = `vi-${crypto.randomUUID().slice(0, 8)}`;
+      const items: BatchItem[] = body.inputs.map((x, i) => ({ x, i }));
+      const job = new VisionBatch(jobId, body.id!, items, ws, rpc, {
+        task: (w, it) => inferCall(kind(w)!, body.id!, (it as unknown as { x: TensorB64 }).x, m.io),
+        stealAfterMs: body.steal_after_ms, maxAttempts: body.max_attempts, telemetry: tsTelemetrySink(jobId),
+      });
+      const r = await job.run();
+      const byIdx = new Map(job.results.map((x) => [x.index, x]));
+      const outputs = body.inputs.map((_, i) => {
+        const x = byIdx.get(i);
+        return x?.ok ? { ...(x.data as Record<string, unknown>), worker: x.worker, ms: x.ms } as unknown as TensorB64 & { worker?: string } : null;
+      });
+      const failed = job.results.filter((x) => !x.ok).map((x) => ({ index: x.index, worker: x.worker, error: x.error }));
+      let parity: ReturnType<typeof parityReport> | undefined;
+      if (body.check_parity) {
+        const ref = (body.reference && workers.has(body.reference) ? body.reference : undefined)
+          ?? m.workers.find((w) => kind(w) === 'torch' && workers.has(w)) ?? (m.lowerer && workers.has(m.lowerer) ? m.lowerer : undefined);
+        if (!ref) return json({ error: 'check_parity needs a live reference worker (a native torch holder)' }, 503);
+        const refRpc = makeFleetRpc((w) => kind(w) ?? 'torch', tsRpc, modelRpcById, m.io);
+        const refOut = await Promise.all(body.inputs.map(async (x, i) => {
+          const o = outputs[i];
+          if (o && o.worker === ref) return o;               // already computed on the reference worker
+          const c = inferCall(kind(ref) ?? 'torch', body.id!, x, m.io);
+          const rr = await refRpc(ref, c.op, c.payload);
+          return rr.ok ? rr.data as unknown as TensorB64 : null;
+        }));
+        parity = parityReport(outputs, refOut, ref);
+      }
+      return json({ ok: failed.length === 0, id: body.id, job: jobId, outputs, per_worker: r.per_worker, workers: ws, excluded, failed,
+        retries: r.retries, stolen: r.stolen, wall_s: r.wall_s, parity });
     }
     if (action === 'batch' && req.method === 'POST') {
       const body = await req.json().catch(() => ({})) as { id?: string; items?: BatchItem[]; workers?: string[]; tta?: string; overlap?: number; sw_batch?: number; blend?: string; normalize?: unknown; steal_after_ms?: number; max_attempts?: number; split?: 'cases' | 'tiles' };
       const m = body.id ? visionModels.get(body.id) : undefined; if (!m) return json({ error: 'no such model — POST /vision/load first' }, 404);
       if (!Array.isArray(body.items) || !body.items.length) return json({ error: 'items must be a non-empty array of {ref, out, mask?}' }, 400);
-      const ws = (body.workers?.length ? body.workers.filter((w) => m.workers.includes(w)) : m.workers).filter((w) => workers.has(w));
-      if (!ws.length) return json({ error: 'no live worker holds this model' }, 503);
+      // volume batches (vision_predict: sliding window, TTA, label maps under MOREGPU_OUTPUT_DIR) run on native holders
+      const ws = (body.workers?.length ? body.workers.filter((w) => m.workers.includes(w)) : m.workers).filter((w) => workers.has(w) && holderKind(m)(w) === 'torch');
+      if (!ws.length) return json({ error: 'no live native (torch) worker holds this model — /vision/batch runs volumes on torch workers; use /vision/infer_batch for tensors' }, 503);
       const id = `vj-${crypto.randomUUID().slice(0, 8)}`;
       const job = new VisionBatch(id, body.id!, body.items, ws, tsRpc, { tta: body.tta, overlap: body.overlap, sw_batch: body.sw_batch, blend: body.blend,
         normalize: body.normalize, split: body.split, stealAfterMs: body.steal_after_ms, maxAttempts: body.max_attempts, telemetry: tsTelemetrySink(id) });
@@ -2764,7 +2873,9 @@ if (SELF_WORKER) {
     // OLDER worker.ts (e.g. from before a registration-protocol change) would desync from THIS coordinator and
     // self-reject with "bad join token". Force-refresh just that one module in the remote case so the built-in
     // worker always matches the coordinator; a local file:// worker is always read fresh, so skip it there.
-    const reload = workerUrl.startsWith('http') ? [`--reload=${workerUrl}`] : [];
+    // vision_wgsl.ts (the WebGPU vision executor, lazily imported by worker.ts) is refreshed with it for the same reason.
+    const visionUrl = new URL('../worker/vision_wgsl.ts', import.meta.url).href;
+    const reload = workerUrl.startsWith('http') ? [`--reload=${workerUrl},${visionUrl}`] : [];
     new Deno.Command(Deno.execPath(), {
       args: ['run', '--unstable-webgpu', ...reload, '--allow-net', '--allow-env', '--allow-sys', workerUrl,
         '--server', wsUrl, '--token', cfg.joinToken, '--name', Deno.env.get('MOREGPU_NAME') ?? 'admin-slot'],

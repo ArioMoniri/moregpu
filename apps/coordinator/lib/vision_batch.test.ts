@@ -57,6 +57,37 @@ describe('VisionBatch (pull-based work queue with stealing + churn retry)', () =
   });
 });
 
+describe('VisionBatch with a per-worker-kind task callback (mixed torch + WebGPU fleet)', () => {
+  it('each worker gets the op/payload its kind needs; items are served by both kinds; results keep item order', async () => {
+    const kind: Record<string, 'torch' | 'webgpu'> = { t1: 'torch', g1: 'webgpu' };
+    const seen: Array<[string, string, any]> = [];
+    const rpc: Rpc = async (w, op, p) => {
+      seen.push([w, op, p]);
+      await sleep(kind[w] === 'torch' ? 3 : 5);
+      const i = kind[w] === 'torch' ? p.i : p.inputs.x.i;
+      return { ok: true, data: { shape: [1], data: `y${i}`, kind: kind[w] } };
+    };
+    const its = Array.from({ length: 10 }, (_, i) => ({ i }));
+    const b = new VisionBatch('j', 'm', its, ['t1', 'g1'], rpc, {
+      task: (w, it) => kind[w] === 'torch'
+        ? { op: 'vision_infer', payload: { id: 'm', i: (it as { i: number }).i } }
+        : { op: 'vision_infer', payload: { id: 'm', inputs: { x: { i: (it as { i: number }).i } } } },
+    });
+    const r = await b.run();
+    expect(r.done).toBe(10); expect(r.failed).toBe(0);
+    expect(b.results.map((x) => x.data!.data)).toEqual(its.map((_, i) => `y${i}`));
+    expect(r.per_worker.t1! + r.per_worker.g1!).toBe(10);
+    expect(r.per_worker.t1).toBeGreaterThan(0); expect(r.per_worker.g1).toBeGreaterThan(0);
+    expect(seen.every(([w, op, p]) => op === 'vision_infer' && (kind[w] === 'torch' ? 'i' in p : 'inputs' in p))).toBe(true);
+  });
+  it('without a task callback the default op is still vision_predict (existing behaviour)', async () => {
+    const ops: string[] = [];
+    const rpc: Rpc = async (_w, op) => { ops.push(op); return { ok: true, data: {} }; };
+    await new VisionBatch('j', 'm', items(3), ['a'], rpc).run();
+    expect(ops).toEqual(['vision_predict', 'vision_predict', 'vision_predict']);
+  });
+});
+
 describe('VisionBatch split=tiles (one volume across all workers)', () => {
   it('each item is split into one part per worker, merged once, part failures retried on another worker', async () => {
     const calls: Array<[string, string, any]> = [];

@@ -6,9 +6,12 @@
 
 export interface RpcResult { ok: boolean; data?: Record<string, unknown>; error?: string }
 export type Rpc = (workerId: string, op: string, payload: Record<string, unknown>) => Promise<RpcResult>;
-export interface BatchItem { ref: unknown; out: string; mask?: unknown }
+export interface BatchItem { ref?: unknown; out?: string; mask?: unknown; [k: string]: unknown }
+/** Per-worker request builder: lets one queue drive workers of different kinds (a torch worker and a WebGPU worker need
+ *  different payloads for the same logical op). Default: vision_predict {id, ref, out, mask, tta, …} (torch). */
+export type BatchTask = (worker: string, item: BatchItem, index: number) => { op: string; payload: Record<string, unknown> };
 export interface BatchOpts { tta?: string; overlap?: number; sw_batch?: number; blend?: string; normalize?: unknown;
-  split?: 'cases' | 'tiles';
+  split?: 'cases' | 'tiles'; task?: BatchTask;
   maxAttempts?: number; deadAfter?: number; stealAfterMs?: number; telemetry?: (r: Record<string, unknown>) => void; now?: () => number }
 export interface ItemResult { index: number; worker?: string; ok: boolean; data?: Record<string, unknown>; error?: string; attempts: number; ms?: number }
 
@@ -61,8 +64,9 @@ export class VisionBatch {
       f.workers.add(w); this.inflight.set(idx, f);
       const it = this.items[idx]!; const t = this.now();
       this.attempts[idx]!++;
-      const r = await this.rpc(w, 'vision_predict', { id: this.model, ref: it.ref, out: it.out, mask: it.mask, tta: this.o.tta ?? 'none',
-        overlap: this.o.overlap ?? 0.5, sw_batch: this.o.sw_batch ?? 8, blend: this.o.blend ?? 'gaussian', normalize: this.o.normalize });
+      const req = this.o.task ? this.o.task(w, it, idx) : { op: 'vision_predict', payload: { id: this.model, ref: it.ref, out: it.out, mask: it.mask, tta: this.o.tta ?? 'none',
+        overlap: this.o.overlap ?? 0.5, sw_batch: this.o.sw_batch ?? 8, blend: this.o.blend ?? 'gaussian', normalize: this.o.normalize } };
+      const r = await this.rpc(w, req.op, req.payload);
       f.workers.delete(w);
       if (this.finished.has(idx)) continue;                // a stolen duplicate already finished it
       if (r.ok) {

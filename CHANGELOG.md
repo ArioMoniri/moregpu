@@ -77,6 +77,13 @@ The work is planned in ADRs 0101–0114 (`docs/dev/adr/`) and verified against t
 
 ### Added
 
+- **Mixed torch + WebGPU vision fleet.** `/vision/load {fleet: 'webgpu'|'all'}` lowers the model on a torch worker
+  and streams the op-graph + safetensors to every worker with the `vision` cap. `/vision/infer` routes to either kind,
+  and `/vision/infer_batch` spreads tensors over all holders with the work-stealing queue (optional `check_parity`).
+  The Python lowering now emits exactly the WGSL executor's schema (`vision_ops.json`, default `torch.export`
+  dialect). Python-lowered UNet/ViT graphs equal PyTorch within 1e-5 on the TS executor and on lavapipe. The executor
+  gains `adaptive_avg_pool2d/3d` (divisible sizes only). `vision_wgsl.ts` is a second signed installer artefact that
+  fails soft, and the torch worker tree gets a signed `MANIFEST.sha256` (ADR-0103). CI adds a `webgpu` job.
 - **Pipeline sharding now works for Llama-family models**, not just GPT-2 — the torch worker's
   `shard_load`/`shard_forward` detect the architecture (GPT-2 `transformer.h` + learned positions vs
   Llama-style `model.layers` + RMSNorm + RoPE) and pipe activations through either. Verified token-for-token

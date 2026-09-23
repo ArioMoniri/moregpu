@@ -112,6 +112,24 @@ for (const [name, outs] of [['unet3d_tiny', ['logits', 'probs']], ['seg2d_tiny',
   } });
 }
 
+// graphs produced by the PYTHON lowering (tests/goldens/make_lowering_goldens.py) — the mixed-fleet path, on real WGSL
+for (const name of ['unet3d', 'segvit', 'vit_tiny']) {
+  Deno.test({ name: `webgpu: python-lowered ${name} on the GPU equals PyTorch (≤1e-5 rel)`, ...T, fn: async () => {
+    const graph = JSON.parse(await Deno.readTextFile(url(`../goldens/wgsl/lowered/${name}.graph.json`))) as OpGraph;
+    const weights = parseSafetensors(await Deno.readFile(url(`../goldens/wgsl/lowered/${name}.safetensors`)));
+    const io = JSON.parse(await Deno.readTextFile(url(`../goldens/wgsl/lowered/${name}.io.json`))) as { inputs: Record<string, TJson>; expected: Record<string, TJson> };
+    const gpu = await createGpuRunner(device!, VisionModel.compile(graph, weights));
+    try {
+      const out = await gpu.run(inputsOf(io.inputs));
+      for (const [k, v] of Object.entries(io.expected)) {
+        const e = tensorOf(v), err = relErr(out[k].data, e.data);
+        console.log(`[webgpu] lowered ${name}.${k}: vs torch ${err.toExponential(2)}`);
+        assert(shapeEq(out[k].shape, e.shape) && err <= 1e-5, `lowered ${name}.${k} err ${err}`);
+      }
+    } finally { gpu.destroy(); }
+  } });
+}
+
 Deno.test({ name: 'webgpu: UNet under a 256 KiB binding limit (spatial slabs + inner chunks) on the GPU', ...T, fn: async () => {
   const { model, io } = await loadModel('unet3d_tiny', { maxBindingBytes: 256 * 1024 });
   assert(model.plan.tiled.length > 0, 'expected tiling');
