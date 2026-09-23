@@ -1,0 +1,354 @@
+// Generic training session driven by the coordinator (ADR-0104/0105/0106/0107/0111).
+// Pure logic over an injected RPC, so it is unit-tested with fake workers (train_session.test.ts) and wired to the
+// real sealed relay in server.ts. The coordinator is the DiLoCo parameter server: it assigns deterministic sample
+// shards, pulls each worker's post-inner-step state, takes a samples-weighted average, applies outer Nesterov,
+// broadcasts, and writes one telemetry record per (round, worker) plus one per round.
+
+import { OuterState, weightedAverage, outerStep, dropNonFinite, type Tensors } from './diloco.ts';
+import { SampleStream, allocate, split, type StreamState } from './sharding.ts';
+import { decodeTensors, encodeTensors, b64ToBytes, bytesToB64, chunkBytes, concatBytes, type WireHeader, type WireDtype } from './tensorwire.ts';
+
+export interface RpcResult { ok: boolean; data?: Record<string, unknown>; error?: string }
+export type Rpc = (workerId: string, op: string, payload: Record<string, unknown>) => Promise<RpcResult>;
+
+export interface SessionConfig {
+  task: string;
+  cfg?: Record<string, unknown>;
+  amp?: 'auto' | 'bf16' | 'fp16' | 'fp32';
+  seed?: number;
+  deterministic?: boolean;
+  manifest_len: number;              // number of samples addressable by index on every worker
+  batch: number;                     // samples per inner step
+  inner_steps: number;               // H
+  lr: number;
+  outer_lr?: number;                 // η (default 0.7)
+  outer_momentum?: number;           // μ (default 0.9)
+  alloc?: 'fixed' | 'proportional';
+  sync_dtype?: WireDtype;            // worker → coordinator
+  broadcast_dtype?: 'f32' | 'bf16' | 'fp16';
+  chunk_bytes?: number;
+  target_samples?: number;           // stop exactly here
+  max_rounds?: number;
+  checkpoint_every?: number;         // rounds; 0 = off
+  keep_checkpoints?: number;
+  eval?: { refs: unknown[]; kind: string; every: number };
+}
+
+export interface CheckpointStore {
+  write(name: string, data: Uint8Array | string): Promise<void>;
+  read(name: string): Promise<Uint8Array | null>;
+  list(prefix: string): Promise<string[]>;
+  remove(name: string): Promise<void>;
+}
+
+export interface SessionDeps {
+  now?: () => number;                            // ms
+  telemetry?: (rec: Record<string, unknown>) => void;
+  store?: CheckpointStore;
+  log?: (level: string, msg: string) => void;
+  gitSha?: string;
+}
+
+export interface RoundSummary {
+  round: number; workers: string[]; dropped: string[]; dropped_nonfinite: string[]; samples: number; samples_seen: number;
+  avg_last_loss: number; wall_s: number; reduce_s: number; bytes_up: number; bytes_down: number; alarms: string[];
+  eval?: Record<string, unknown>; monitors?: Record<string, unknown>; done: boolean;
+}
+
+const SCHEMA = 'moregpu.telemetry/1';
+
+export async function configHash(cfg: SessionConfig): Promise<string> {
+  const canon = JSON.stringify(cfg, Object.keys(flatten(cfg)).sort());
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canon)));
+  return Array.from(d, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+function flatten(o: unknown, out: Record<string, true> = {}): Record<string, true> {
+  if (o && typeof o === 'object') for (const [k, v] of Object.entries(o as Record<string, unknown>)) { out[k] = true; flatten(v, out); }
+  return out;
+}
+
+export class TrainSession {
+  st: OuterState | null = null;
+  shapes: Record<string, number[]> = {};
+  stream: SampleStream;
+  samplesSeen = 0;
+  perWorkerSeen = new Map<string, number>();
+  speeds = new Map<string, number>();
+  lastBroadcast: Tensors | null = null;
+  history: RoundSummary[] = [];
+  status: 'new' | 'ready' | 'running' | 'done' | 'failed' | 'closed' = 'new';
+  busy = false;
+  lastError = '';
+  hash = '';
+  private now: () => number;
+
+  constructor(public id: string, public cfg: SessionConfig, public workers: string[], private rpc: Rpc, private deps: SessionDeps = {}) {
+    if (!(cfg.manifest_len > 0)) throw new Error('manifest_len must be > 0');
+    if (!(cfg.batch > 0) || !(cfg.inner_steps > 0)) throw new Error('batch and inner_steps must be > 0');
+    if (!workers.length) throw new Error('a training session needs at least one worker');
+    this.stream = new SampleStream(cfg.manifest_len, cfg.seed ?? 0);
+    this.now = deps.now ?? (() => performance.now());
+  }
+
+  get round(): number { return this.st?.round ?? 0; }
+  private get chunk(): number { return this.cfg.chunk_bytes ?? (4 << 20); }
+  private log(level: string, msg: string) { this.deps.log?.(level, `train ${this.id}: ${msg}`); }
+
+  private async call(w: string, op: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const r = await this.rpc(w, op, { session: this.id, ...payload });
+    if (!r.ok) throw new Error(`${w} ${op}: ${r.error ?? 'failed'}`);
+    return r.data ?? {};
+  }
+
+  /** Pull an encoded state whose first reply carried header/nchunks/chunk0. Returns tensors + bytes received. */
+  private async pull(w: string, first: Record<string, unknown>): Promise<{ tensors: Tensors; bytes: number; header: WireHeader }> {
+    const header = first.header as WireHeader, n = Number(first.nchunks);
+    const parts = [b64ToBytes(String(first.chunk0 ?? ''))]; let bytes = String(first.chunk0 ?? '').length;
+    for (let k = 1; k < n; k++) {
+      const c = await this.call(w, 'task_state_chunk', { k });
+      parts.push(b64ToBytes(String(c.data))); bytes += String(c.data).length;
+    }
+    const ref = header.dtype === 'int8delta' ? this.lastBroadcast ?? undefined : undefined;
+    const tensors = await decodeTensors(header, concatBytes(parts), ref);
+    return { tensors, bytes, header };
+  }
+
+  private async push(w: string, header: WireHeader, blob: Uint8Array): Promise<{ bytes: number; deser_s: number }> {
+    const parts = chunkBytes(blob, this.chunk); let bytes = 0, deser = 0;
+    for (let k = 0; k < parts.length; k++) {
+      const data = bytesToB64(parts[k]!); bytes += data.length;
+      const r = await this.call(w, 'task_state_put', { header: k === 0 ? header : null, k, n: parts.length, data });
+      if (k === parts.length - 1) { if (!r.applied) throw new Error(`${w}: state not applied`); deser = Number(r.deserialize_s ?? 0); }
+    }
+    return { bytes, deser_s: deser };
+  }
+
+  private async encodeGlobal(): Promise<{ header: WireHeader; blob: Uint8Array }> {
+    const enc = await encodeTensors(this.st!.global, this.shapes, this.cfg.broadcast_dtype ?? 'f32');
+    // What the workers will hold is the DECODED broadcast; keep exactly that as the int8-delta reference.
+    this.lastBroadcast = await decodeTensors(enc.header, enc.blob);
+    return enc;
+  }
+
+  private async broadcast(targets: string[]): Promise<{ ok: string[]; failed: string[]; bytes: Map<string, number>; secs: Map<string, number> }> {
+    const { header, blob } = await this.encodeGlobal();
+    const bytes = new Map<string, number>(), secs = new Map<string, number>();
+    const res = await Promise.all(targets.map(async (w) => {
+      const t0 = this.now();
+      try { const r = await this.push(w, header, blob); bytes.set(w, r.bytes); secs.set(w, (this.now() - t0) / 1000); return true; }
+      catch (e) { this.log('warn', `broadcast to ${w} failed: ${(e as Error).message}`); return false; }
+    }));
+    return { ok: targets.filter((_, i) => res[i]), failed: targets.filter((_, i) => !res[i]), bytes, secs };
+  }
+
+  async init(): Promise<Record<string, unknown>> {
+    this.hash = await configHash(this.cfg);
+    const init = { task: this.cfg.task, cfg: this.cfg.cfg ?? {}, amp: this.cfg.amp ?? 'auto', seed: this.cfg.seed ?? 0, deterministic: !!this.cfg.deterministic };
+    const r = await Promise.all(this.workers.map((w) => this.rpc(w, 'task_init', { session: this.id, ...init })));
+    const bad = this.workers.filter((_, i) => !r[i]!.ok);
+    if (bad.length === this.workers.length) { this.status = 'failed'; throw new Error(`task_init failed on every worker: ${r[0]!.error}`); }
+    if (bad.length) { this.log('warn', `task_init failed on ${bad.join(', ')} — excluded`); this.workers = this.workers.filter((w) => !bad.includes(w)); }
+    const first = await this.call(this.workers[0]!, 'task_state_get', { dtype: 'f32', chunk_bytes: this.chunk });
+    const { tensors, header } = await this.pull(this.workers[0]!, first);
+    for (const e of header.tensors) this.shapes[e.name] = e.shape;
+    this.st = OuterState.init(tensors);
+    const b = await this.broadcast(this.workers);
+    if (!b.ok.length) { this.status = 'failed'; throw new Error('initial broadcast failed on every worker'); }
+    this.workers = b.ok;
+    this.status = 'ready';
+    const describe = (r[this.workers.indexOf(this.workers[0]!)]?.data?.describe) ?? null;
+    return { ok: true, session: this.id, workers: this.workers, params: [...tensors.values()].reduce((s, a) => s + a.length, 0), describe, config_hash: this.hash };
+  }
+
+  /** Workers that joined after init: initialise the task and hand them the current global. */
+  async addWorker(w: string): Promise<boolean> {
+    const init = { task: this.cfg.task, cfg: this.cfg.cfg ?? {}, amp: this.cfg.amp ?? 'auto', seed: this.cfg.seed ?? 0, deterministic: !!this.cfg.deterministic };
+    const r = await this.rpc(w, 'task_init', { session: this.id, ...init });
+    if (!r.ok) return false;
+    const { header, blob } = await this.encodeGlobal();
+    try { await this.push(w, header, blob); } catch { return false; }
+    if (!this.workers.includes(w)) this.workers.push(w);
+    return true;
+  }
+
+  isDone(): boolean {
+    if (this.cfg.target_samples !== undefined && this.samplesSeen >= this.cfg.target_samples) return true;
+    if (this.cfg.max_rounds !== undefined && this.round >= this.cfg.max_rounds) return true;
+    return false;
+  }
+
+  async runRound(live: (w: string) => boolean = () => true): Promise<RoundSummary> {
+    if (!this.st) throw new Error('session not initialised');
+    if (this.busy) throw new Error('a round is already in progress — rounds are serialized');
+    if (this.isDone()) throw new Error('session already reached its stopping rule');
+    this.busy = true; this.status = 'running';
+    try { return await this.roundInner(live); }
+    catch (e) { this.lastError = (e as Error).message; throw e; }
+    finally { this.busy = false; if (this.status === 'running') this.status = this.isDone() ? 'done' : 'ready'; }
+  }
+
+  private async roundInner(live: (w: string) => boolean): Promise<RoundSummary> {
+    const tRound = this.now();
+    const ws = this.workers.filter(live);
+    const gone = this.workers.filter((w) => !live(w));
+    if (!ws.length) { this.status = 'failed'; throw new Error('all workers of this session are gone'); }
+    const per = this.cfg.batch * this.cfg.inner_steps;
+    const remaining = this.cfg.target_samples !== undefined ? this.cfg.target_samples - this.samplesSeen : undefined;
+    const sizes = allocate(per, ws.length, ws.map((w) => this.speeds.get(w) ?? 1), this.cfg.alloc ?? 'fixed', remaining);
+    const streamBefore = this.stream.state();
+    const shards = split(this.stream.take(sizes.reduce((a, b) => a + b, 0)), sizes);
+    type R = { w: string; tensors: Tensors; samples: number; report: Record<string, any>; t_inner: number; t_pull: number; bytes_up: number; wire_err?: unknown };
+    const results = await Promise.all(ws.map(async (w, i): Promise<R | { w: string; error: string }> => {
+      const refs = shards[i]!;
+      if (!refs.length) return { w, error: 'no samples this round' };
+      const steps = Math.max(1, Math.min(refs.length, Math.round(refs.length / this.cfg.batch)));
+      const t0 = this.now();
+      try {
+        const first = await this.call(w, 'task_inner', { refs, steps, lr: this.cfg.lr, sync_dtype: this.cfg.sync_dtype ?? 'f32', chunk_bytes: this.chunk });
+        const t1 = this.now();
+        const { tensors, bytes, header } = await this.pull(w, first);
+        const t2 = this.now();
+        const report = first.report as Record<string, any>;
+        return { w, tensors, samples: Number(report.samples ?? refs.length), report, t_inner: (t1 - t0) / 1000, t_pull: (t2 - t1) / 1000, bytes_up: bytes, wire_err: header.error };
+      } catch (e) { return { w, error: (e as Error).message }; }
+    }));
+    const okR = results.filter((r): r is R => 'tensors' in r);
+    const failed = results.filter((r): r is { w: string; error: string } => 'error' in r && r.error !== 'no samples this round');
+    const { kept, dropped: nonFinite } = dropNonFinite(okR.map((r) => ({ id: r.w, ...r })));
+    if (!kept.length) {
+      // nothing usable: roll the sample stream back so these samples are not counted as seen
+      this.stream = SampleStream.fromState(streamBefore);
+      throw new Error(`round produced no usable state${nonFinite.length ? ` (non-finite: ${nonFinite.join(', ')})` : failed.length ? `: ${failed[0]!.error}` : ''}`);
+    }
+    const tReduce0 = this.now();
+    const avg = weightedAverage(kept.map((r) => ({ tensors: r.tensors, weight: r.samples })));
+    outerStep(this.st!, avg, this.cfg.outer_lr ?? 0.7, this.cfg.outer_momentum ?? 0.9);
+    const reduce_s = (this.now() - tReduce0) / 1000;
+    let roundSamples = 0;
+    for (const r of kept) {
+      roundSamples += r.samples; this.perWorkerSeen.set(r.w, (this.perWorkerSeen.get(r.w) ?? 0) + r.samples);
+      const c = Number(r.report.timings?.compute_s ?? 0);
+      if (c > 0) this.speeds.set(r.w, r.samples / c);
+    }
+    this.samplesSeen += roundSamples;
+    // broadcast to every live worker (including ones dropped for non-finite state: they must resync)
+    const b = await this.broadcast(ws);
+    const failedIds = new Set(failed.map((f) => f.w));
+    const alarms: string[] = [];
+    // after_outer hook (e.g. JEPA EMA target update) on all synced workers; compare target hashes
+    const after = await Promise.all(b.ok.map((w) => this.rpc(w, 'task_after_outer', { session: this.id, round: this.round })));
+    const hashes = new Set(after.map((a) => a.data?.target_sha256).filter((h) => h !== undefined));
+    if (hashes.size > 1) alarms.push('target encoders diverged across workers (EMA hash mismatch)');
+    const monitors = (after[0]?.data?.monitors ?? undefined) as Record<string, unknown> | undefined;
+    for (const a of after) for (const al of (a.data?.alarms as string[] | undefined) ?? []) if (!alarms.includes(al)) alarms.push(al);
+    this.workers = this.workers.filter((w) => b.ok.includes(w) || (!ws.includes(w) && !gone.includes(w)));
+    const dropped = [...new Set([...b.failed, ...failedIds, ...gone])];
+    if (!this.workers.length) { this.status = 'failed'; throw new Error('all workers fell out of sync — session failed'); }
+    let evalOut: Record<string, unknown> | undefined;
+    if (this.cfg.eval && this.cfg.eval.every > 0 && this.round % this.cfg.eval.every === 0) {
+      const e = await this.rpc(this.workers[0]!, 'task_eval', { session: this.id, refs: this.cfg.eval.refs, kind: this.cfg.eval.kind });
+      evalOut = e.ok ? (e.data?.metrics as Record<string, unknown>) : { error: e.error };
+    }
+    const wall = (this.now() - tRound) / 1000;
+    const losses = kept.map((r) => { const l = r.report.losses as number[]; return l[l.length - 1] ?? NaN; });
+    const summary: RoundSummary = {
+      round: this.round, workers: kept.map((r) => r.w), dropped, dropped_nonfinite: nonFinite, samples: roundSamples, samples_seen: this.samplesSeen,
+      avg_last_loss: losses.reduce((a, b) => a + b, 0) / losses.length, wall_s: wall, reduce_s,
+      bytes_up: okR.reduce((s, r) => s + r.bytes_up, 0), bytes_down: [...b.bytes.values()].reduce((s, x) => s + x, 0),
+      alarms, eval: evalOut, monitors, done: this.isDone(),
+    };
+    this.history.push(summary);
+    this.emitTelemetry(summary, okR, b.secs, b.bytes, wall);
+    if ((this.cfg.checkpoint_every ?? 0) > 0 && this.round % this.cfg.checkpoint_every! === 0) await this.checkpoint();
+    return summary;
+  }
+
+  private emitTelemetry(s: RoundSummary, rs: Array<{ w: string; samples: number; report: Record<string, any>; t_inner: number; t_pull: number; bytes_up: number; wire_err?: unknown }>, bsecs: Map<string, number>, bbytes: Map<string, number>, wall: number) {
+    const tel = this.deps.telemetry; if (!tel) return;
+    const ts = new Date().toISOString();
+    for (const r of rs) {
+      const t = r.report.timings ?? {};
+      const compute = Number(t.compute_s ?? 0), data = Number(t.data_s ?? 0), ser = Number(t.serialize_s ?? 0);
+      const inflight = r.t_inner + r.t_pull + (bsecs.get(r.w) ?? 0);
+      const network = Math.max(0, inflight - compute - data - ser);
+      const wait = Math.max(0, wall - compute - data - ser - network);
+      const m = r.report.metrics ?? {};
+      tel({ schema: SCHEMA, kind: 'worker_round', ts, session: this.id, task: this.cfg.task, round: s.round, worker: r.w,
+        wall_s: wall, compute_s: compute, data_s: data, serialize_s: ser, network_s: network, wait_s: wait,
+        bytes_up: r.bytes_up, bytes_down: bbytes.get(r.w) ?? 0, samples: r.samples, samples_seen: this.perWorkerSeen.get(r.w) ?? 0,
+        samples_per_s: compute > 0 ? r.samples / compute : null, loss_last: (r.report.losses as number[]).at(-1) ?? null,
+        amp: m.amp ?? null, gpu_util: m.gpu_util ?? null, gpu_power_w: m.gpu_power_w ?? null, energy_j: m.energy_j ?? null,
+        mem_peak_bytes: m.mem_peak_bytes ?? null, hw: m.hw ?? null, wire_error: r.wire_err ?? null,
+        git_sha: this.deps.gitSha ?? null, config_hash: this.hash });
+    }
+    tel({ schema: SCHEMA, kind: 'round', ts, session: this.id, task: this.cfg.task, round: s.round, wall_s: wall, reduce_s: s.reduce_s,
+      workers: s.workers, dropped: s.dropped, samples: s.samples, samples_seen: s.samples_seen, avg_last_loss: s.avg_last_loss,
+      bytes_up: s.bytes_up, bytes_down: s.bytes_down, alarms: s.alarms, eval: s.eval ?? null, monitors: s.monitors ?? null,
+      git_sha: this.deps.gitSha ?? null, config_hash: this.hash });
+  }
+
+  // ---------------------------------------------------------------- checkpoint / resume (ADR-0106)
+  async checkpoint(): Promise<string | null> {
+    const store = this.deps.store; if (!store || !this.st) return null;
+    const name = `${this.id}/round-${String(this.round).padStart(6, '0')}`;
+    const g = await encodeTensors(this.st.global, this.shapes, 'f32');
+    const m = await encodeTensors(this.st.momentum, this.shapes, 'f32');
+    await store.write(`${name}.global.bin`, g.blob);
+    await store.write(`${name}.momentum.bin`, m.blob);
+    const meta = { v: 1, id: this.id, cfg: this.cfg, workers: this.workers, round: this.round, samples_seen: this.samplesSeen,
+      per_worker_seen: Object.fromEntries(this.perWorkerSeen), speeds: Object.fromEntries(this.speeds), stream: this.stream.state(),
+      global: g.header, momentum: m.header, config_hash: this.hash };
+    await store.write(`${name}.json`, JSON.stringify(meta));   // written last: a checkpoint exists iff its .json exists
+    const keep = this.cfg.keep_checkpoints ?? 3;
+    const all = (await store.list(`${this.id}/`)).filter((n) => n.endsWith('.json')).sort();
+    for (const old of all.slice(0, Math.max(0, all.length - keep))) {
+      const base = old.slice(0, -5);
+      for (const suf of ['.json', '.global.bin', '.momentum.bin']) await store.remove(base + suf);
+    }
+    return name;
+  }
+
+  static async resume(id: string, store: CheckpointStore, rpc: Rpc, deps: SessionDeps, workers?: string[]): Promise<TrainSession> {
+    const all = (await store.list(`${id}/`)).filter((n) => n.endsWith('.json')).sort();
+    if (!all.length) throw new Error(`no checkpoint for session ${id}`);
+    const base = all[all.length - 1]!.slice(0, -5);
+    const meta = JSON.parse(new TextDecoder().decode((await store.read(`${base}.json`))!));
+    const s = new TrainSession(id, meta.cfg, workers ?? meta.workers, rpc, { ...deps, store });
+    const g = await decodeTensors(meta.global, (await store.read(`${base}.global.bin`))!);
+    const m = await decodeTensors(meta.momentum, (await store.read(`${base}.momentum.bin`))!);
+    s.st = new OuterState(g, m, meta.round);
+    for (const e of (meta.global as WireHeader).tensors) s.shapes[e.name] = e.shape;
+    s.samplesSeen = meta.samples_seen; s.perWorkerSeen = new Map(Object.entries(meta.per_worker_seen));
+    s.speeds = new Map(Object.entries(meta.speeds)); s.stream = SampleStream.fromState(meta.stream as StreamState);
+    s.hash = meta.config_hash;
+    const init = { task: s.cfg.task, cfg: s.cfg.cfg ?? {}, amp: s.cfg.amp ?? 'auto', seed: s.cfg.seed ?? 0, deterministic: !!s.cfg.deterministic };
+    const r = await Promise.all(s.workers.map((w) => rpc(w, 'task_init', { session: id, replace: true, ...init })));
+    s.workers = s.workers.filter((_, i) => r[i]!.ok);
+    if (!s.workers.length) throw new Error('resume: task_init failed on every worker');
+    const b = await s.broadcast(s.workers);
+    s.workers = b.ok;
+    // replay the per-round hook so stateful targets (JEPA EMA) are rebuilt identically is NOT possible from the
+    // global alone; tasks with non-synced state must persist it via task_export — documented in docs/TRAINING.md.
+    s.status = s.isDone() ? 'done' : 'ready';
+    return s;
+  }
+
+  // ---------------------------------------------------------------- misc
+  async evaluate(refs: unknown[], kind: string, worker?: string): Promise<Record<string, unknown>> {
+    return (await this.call(worker ?? this.workers[0]!, 'task_eval', { refs, kind })).metrics as Record<string, unknown>;
+  }
+  async export(fmt: string, path: string, worker?: string): Promise<Record<string, unknown>> {
+    return this.call(worker ?? this.workers[0]!, 'task_export', { fmt, path });
+  }
+  async globalTensors(dtype: 'f32' | 'bf16' | 'fp16' = 'f32') { return encodeTensors(this.st!.global, this.shapes, dtype); }
+  async close(): Promise<void> {
+    await Promise.all(this.workers.map((w) => this.rpc(w, 'task_close', { session: this.id })));
+    this.status = 'closed';
+  }
+  describe(): Record<string, unknown> {
+    return { id: this.id, task: this.cfg.task, status: this.status, workers: this.workers, round: this.round, samples_seen: this.samplesSeen,
+      target_samples: this.cfg.target_samples ?? null, per_worker_seen: Object.fromEntries(this.perWorkerSeen),
+      speeds: Object.fromEntries(this.speeds), busy: this.busy, last_error: this.lastError || null, config_hash: this.hash,
+      last: this.history.at(-1) ?? null };
+  }
+}
