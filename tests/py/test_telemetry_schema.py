@@ -21,7 +21,7 @@ WORKER_ROUND_FIELDS = {
 }
 ROUND_FIELDS = {
     "schema", "kind", "ts", "session", "task", "round", "wall_s", "reduce_s", "workers", "dropped", "samples",
-    "samples_seen", "avg_last_loss", "bytes_up", "bytes_down", "alarms", "eval", "monitors", "git_sha", "config_hash",
+    "samples_seen", "avg_last_loss", "lr", "bytes_up", "bytes_down", "alarms", "eval", "monitors", "git_sha", "config_hash",
 }
 TS = "2026-09-23T08:00:00.123Z"
 H64 = "a" * 64
@@ -41,7 +41,7 @@ def worker_round(**over):
 def round_rec(**over):
     r = {"schema": "moregpu.telemetry/1", "kind": "round", "ts": TS, "session": "s1", "task": "toy", "round": 3,
          "wall_s": 1.0, "reduce_s": 0.01, "workers": ["w0", "w1"], "dropped": [], "samples": 16, "samples_seen": 48,
-         "avg_last_loss": 0.4, "bytes_up": 2048, "bytes_down": 4096, "alarms": [], "eval": {"loss": 0.3},
+         "avg_last_loss": 0.4, "lr": 1e-3, "bytes_up": 2048, "bytes_down": 4096, "alarms": [], "eval": {"loss": 0.3},
          "monitors": None, "git_sha": None, "config_hash": H64}
     r.update(over)
     return r
