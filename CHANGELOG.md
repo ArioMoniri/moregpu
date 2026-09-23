@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — vision, generic training tasks, JEPA (0.7.0-dev)
+
+The work is planned in ADRs 0101–0114 (`docs/dev/adr/`) and verified against the pre-work baseline in
+`docs/dev/BASELINE.md`.
+
+- **Training-task framework.**
+  - `TrainTask` interface with a pinned plugin registry (entry points, allowlisted by dist, version and wheel sha256).
+  - Per-session training state replaces the single global `TRAIN` slot. The legacy `/train` and `/train/diloco` routes
+    are unchanged; their e2e tests still pass.
+  - `/train/sessions` API, available from the Python SDK, the TS SDK, the CLI (`moregpu train …`) and the dashboard.
+- **Generalised DiLoCo.**
+  - Syncs full weights or adapters, averaged with sample weights; outer Nesterov step with fp32 outer state.
+  - Deterministic SplitMix64 sample stream, with cross-language golden tests.
+  - Heterogeneous `proportional` allocation.
+  - `target_samples` stops exactly at the requested count.
+  - Warmup + cosine LR per round.
+  - Chunked, sha256-checked tensor sync in f32, bf16, fp16 or int8-delta.
+  - Checkpoint and resume (bit-identical), and churn handling.
+  - The coordinator result equals the in-process reference within 1e-7.
+- **AMP policy.** bf16, fp16 + GradScaler, or fp32. A forced mode the device cannot run is an error, and the mode used is
+  recorded.
+- **JEPA** (`ijepa_2d`, `jepa_2p5d`, `jepa_3d`).
+  - Model: ViT in 2D/3D with timm-compatible keys, plus a predictor, trained with I-JEPA multi-block masking.
+  - EMA is updated after each outer step with product-of-schedule momentum. N=1, H=1 DiLoCo equals per-step I-JEPA,
+    and target hashes are checked across workers.
+  - Collapse monitors: per-dimension std and RankMe, with alarms.
+  - Evaluation: k-NN and linear probe.
+  - Export to safetensors, torch.export or ONNX, with a parity probe.
+- **Vision fine-tuning.**
+  - `segment` (2D, 2.5D and 3D; Dice+CE matching MONAI) and `classify`, on a random or JEPA-exported encoder, in full,
+    frozen or LoRA mode.
+  - `finetune_model` fine-tunes **any published native model** (torchvision, timm, MONAI, HF, plugin) with DiLoCo.
+- **Published models, run exactly as released.**
+  - Adapters for state_dict, safetensors + named arch, allowlisted plugins, torch.export, TorchScript and ONNX.
+  - sha256 is verified. Pickled full models are refused, including a crafted `.pt2` pickle fallback.
+  - Automatic lowering to a MoreGPU op-graph or ONNX, with a parity probe.
+  - The repo-wide pickle/`weights_only` ban test passes. The LLM loaders now use `use_safetensors=True`.
+- **Vision inference.**
+  - `/vision/load|infer|batch|jobs|unload|models|lower|capabilities`.
+  - Sliding-window inference with flip TTA, equivalent to MONAI.
+  - Pull-based work-stealing batch queue with churn retry and straggler duplication.
+  - **Tile sharding**: one volume split across workers, giving exactly the single-node result.
+- **WebGPU vision (M6).** WGSL conv2d/3d (implicit GEMM), transposed conv, norms, pooling, upsampling, concat, softmax,
+  argmax, attention and fp16 storage, with a memory planner and a sliding-window driver. Verified on real software
+  adapters: Mesa lavapipe under Deno and SwiftShader in Chromium.
+- **Data plane.**
+  - Sources: `file://` under allowed roots, `https://` from an allowlist with sha256, anonymous public buckets, and
+    `pushed://` RAM-staged blobs.
+  - Readers for NumPy, NIfTI, DICOM, PNG/JPEG and TIFF.
+  - Content-addressed LRU cache, memmap shards and a prefetching loader.
+  - Per-worker capabilities at `/workers/:id/caps`.
+- **Telemetry and `moregpu bench`.**
+  - Versioned `moregpu.telemetry/1` JSONL: compute, data, serialise, network and wait times, bytes, GPU utilisation,
+    energy (NVML), peak memory, AMP mode, hardware fingerprint and config hash.
+  - `/net` reports RTT p50/p90/p99 and sustained up/down bandwidth.
+  - `moregpu bench` emulates VRAM, CPU, memory and network limits.
+- **Research boundary guard** (`tests/boundary`), plus unit tests (pytest, ≥90 % coverage of `moregpu_worker`) and
+  vitest suites for the coordinator libs.
+
+### Security
+
+- Model and weight loads refuse pickles, `trust_remote_code` and `from_pretrained` without safetensors, enforced by a CI
+  ban test.
+- Data and model roots are realpath-confined, and https hosts come from an allowlist with sha256 required.
+- Bucket tools run with credentials stripped.
+- Outputs are confined to `MOREGPU_OUTPUT_DIR`.
+
+
 ### Added
 
 - **Pipeline sharding now works for Llama-family models**, not just GPT-2 — the torch worker's
