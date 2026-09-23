@@ -9,14 +9,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ..errors import KeyMismatch, RefusedFormat, UnknownArch
+from ..errors import KeyMismatch, RefusedFormat, UnknownArch, brief
 from .base import DTYPES, Adapter, Fetch, Handle, fetch_verified, module_sha256, resolve_device
 
 CONTAINER_KEYS = ("state_dict", "model_state_dict", "model", "module", "net", "network")
 PREFIXES = ("module.", "_orig_mod.")
 HF_AUTO = {"AutoModel", "AutoModelForImageClassification", "AutoModelForSemanticSegmentation",
            "AutoModelForObjectDetection", "AutoModelForDepthEstimation", "AutoBackbone"}
-_EXTRA = {"torchvision": "torchvision", "timm": "timm", "monai": "monai", "hf": "llm"}
 
 
 def _all_tensors(d: dict) -> bool:
@@ -60,40 +59,54 @@ def read_state_dict(path: Path, fmt: str) -> tuple[dict[str, torch.Tensor], list
         obj = torch.load(path, map_location="cpu", weights_only=True)
     except Exception as e:
         raise RefusedFormat(f"{path.name} could not be loaded with weights_only=True (a pickled full model or "
-                            f"arbitrary objects?): {str(e).splitlines()[0][:300]}") from None
+                            f"arbitrary objects?): {brief(e, 300)}") from None
     return unwrap(obj)
+
+
+def _torchvision(name, kw):
+    tvm = importlib.import_module("torchvision.models")
+    if name not in tvm.list_models():
+        raise UnknownArch(f"torchvision has no model {name!r}")
+    return tvm.get_model(name, weights=None, **kw)
+
+
+def _timm(name, kw):
+    timm = importlib.import_module("timm")
+    if not timm.is_model(name):
+        raise UnknownArch(f"timm has no model {name!r}")
+    return timm.create_model(name, pretrained=False, **kw)
+
+
+def _monai(name, kw):
+    nets = importlib.import_module("monai.networks.nets")
+    cls = None if name.startswith("_") else getattr(nets, name, None)
+    if not (isinstance(cls, type) and issubclass(cls, nn.Module)):
+        raise UnknownArch(f"monai.networks.nets has no network {name!r}")
+    return cls(**kw)
+
+
+def _hf(name, kw):
+    if name not in HF_AUTO:
+        raise RefusedFormat(f"hf architectures are built from a config dict with a transformers Auto class "
+                            f"({sorted(HF_AUTO)}), not {name!r}")
+    tr = importlib.import_module("transformers")
+    return getattr(tr, name).from_config(tr.AutoConfig.for_model(**kw.get("config", {})))
+
+
+# registry -> (builder(name, kwargs) -> nn.Module, pip extra that provides it)
+BUILDERS = {"torchvision": (_torchvision, "torchvision"), "timm": (_timm, "timm"), "monai": (_monai, "monai"),
+            "hf": (_hf, "llm")}
 
 
 def build_arch(arch: dict) -> tuple[nn.Module, dict]:
     reg, name, kw = arch["registry"], arch["name"], dict(arch.get("kwargs") or {})
-    extra: dict = {}
-    try:
-        if reg == "torchvision":
-            tvm = importlib.import_module("torchvision.models")
-            if name not in tvm.list_models():
-                raise UnknownArch(f"torchvision has no model {name!r}")
-            return tvm.get_model(name, weights=None, **kw), extra
-        if reg == "timm":
-            timm = importlib.import_module("timm")
-            if not timm.is_model(name):
-                raise UnknownArch(f"timm has no model {name!r}")
-            return timm.create_model(name, pretrained=False, **kw), extra
-        if reg == "monai":
-            nets = importlib.import_module("monai.networks.nets")
-            cls = None if name.startswith("_") else getattr(nets, name, None)
-            if not (isinstance(cls, type) and issubclass(cls, nn.Module)):
-                raise UnknownArch(f"monai.networks.nets has no network {name!r}")
-            return cls(**kw), extra
-        if reg == "hf":
-            if name not in HF_AUTO:
-                raise RefusedFormat(f"hf architectures are built from a config dict with a transformers Auto class "
-                                    f"({sorted(HF_AUTO)}), not {name!r}")
-            tr = importlib.import_module("transformers")
-            cfg = tr.AutoConfig.for_model(**kw.get("config", {}))
-            return getattr(tr, name).from_config(cfg), extra
-    except ImportError as e:
-        raise UnknownArch(f"registry {reg!r} is not installed on this worker "
-                          f"(pip install 'moregpu-worker[{_EXTRA[reg]}]'): {e}") from None
+    if reg in BUILDERS:
+        fn, extra = BUILDERS[reg]
+        try:
+            return fn(name, kw), {}
+        except ImportError as e:
+            raise UnknownArch(f"registry {reg!r} is not installed on this worker "
+                              f"(pip install 'moregpu-worker[{extra}]'): {e}") from None
     from . import plugins  # registry == "plugin" (the schema admits nothing else)
     factory, info = plugins.get(name)
     model = factory(**kw)

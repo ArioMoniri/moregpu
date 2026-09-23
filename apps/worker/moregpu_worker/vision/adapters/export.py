@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from ..errors import RefusedFormat
+from ..errors import RefusedFormat, brief
 from .base import Adapter, Fetch, Handle, fetch_verified, resolve_device
 
 try:
@@ -49,7 +49,7 @@ def check_pt2(path: Path) -> None:
                     torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
                 except Exception as e:
                     raise RefusedFormat(f"{path.name}: member {name} does not load with weights_only=True "
-                                        f"({str(e).splitlines()[0][:200]})") from None
+                                        f"({brief(e)})") from None
 
 
 class TorchExportAdapter(Adapter):
@@ -84,7 +84,7 @@ class TorchScriptAdapter(Adapter):
         try:
             model = torch.jit.load(str(path), map_location=device).eval()
         except Exception as e:
-            raise RefusedFormat(f"{path.name} is not a TorchScript archive ({str(e).splitlines()[0][:200]})") from None
+            raise RefusedFormat(f"{path.name} is not a TorchScript archive ({brief(e)})") from None
         return Handle(spec=spec, adapter=self.name, sha256=sha, model=model, device=device, extra={"path": path})
 
     def forward(self, handle: Handle, x: torch.Tensor):

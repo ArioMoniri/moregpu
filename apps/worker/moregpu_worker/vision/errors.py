@@ -6,6 +6,12 @@ REFUSAL_HINT = ("MoreGPU never unpickles arbitrary objects: export a state_dict 
                 "admin to install an allowlisted `moregpu.models` plugin")
 
 
+def brief(e: BaseException, n: int = 200) -> str:
+    """First line of an exception message, truncated (safe for empty messages)."""
+    lines = str(e).splitlines()
+    return (lines[0] if lines else type(e).__name__)[:n]
+
+
 class Refused(Exception):
     """Base class: the worker refuses to load this artefact."""
 

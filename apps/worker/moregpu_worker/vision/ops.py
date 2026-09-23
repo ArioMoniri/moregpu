@@ -21,6 +21,7 @@ import torch
 from . import adapters as A
 from . import lowering as L
 from .adapters import plugins
+from .adapters.onnx import available_providers
 
 HANDLES: dict[str, A.Handle] = {}
 LOWERED: dict[tuple[str, str], L.LoweredArtifact] = {}
@@ -44,15 +45,6 @@ def lowered(mid: str, target: str) -> L.LoweredArtifact:
     return LOWERED[(mid, target)]
 
 
-def _onnx_providers() -> list[str]:
-    try:
-        import onnxruntime as ort
-    except ImportError:  # pragma: no cover - onnx extra not installed
-        return []
-    from .adapters.onnx import pick_providers
-    return pick_providers(ort.get_available_providers())
-
-
 def models_describe(p: dict) -> dict:
     found, refused = plugins.discover()
     regs = {r: importlib.util.find_spec(m) is not None for r, m in _REGISTRY_MODULES.items()}
@@ -60,7 +52,7 @@ def models_describe(p: dict) -> dict:
     return {"formats": list(A.ADAPTERS), "registries": regs,
             "plugins": {"available": sorted(found), "refused": refused},
             "lowering": {"targets": list(L.TARGETS), "wgsl_ops": sorted(L.WGSL_OPS), "version": L.LOWERING_VERSION},
-            "onnx_providers": _onnx_providers(), "loaded": sorted(HANDLES)}
+            "onnx_providers": available_providers(), "loaded": sorted(HANDLES)}
 
 
 def load(p: dict) -> dict:

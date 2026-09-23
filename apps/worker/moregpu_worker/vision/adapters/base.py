@@ -82,11 +82,11 @@ def run_inference(predict: Callable[[torch.Tensor], Any], x: torch.Tensor, infer
     def base(t):
         return as_tensor(predict(t))
 
-    fn = base
-    if inference.get("tta") == "flip":
-        def fn(t):
-            preds = [base(t)] + [base(t.flip(d)).flip(d) for d in range(2, t.ndim)]
-            return torch.stack(preds).mean(0)
+    def flip_tta(t):
+        preds = [base(t)] + [base(t.flip(d)).flip(d) for d in range(2, t.ndim)]
+        return torch.stack(preds).mean(0)
+
+    fn = flip_tta if inference.get("tta") == "flip" else base
 
     if inference.get("mode") == "sliding_window":
         from monai.inferers import sliding_window_inference

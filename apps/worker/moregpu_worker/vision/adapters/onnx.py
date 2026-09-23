@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from ..errors import RefusedFormat
+from ..errors import RefusedFormat, brief
 from .base import Adapter, Fetch, Handle, fetch_verified
 
 PREFERRED = ["CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"]
@@ -15,6 +15,15 @@ _NP = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(doubl
 def pick_providers(available) -> list[str]:
     out = [p for p in PREFERRED if p in available]
     return out if "CPUExecutionProvider" in out else out + ["CPUExecutionProvider"]
+
+
+def available_providers() -> list[str]:
+    """Providers this worker would use, in preference order ([] when onnxruntime is not installed)."""
+    try:
+        import onnxruntime as ort
+    except ImportError:  # pragma: no cover - onnx extra not installed
+        return []
+    return pick_providers(ort.get_available_providers())
 
 
 def session(model, providers=None):
@@ -30,7 +39,7 @@ class OnnxAdapter(Adapter):
         try:
             sess = session(str(path))
         except Exception as e:
-            raise RefusedFormat(f"{path.name} is not a loadable ONNX model ({str(e).splitlines()[0][:200]})") from None
+            raise RefusedFormat(f"{path.name} is not a loadable ONNX model ({brief(e)})") from None
         dev = "cuda" if sess.get_providers()[0] == "CUDAExecutionProvider" else "cpu"
         return Handle(spec=spec, adapter=self.name, sha256=sha, model=sess, device=dev, extra={"path": path})
 

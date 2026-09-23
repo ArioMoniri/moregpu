@@ -29,6 +29,7 @@ import torch
 
 from . import opgraph_ref
 from .adapters import ADAPTERS, Handle, as_tensor
+from .errors import brief
 
 LOWERING_VERSION = "1"
 TARGETS = ("wgsl", "onnx-web")
@@ -262,7 +263,7 @@ def _lower(handle: Handle, target: str, x: torch.Tensor, key: str) -> LoweredArt
         art.ops = _graph_ops(ep)
         art.unsupported_ops = [op for op in art.ops if op not in WGSL_OPS]
     except Exception as e:
-        art.reason = f"torch.export failed ({type(e).__name__}: {str(e).splitlines()[0][:200]}); "
+        art.reason = f"torch.export failed ({type(e).__name__}: {brief(e)}); "
     if target == "wgsl" and ep is not None and not art.unsupported_ops:
         art.kind = "opgraph"
         art.graph, art.weights = _emit_opgraph(ep)
@@ -272,7 +273,7 @@ def _lower(handle: Handle, target: str, x: torch.Tensor, key: str) -> LoweredArt
         if target == "wgsl":
             art.reason += "ops outside the WGSL table; lowered to ONNX for onnxruntime-web"
     except Exception as e:
-        art.reason += f"ONNX export failed ({type(e).__name__}: {str(e).splitlines()[0][:200]}); native-only"
+        art.reason += f"ONNX export failed ({type(e).__name__}: {brief(e)}); native-only"
     return art
 
 
