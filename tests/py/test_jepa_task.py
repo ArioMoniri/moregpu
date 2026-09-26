@@ -187,3 +187,32 @@ def test_knn_and_probe_edge_cases():
     f = torch.nn.functional.normalize(torch.cat([torch.randn(10, 4) + 5, torch.randn(10, 4) - 5]), dim=1)
     y = torch.tensor([0] * 10 + [1] * 10)
     assert J.knn_accuracy(f, y) > 0.9 and J.linear_probe_accuracy(f, y) > 0.9
+
+
+def test_rank_alarm_ignores_a_shared_mean_offset():
+    # real pilot: mean-pooled ViT features of CT slices = a large common vector + small input-dependent spread; the
+    # raw (uncentred) RankMe is ~1.1 even for a random-init encoder, so the rank alarm must use centred embeddings
+    g = torch.Generator().manual_seed(0)
+    z = 10.0 * torch.ones(256, 32) + 0.05 * torch.randn(256, 32, generator=g)
+    m = MON.embedding_monitors(z)
+    assert m["rankme"] < 2 and m["rankme_centered"] > 20
+    assert MON.alarms(m, std_min=1e-3, rank_min=2.0) == []
+
+
+def test_rank_alarm_fires_on_dimensional_collapse():
+    g = torch.Generator().manual_seed(0)
+    u = torch.randn(1, 32, generator=g)
+    z = 3.0 + torch.randn(256, 1, generator=g) * u               # spread along ONE direction only
+    m = MON.embedding_monitors(z)
+    assert m["std_mean"] > 1e-3 and m["rankme_centered"] < 1.5
+    assert any("RankMe" in a and "collapse" in a for a in MON.alarms(m, std_min=1e-3, rank_min=2.0))
+
+
+def test_probe_batch_is_spread_over_the_manifest():
+    # the first N manifest entries are adjacent slices of one patient; the probe must span the manifest
+    t = R.create("jepa_2p5d"); t.init(CFG, ctx())
+    idx = t.probe_idx
+    assert len(idx) == 16 == len(set(idx)) and idx == sorted(idx)
+    assert idx[0] == 0 and idx[-1] >= 48 - 48 // 16
+    t2 = R.create("jepa_2p5d"); t2.init({**CFG, "probe_batch": 999}, ctx())
+    assert t2.probe_idx == list(range(48))

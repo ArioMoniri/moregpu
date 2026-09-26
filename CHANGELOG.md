@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JEPA collapse monitor false positive (0.7.0-dev)
+
+- The RankMe collapse alarm now uses the effective rank of the **mean-centred** probe embeddings (`rankme_centered`).
+  RankMe as published (uncentred) is still reported as `rankme`. On real CT, mean-pooled ViT features share a large
+  common vector, so the uncentred RankMe reads ~1.1 at random init and drops further in healthy training. That
+  stopped every pilot run at its first monitor.
+- The JEPA probe batch is spread evenly over the manifest instead of taking its first `probe_batch` entries, which
+  are adjacent slices of one volume.
+
 ### Added — vision, generic training tasks, JEPA (0.7.0-dev)
 
 The work is planned in ADRs 0101–0114 (`docs/dev/adr/`) and verified against the pre-work baseline in

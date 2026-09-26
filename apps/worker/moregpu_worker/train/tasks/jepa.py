@@ -48,6 +48,13 @@ class EmaSchedule:
         return m
 
 
+def probe_indices(n: int, k: int) -> list[int]:
+    """k fixed probe samples spread evenly over the manifest (its first entries are adjacent slices of one patient)."""
+    if k >= n:
+        return list(range(n))
+    return sorted({(i * n) // k for i in range(k)})
+
+
 class DataPlaneSource:
     """Adapter over moregpu_worker.data.DataPlane: manifest indices → batches (+ optional labels in ref.meta)."""
     def __init__(self, plane, spec: dict, kind: str = "2p5d"):
@@ -115,7 +122,7 @@ class _JepaBase(TrainTask):
         self.flip = bool(cfg.get("hflip", False))
         self.monitor_every = int(cfg.get("monitor_every", 1))
         self.std_min, self.rank_min = float(cfg.get("collapse_std_min", 1e-3)), float(cfg.get("collapse_rank_min", 2.0))
-        self.probe_idx = list(range(min(int(cfg.get("probe_batch", 256)), len(self.data))))
+        self.probe_idx = probe_indices(len(self.data), int(cfg.get("probe_batch", 256)))
         n = sum(p.numel() for p in self.encoder.parameters()) + sum(p.numel() for p in self.predictor.parameters())
         self.info = {"encoder": self.vit_cfg, "params": n, "tokens": self.encoder.num_patches}
         return {"ok": True, "params": n, "tokens": self.encoder.num_patches}
